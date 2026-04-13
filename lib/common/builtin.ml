@@ -126,7 +126,13 @@ let fundecl_of_builtin ctx builtin receiver_ty node_opt =
   | StringLengthByte -> make Int "LengthByte" []
   | StringEmpty -> make Int "Empty" []
   | StringFind -> make Int "Find" [ String ]
-  | StringGetPart -> make String "GetPart" [ Int; Int ]
+  | StringGetPart ->
+      make String "GetPart" [ Int; Int ]
+        ~defaults:
+          [
+            None;
+            Some (make_expr ~ty:Int (ConstInt 2147483647));
+          ]
   | StringPushBack -> make Void "PushBack" [ Int ]
   | StringPopBack -> make Void "PopBack" []
   | StringErase -> make Void "Erase" [ Int ]

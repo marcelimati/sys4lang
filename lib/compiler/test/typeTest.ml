@@ -312,6 +312,15 @@ let%expect_test "class declarations" =
     |};
   [%expect {| ok |}]
 
+let%expect_test "string getpart with omitted length" =
+  type_test
+    {|
+      void f(string s) {
+        s.GetPart(1);
+      }
+    |};
+  [%expect {| ok |}]
+
 let%expect_test "qualified class member declaration" =
   type_test ~ain_version:11
     {|
