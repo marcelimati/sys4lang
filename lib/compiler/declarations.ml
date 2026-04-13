@@ -43,8 +43,32 @@ class type_declare_visitor ctx =
             if
               not (ft_compatible (ft_of_fundecl decl) (ft_of_fundecl prev_decl))
             then
-              compile_error "Function signature mismatch"
-                (ASTDeclaration (Function decl))
+              if Ain.version ctx.ain < 11 then
+                compile_error "Function signature mismatch"
+                  (ASTDeclaration (Function decl))
+              else (
+                let ft = ft_of_fundecl decl in
+                let nr_params = List.length decl.params in
+                let rec find_key suffix =
+                  let key =
+                    if suffix = 0 then Printf.sprintf "%s#%d" name nr_params
+                    else Printf.sprintf "%s#%d_%d" name nr_params suffix
+                  in
+                  match Hashtbl.find ctx.functions key with
+                  | Some existing
+                    when ft_compatible ft (ft_of_fundecl existing) ->
+                      (key, Some existing)
+                  | None -> (key, None)
+                  | _ -> find_key (suffix + 1)
+                in
+                let key, matching = find_key 0 in
+                (match matching with
+                | Some overload_decl when Option.is_some decl.body ->
+                    overload_decl.index <- decl.index;
+                    decl.params <- overload_decl.params;
+                    Hashtbl.set ctx.functions ~key ~data:decl
+                | _ -> Hashtbl.set ctx.functions ~key ~data:decl);
+                prev_decl)
             else if Option.is_some prev_decl.body then
               compile_error "Duplicate function definition"
                 (ASTDeclaration (Function decl))

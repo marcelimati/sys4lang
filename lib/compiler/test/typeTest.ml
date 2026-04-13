@@ -649,6 +649,18 @@ let%expect_test "duplicated function definition" =
           5 |       void C::f() {}
                     ^^^^^^^^^^^^^^ |}]
 
+let%expect_test "v11 overloaded method declarations" =
+  type_test ~ain_version:11
+    {|
+      class C {
+        void f(int x, int y);
+        void f(int x);
+      };
+      void C::f(int x, int y) {}
+      void C::f(int x) {}
+    |};
+  [%expect {| ok |}]
+
 let%expect_test "undeclared method" =
   type_test {|
       class C {};
