@@ -17,8 +17,8 @@
 open Common
 open Compiler
 
-let type_test input =
-  let ctx = Jaf.context_from_ain (Ain.create 4 0) in
+let type_test ?(ain_version = 4) input =
+  let ctx = Jaf.context_from_ain (Ain.create ain_version 0) in
   let debug_info = DebugInfo.create () in
   try
     Compile.compile ctx [ Pje.Jaf "-" ] debug_info (fun _ -> input);
@@ -282,6 +282,14 @@ let%expect_test "variable declarations" =
         ref int ri = NULL;       // ok
       }
     |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 array ref type syntax" =
+  type_test ~ain_version:11 {|
+    class C {};
+    array@ref C xs;
+    void f(ref array@ref C ys) {}
+  |};
   [%expect {| ok |}]
 
 let%expect_test "class declarations" =

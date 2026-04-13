@@ -340,6 +340,7 @@ type_specifier
   (* FIXME: this disallows arrays/wraps of ref-qualified types *)
   | ARRAY AT atomic_type_specifier AT I_CONSTANT { multidim_array $5 $3 }
   | ARRAY AT atomic_type_specifier { Array $3 }
+  | ARRAY AT REF atomic_type_specifier { Array (Ref $4) }
   | WRAP AT type_specifier { Wrap $3 }
 
 statement
