@@ -1291,3 +1291,30 @@ let%expect_test "v11 ref array decl from global" =
     048: FUNC NULL
     054: EOF
     |}]
+
+let%expect_test "v11 NOT assign to int skips ITOB" =
+  compile_test ~ain_version:11
+    {|
+      class C {
+        int m_flag;
+        void Toggle() {
+          this.m_flag = !this.m_flag;
+        }
+      };
+    |};
+  [%expect
+    {|
+    000: FUNC C@Toggle
+    006: PUSHSTRUCTPAGE
+    008: PUSH 0
+    014: PUSHSTRUCTPAGE
+    016: PUSH 0
+    022: REF
+    024: NOT
+    026: ASSIGN
+    028: POP
+    030: RETURN
+    032: EOF test.jaf
+    038: FUNC NULL
+    044: EOF
+    |}]
