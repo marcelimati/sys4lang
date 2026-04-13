@@ -1209,24 +1209,38 @@ class jaf_compiler ctx debug_info =
         let v = self#get_local (Option.value_exn decl.index) in
         self#scope_add_var v;
         match v.value_type with
-        | Ref _ ->
-            let lhs =
-              {
-                node = Ident (decl.name, LocalVariable (v.index, decl.location));
-                ty = decl.type_spec.ty;
-                loc = decl.location;
-              }
-            and rhs =
-              match decl.initval with
-              | Some e -> e
-              | None -> make_expr ~ty:decl.type_spec.ty Null
-            in
-            self#compile_statement
-              {
-                node = RefAssign (lhs, rhs);
-                delete_vars = [];
-                loc = decl.location;
-              }
+        | Ref _ -> (
+            match decl.initval with
+            | Some e
+              when Ain.version ctx.ain > 8
+                   && (match v.value_type with Ref (Array _) -> true | _ -> false) ->
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#compile_delete_ref decl.type_spec.ty;
+                (* For v11 array-ref declarations, the original compiler
+                   pushes the rhs as a raw ref value and then uses ASSIGN;SP_INC
+                   on the freshly-declared slot. *)
+                self#compile_lvalue e;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC
+            | _ ->
+                let lhs =
+                  {
+                    node = Ident (decl.name, LocalVariable (v.index, decl.location));
+                    ty = decl.type_spec.ty;
+                    loc = decl.location;
+                  }
+                and rhs =
+                  match decl.initval with
+                  | Some e -> e
+                  | None -> make_expr ~ty:decl.type_spec.ty Null
+                in
+                self#compile_statement
+                  {
+                    node = RefAssign (lhs, rhs);
+                    delete_vars = [];
+                    loc = decl.location;
+                  })
         | Int | Bool | LongInt | Float | FuncType _ | String ->
             let lhs =
               {

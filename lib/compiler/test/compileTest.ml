@@ -1261,3 +1261,33 @@ let%expect_test "HLL-implemented builtin methods" =
     074: FUNC NULL
     080: EOF
     |}]
+
+(* v11 ref-decl: 'ref array@T List = globalArray;' uses the original
+   compiler's DUP2+REF+DELETE declaration pattern instead of the older
+   generic RefAssign lowering. *)
+let%expect_test "v11 ref array decl from global" =
+  compile_test ~ain_version:11 {| 
+    array@int g_List;
+    void f() {
+      ref array@int List = g_List;
+    }
+  |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: DUP2
+    016: REF
+    018: DELETE
+    020: PUSHGLOBALPAGE
+    022: PUSH 0
+    028: REF
+    030: ASSIGN
+    032: SP_INC
+    034: RETURN
+    036: ENDFUNC f
+    042: EOF test.jaf
+    048: FUNC NULL
+    054: EOF
+    |}]
