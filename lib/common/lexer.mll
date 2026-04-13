@@ -164,6 +164,7 @@ rule token = parse
   | (hp h+ '.' p) as n      { F_CONSTANT(Float.of_string n) }
   | ("'" mc* "'") as s      { C_CONSTANT(process_message s) }
   | ('"' sc* '"' ws*)+ as s { S_CONSTANT(process_string s) }
+  | ('<' (l a*) '>') as s   { IDENTIFIER(s) }
   | '+'                     { PLUS }
   | '-'                     { MINUS }
   | '*'                     { TIMES }

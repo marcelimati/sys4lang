@@ -46,6 +46,14 @@ let%expect_test "syntax error" =
         2 |     int c = ;
                         ^ |}]
 
+let%expect_test "v11 angle-bracketed identifier" =
+  type_test ~ain_version:11 {|
+    class C {
+      int <MouseEnterEvent>;
+    };
+  |};
+  [%expect {| ok |}]
+
 let%expect_test "undefined variable" =
   type_test {|
     int c = foo;
