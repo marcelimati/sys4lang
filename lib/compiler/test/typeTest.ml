@@ -312,6 +312,15 @@ let%expect_test "class declarations" =
     |};
   [%expect {| ok |}]
 
+let%expect_test "qualified class member declaration" =
+  type_test ~ain_version:11
+    {|
+      class C {
+        void Event::add(int x) {}
+      };
+    |};
+  [%expect {| ok |}]
+
 let%expect_test "undefined method" =
   type_test {|
       class C {

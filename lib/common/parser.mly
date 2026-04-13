@@ -531,7 +531,7 @@ struct_declaration
   | declaration_specifiers separated_nonempty_list(COMMA, declarator(IDENTIFIER)) SEMICOLON
     { let vars = vardecls ClassVar false $1 $2 in
       MemberDecl { decl_loc=$sloc; typespec=$1; is_const_decls = false; vars } }
-  | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
+  | declaration_specifiers qualified_funcname parameter_list(init_declarator(IDENTIFIER)) opt_body
     { Method (func $sloc $1 $2 $3 $4) }
   | IDENTIFIER LPAREN VOID? RPAREN opt_body
     { Constructor (func $sloc (implicit_void $symbolstartpos) $1 [] $5) }
