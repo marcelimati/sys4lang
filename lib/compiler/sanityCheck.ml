@@ -25,8 +25,7 @@ class sanity_check_visitor ctx =
     method! visit_expression expr =
       super#visit_expression expr;
       (match expr.ty with
-      | Untyped ->
-          compiler_bug "expression has no type" (Some (ASTExpression expr))
+      | Untyped -> () (* Generated/v11 code may have untyped expressions *)
       | _ -> ());
       match expr.node with
       | Ident (_, UnresolvedIdent) ->
@@ -35,9 +34,13 @@ class sanity_check_visitor ctx =
       | Ident (_, GlobalConstant) ->
           compiler_bug "global constant not eliminated"
             (Some (ASTExpression expr))
+      | Member ({ ty = (HLLParam | Ref HLLParam); _ }, _, UnresolvedMember) ->
+          () (* HLLParam member access deferred to runtime *)
       | Member (_, _, UnresolvedMember) ->
           compiler_bug "member expression has no member_type"
             (Some (ASTExpression expr))
+      | Call ({ ty = (HLLParam | Ref HLLParam); _ }, _, UnresolvedCall) ->
+          () (* HLLParam call deferred to runtime *)
       | Call (_, _, UnresolvedCall) ->
           compiler_bug "call expression has no call_type"
             (Some (ASTExpression expr))

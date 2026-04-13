@@ -189,6 +189,18 @@ let fundecl_of_builtin ctx builtin receiver_ty node_opt =
       make Int "Find"
         [ Int; Int; cb_argtype; cb_type ]
         ~defaults:[ None; None; None; cb_default ]
+  | ArrayAny ->
+      let cb_argtype =
+        match elem_ty with
+        | Int | Float | Bool | String -> elem_ty
+        | Struct _ -> Ref elem_ty
+        | _ ->
+            CompileError.compile_error
+              ("Any() is not supported for array@" ^ jaf_type_to_string elem_ty)
+              (Option.value_exn node_opt)
+      in
+      let cb_type = TyMethod ([ cb_argtype ], Bool) in
+      make Bool "Any" [ cb_type ]
   | DelegateNumof -> make Int "Numof" []
   | DelegateExist -> make Int "Exist" [ delegate_ft receiver_ty ]
   | DelegateErase -> make Void "Erase" [ delegate_ft receiver_ty ]

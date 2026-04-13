@@ -63,7 +63,14 @@ class visitor ctx =
         (* generate array initializer for the class *)
         let name = if !has_ctor then "2" else "0" in
         let full_name = s.name ^ "@" ^ name in
-        let f_index = (Ain.add_function ctx.ain full_name).index in
+        let f_index =
+          (* The function may have been pre-registered during
+             register_type_declarations to preserve ordering with the
+             original compiler. If so, reuse its index. *)
+          match Ain.get_function ctx.ain full_name with
+          | Some f -> f.index
+          | None -> (Ain.add_function ctx.ain full_name).index
+        in
         let fdecl =
           {
             name;
@@ -80,7 +87,7 @@ class visitor ctx =
               Some (Ain.get_struct ctx.ain s.name |> Option.value_exn).index;
           }
         in
-        Hashtbl.add_exn ctx.functions ~key:full_name ~data:fdecl;
+        Hashtbl.set ctx.functions ~key:full_name ~data:fdecl;
         initializer_funcs <- Function fdecl :: initializer_funcs;
         if not !has_ctor then
           (* register the generated constructor in ain *)

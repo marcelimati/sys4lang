@@ -1250,14 +1250,326 @@ let%expect_test "HLL-implemented builtin methods" =
     008: PUSH 0
     014: REF
     016: CALLHLL library(0), library_function(0)
-    026: S_PUSH "a"
-    032: CALLHLL library(0), library_function(0)
+    026: PUSHLOCALPAGE
+    028: PUSH 2
+    034: S_PUSH "a"
+    040: ASSIGN
+    042: CALLHLL library(0), library_function(0)
+    052: PUSHLOCALPAGE
+    054: PUSH 1
+    060: CALLHLL library(1), library_function(0)
+    070: RETURN
+    072: ENDFUNC f
+    078: EOF test.jaf
+    084: FUNC NULL
+    090: EOF
+    |}]
+
+(* v11 ref-decl: 'ref array@T List = globalArray;' must use
+   DUP2+REF+DELETE (not CHECKUDO+SWAP) to match the original v11 compiler.
+   Reproduces the task::Parts_Create pattern. *)
+let%expect_test "v11 ref array decl from global" =
+  compile_test ~ain_version:11 {|
+    array@int g_List;
+    void f() {
+      ref array@int List = g_List;
+    }
+  |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: DUP2
+    016: REF
+    018: DELETE
+    020: PUSHGLOBALPAGE
+    022: PUSH 0
+    028: REF
+    030: ASSIGN
+    032: SP_INC
+    034: RETURN
+    036: ENDFUNC f
+    042: EOF test.jaf
+    048: FUNC NULL
+    054: EOF
+    |}]
+
+let%expect_test "v11 null coalesce on ref-returning call keeps dummy refs" =
+  compile_test ~ain_version:11
+    {|
+      ref string Last(array@string xs) {
+        return NULL;
+      }
+      string f(array@string xs) {
+        return Last(xs) ?? "";
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC Last
+    006: PUSH -1
+    012: RETURN
+    014: PUSH -1
+    020: RETURN
+    022: ENDFUNC Last
+    028: FUNC f
+    034: PUSHLOCALPAGE
+    036: PUSH 0
+    042: REF
+    044: A_REF
+    046: CALLFUNC Last
+    052: PUSHLOCALPAGE
+    054: PUSH 1
+    060: REF
+    062: CHECKUDO
+    064: PUSHLOCALPAGE
+    066: SWAP
+    068: PUSH 1
+    074: SWAP
+    076: ASSIGN
+    078: DUP
+    080: PUSH -1
+    086: EQUALE
+    088: IFZ 128
+    094: POP
+    096: S_PUSH ""
+    102: PUSHLOCALPAGE
+    104: PUSH 2
+    110: REF
+    112: CHECKUDO
+    114: PUSHLOCALPAGE
+    116: SWAP
+    118: PUSH 2
+    124: SWAP
+    126: ASSIGN
+    128: A_REF
+    130: RETURN
+    132: S_PUSH ""
+    138: RETURN
+    140: ENDFUNC f
+    146: EOF test.jaf
+    152: FUNC NULL
+    158: EOF
+    |}]
+
+let%expect_test "v11 ref-return dummy survives until block end" =
+  compile_test ~ain_version:11
+    {|
+      struct S {
+        void Create(string name) {}
+      };
+      ref S Make(array@S xs) {
+        return NULL;
+      }
+      void f(array@S xs, string name) {
+        ref S s;
+        {
+          s <- Make(xs);
+          s.Create(name);
+        }
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC S@Create
+    006: RETURN
+    008: FUNC Make
+    014: PUSH -1
+    020: RETURN
+    022: PUSH -1
+    028: RETURN
+    030: ENDFUNC Make
+    036: FUNC f
     042: PUSHLOCALPAGE
-    044: PUSH 1
-    050: CALLHLL library(1), library_function(0)
-    060: RETURN
-    062: ENDFUNC f
-    068: EOF test.jaf
-    074: FUNC NULL
-    080: EOF
+    044: PUSH 2
+    050: DUP2
+    052: REF
+    054: DELETE
+    056: PUSH -1
+    062: ASSIGN
+    064: POP
+    066: PUSHLOCALPAGE
+    068: PUSH 2
+    074: DUP2
+    076: REF
+    078: DELETE
+    080: PUSHLOCALPAGE
+    082: PUSH 0
+    088: REF
+    090: A_REF
+    092: CALLFUNC Make
+    098: PUSHLOCALPAGE
+    100: PUSH 3
+    106: REF
+    108: CHECKUDO
+    110: PUSHLOCALPAGE
+    112: SWAP
+    114: PUSH 3
+    120: SWAP
+    122: ASSIGN
+    124: DUP
+    126: SP_INC
+    128: ASSIGN
+    130: POP
+    132: SH_LOCALDELETE <dummy : Make : 10>
+    138: PUSHLOCALPAGE
+    140: PUSH 2
+    146: REF
+    148: PUSH 1
+    154: PUSHLOCALPAGE
+    156: PUSH 1
+    162: REF
+    164: A_REF
+    166: CALLMETHOD S@Create
+    172: SH_LOCALDELETE <dummy : Make : 10>
+    178: RETURN
+    180: ENDFUNC f
+    186: EOF test.jaf
+    192: FUNC NULL
+    198: EOF
+    |}]
+
+let%expect_test "v11 hidden property string setter keeps rhs as raw ref" =
+  compile_test ~ain_version:11
+    {|
+      class C {
+      public:
+        string <Sound>;
+        void Sound::set(string value) {
+          this.<Sound> = value;
+        }
+      };
+    |};
+  [%expect
+    {|
+    000: FUNC C@Sound::set
+    006: PUSHSTRUCTPAGE
+    008: PUSH 0
+    014: REF
+    016: PUSHLOCALPAGE
+    018: PUSH 0
+    024: REF
+    026: S_ASSIGN
+    028: POP
+    030: RETURN
+    032: EOF test.jaf
+    038: FUNC NULL
+    044: EOF
+    |}]
+
+(* Foreach counter increment must emit INC then reload (no DUP2),
+   matching the original compiler's pattern.  Uses ain v6 since the
+   test disassembler can't decode v11 CALLHLL (3-arg form);
+   the ForeachInc codegen is version-independent. *)
+let%expect_test "foreach counter uses INC-reload not DUP2" =
+  compile_test ~ain_version:6
+    {|
+      void f(array@int xs) {
+        foreach (x : xs) {
+          x = 0;
+        }
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 3
+    014: DUP2
+    016: REF
+    018: DELETE
+    020: DUP2
+    022: SH_LOCALREF xs
+    028: ASSIGN
+    030: DUP_X2
+    032: POP
+    034: REF
+    036: SP_INC
+    038: POP
+    040: SH_LOCALASSIGN <foreach_i_1>, -1
+    050: PUSHLOCALPAGE
+    052: PUSH 1
+    058: INC
+    060: PUSHLOCALPAGE
+    062: PUSH 1
+    068: REF
+    070: PUSHLOCALPAGE
+    072: PUSH 3
+    078: PUSH 1
+    084: A_NUMOF
+    086: LT
+    088: IFZ 136
+    094: PUSHLOCALPAGE
+    096: PUSH 2
+    102: SH_LOCALREF <foreach_container_1>
+    108: SH_LOCALREF <foreach_i_1>
+    114: R_ASSIGN
+    116: POP
+    118: POP
+    120: SH_LOCALASSIGN x, 0
+    130: JUMP 50
+    136: SH_LOCALDELETE <foreach_container_1>
+    142: RETURN
+    144: ENDFUNC f
+    150: EOF test.jaf
+    156: FUNC NULL
+    162: EOF
+    |}]
+
+(* v11: NOT;ASSIGN to non-Bool member should NOT have ITOB between them *)
+let%expect_test "v11 NOT assign to int skips ITOB" =
+  compile_test ~ain_version:11
+    {|
+      class C {
+        int m_flag;
+        void Toggle() {
+          this.m_flag = !this.m_flag;
+        }
+      };
+    |};
+  [%expect {|
+    000: FUNC C@Toggle
+    006: PUSHSTRUCTPAGE
+    008: PUSH 0
+    014: PUSHSTRUCTPAGE
+    016: PUSH 0
+    022: REF
+    024: NOT
+    026: ASSIGN
+    028: POP
+    030: RETURN
+    032: EOF test.jaf
+    038: FUNC NULL
+    044: EOF
+    |}]
+
+let%expect_test "v11 struct array element member unwraps fat ref" =
+  compile_test ~ain_version:11
+    {|
+      struct S {
+        int m;
+      };
+      void f(array@S xs) {
+        xs[0].m == 0;
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: REF
+    016: PUSH 0
+    022: REF
+    024: PUSH 0
+    030: REF
+    032: PUSH 0
+    038: EQUALE
+    040: POP
+    042: RETURN
+    044: ENDFUNC f
+    050: EOF test.jaf
+    056: FUNC NULL
+    062: EOF
     |}]

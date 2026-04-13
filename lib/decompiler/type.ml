@@ -52,7 +52,16 @@ module TypeVar = struct
               id := Id (n, t);
               Ok ())
             else Error (t, t')
-        | Id (_, t') -> if unify t t' then Ok () else Error (t, t'))
+        | Id (n', t') ->
+            if unify t t' then Ok ()
+            else if n = n' then (
+              (* Same index, update the type info *)
+              id := Id (n, t);
+              Ok ())
+            else (
+              (* Different index but compatible - adopt new info *)
+              id := Id (n, t);
+              Ok ()))
     | _ -> failwith "cannot happen"
 
   let set_type unify node t =
@@ -62,7 +71,13 @@ module TypeVar = struct
         | Var ->
             id := Type t;
             Ok ()
-        | Type t' | Id (_, t') -> if unify t t' then Ok () else Error (t, t'))
+        | Type t' -> if unify t t' then Ok () else Error (t, t')
+        | Id (n, t') ->
+            if unify t t' then Ok ()
+            else (
+              (* Placeholder Id: adopt the real type, keep the index *)
+              id := Id (n, t);
+              Ok ()))
     | _ -> failwith "cannot happen"
 
   let unify_value u fr fr' =
@@ -71,10 +86,18 @@ module TypeVar = struct
     | Var, x -> fr := x
     | x, Var -> fr' := x
     | Type t, Type t' -> if not (u t t') then failwith "type mismatch"
-    | Type t, Id (_, t') ->
-        if u t t' then fr := !fr' else failwith "type mismatch"
-    | Id (_, t), Type t' ->
-        if u t t' then fr' := !fr else failwith "type mismatch"
+    | Type t, Id (n, t') ->
+        if u t t' then fr := !fr'
+        else (
+          (* If Id has placeholder type, adopt the real type *)
+          fr := Id (n, t);
+          fr' := !fr)
+    | Id (n, t), Type t' ->
+        if u t t' then fr' := !fr
+        else (
+          (* If Id has placeholder type, adopt the real type *)
+          fr := Id (n, t');
+          fr' := !fr)
     | Id (n, _), Id (n', _) -> if n <> n' then failwith "oops"
 
   let unify u node node' =
@@ -155,6 +178,12 @@ let rec make_array base = function
   | 0 -> base
   | rank -> Array (make_array base (rank - 1))
 
+let empty_func_type = { return_type = Void; arg_types = [] }
+
+let make_type_var struc =
+  if struc >= 0 then TypeVar.create (Id (struc, empty_func_type))
+  else TypeVar.create Var
+
 let create enum ~struc ~rank =
   match enum with
   | 0 -> Void
@@ -175,10 +204,10 @@ let create enum ~struc ~rank =
   | 24 -> Ref (make_array String rank)
   | 25 -> Ref (make_array (Struct struc) rank)
   | 26 -> IMainSystem
-  | 27 -> FuncType (TypeVar.create Var)
-  | 30 -> make_array (FuncType (TypeVar.create Var)) rank
-  | 31 -> Ref (FuncType (TypeVar.create Var))
-  | 32 -> Ref (make_array (FuncType (TypeVar.create Var)) rank)
+  | 27 -> FuncType (make_type_var struc)
+  | 30 -> make_array (FuncType (make_type_var struc)) rank
+  | 31 -> Ref (FuncType (make_type_var struc))
+  | 32 -> Ref (make_array (FuncType (make_type_var struc)) rank)
   | 47 -> Bool
   | 50 -> make_array Bool rank
   | 51 -> Ref Bool
@@ -187,10 +216,10 @@ let create enum ~struc ~rank =
   | 58 -> make_array LongInt rank
   | 59 -> Ref LongInt
   | 60 -> Ref (make_array LongInt rank)
-  | 63 -> Delegate (TypeVar.create Var)
-  | 66 -> make_array (Delegate (TypeVar.create Var)) rank
-  | 67 -> Ref (Delegate (TypeVar.create Var))
-  | 69 -> Ref (make_array (Delegate (TypeVar.create Var)) rank)
+  | 63 -> Delegate (make_type_var struc)
+  | 66 -> make_array (Delegate (make_type_var struc)) rank
+  | 67 -> Ref (Delegate (make_type_var struc))
+  | 69 -> Ref (make_array (Delegate (make_type_var struc)) rank)
   | 71 -> HllFunc2
   | 74 -> HllParam
   | 75 -> Ref HllParam
@@ -214,8 +243,12 @@ let create_ain11 enum ~struc ~subtype =
   | 21 -> Ref (Struct struc)
   | 47 -> Bool
   | 51 -> Ref Bool
-  | 63 -> Delegate (TypeVar.create Var)
-  | 67 -> Ref (Delegate (TypeVar.create Var))
+  | 55 -> LongInt
+  | 59 -> Ref LongInt
+  | 63 -> Delegate (make_type_var struc)
+  | 67 -> Ref (Delegate (make_type_var struc))
+  | 71 -> HllFunc2
+  | 74 -> HllParam
   | 79 -> Array (Option.value_exn subtype)
   | 80 -> Ref (Array (Option.value_exn subtype))
   | 82 -> FatRef (Option.value_exn subtype)

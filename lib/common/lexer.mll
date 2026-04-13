@@ -84,12 +84,15 @@ let () =
               "string",       STRING;
               "hll_param",    HLL_PARAM;
               "hll_func",     HLL_FUNC;
+              "hll_func2",    HLL_FUNC2;
               "hll_delegate", HLL_DELEGATE;
               "if",           IF;
               "else",         ELSE;
               "while",        WHILE;
               "do",           DO;
               "for",          FOR;
+              "foreach",      FOREACH;
+              "foreach_r",    FOREACH_R;
               "switch",       SWITCH;
               "case",         CASE;
               "default",      DEFAULT;
@@ -150,6 +153,7 @@ let mc = [^ '\\' '\n' '\''] | es
 rule token = parse
     [' ' '\t' '\r']         { token lexbuf } (* skip blanks *)
   | "//" [^ '\n']*          { token lexbuf }
+  | "/* @lambda " ([^ '*']* as name) " */" { LAMBDA_NAME(String.rstrip name) }
   | "/*"                    { block_comment lexbuf }
   | ['\n' ]                 { Lexing.new_line lexbuf; token lexbuf }
   | d+ as n                 { I_CONSTANT(Int.of_string n) }
@@ -194,6 +198,8 @@ rule token = parse
   | ']'                     { RBRACKET }
   | '{'                     { LBRACE }
   | '}'                     { RBRACE }
+  | "?."                    { QUESTION_DOT }
+  | "??"                    { QUESTION_QUESTION }
   | '?'                     { QUESTION }
   | '='                     { ASSIGN }
   | "+="                    { PLUSASSIGN }
@@ -222,6 +228,7 @@ rule token = parse
                               | Some kw -> kw
                               | None -> IDENTIFIER(s)
                             }
+  | ('<' (l a*) '>') as s   { IDENTIFIER(s) }
   | _                       { raise Error }
   | eof                     { EOF }
 

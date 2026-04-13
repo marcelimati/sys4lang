@@ -30,6 +30,8 @@ type unary_op =
   | PreDec
   | PostInc
   | PostDec
+  | ForeachInc
+  | ForeachDec
 
 type binary_op =
   | Plus
@@ -83,6 +85,7 @@ type jaf_type =
   | Wrap of jaf_type
   | HLLParam
   | HLLFunc
+  | HLLFunc2
   | Delegate of (string * int) option
   | FuncType of (string * int) option
   | IMainSystem
@@ -122,6 +125,7 @@ type type_specifier = { mutable ty : jaf_type; location : location }
 type ident_type =
   | UnresolvedIdent
   | LocalVariable of int * location
+  | CapturedVariable of int * int (* index, capture_level *)
   | GlobalVariable of int
   | GlobalConstant
   | FunctionName of string
@@ -170,6 +174,9 @@ and ast_expression =
   | Assign of assign_op * expression * expression
   | Seq of expression * expression
   | Ternary of expression * expression * expression
+  | NullCoalesce of expression * expression (* a ?? b *)
+  | OptionalMember of expression * string * member_type (* a?.b *)
+  | OptionalCall of expression * expression option list * call_type (* a?.Method(args) *)
   | Cast of jaf_type * expression
   | Subscript of expression * expression
   | Member of expression * string * member_type
@@ -197,6 +204,8 @@ and ast_statement =
   | While of expression * statement
   | DoWhile of expression * statement
   | For of statement * expression option * expression option * statement
+  | ForEach of bool * string * string option * expression * statement
+      (* rev, var_name, index_var_name, array_expr, body *)
   | Goto of string
   | Continue
   | Break
@@ -218,7 +227,7 @@ and variable = {
   mutable is_private : bool;
   kind : variable_type;
   type_spec : type_specifier;
-  initval : expression option;
+  mutable initval : expression option;
   mutable index : int option;
 }
 
@@ -329,6 +338,145 @@ let ast_node_pos = function
       | Destructor f -> f.loc
       | Method f -> f.loc)
   | ASTType t -> t.location
+
+(* Desugar foreach into a while loop *)
+let foreach_counter = ref 0
+
+let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression) (body : statement) =
+  let id = (foreach_counter := !foreach_counter + 1; !foreach_counter) in
+  let counter_name = match ivar_name with
+    | Some name -> name
+    | None -> Printf.sprintf "<foreach_i_%d>" id
+  in
+  let container_name = Printf.sprintf "<foreach_container_%d>" id in
+  let dl = dummy_location in
+  let mk_expr node = { ty = Untyped; node; loc = dl } in
+  let mk_stmt node = { node; delete_vars = []; loc } in
+  let mk_ts ty = { ty; location = dl } in
+  let counter_id = mk_expr (Ident (counter_name, UnresolvedIdent)) in
+  let container_id = mk_expr (Ident (container_name, UnresolvedIdent)) in
+  let numof_call =
+    mk_expr
+      (Call
+         ( mk_expr (Member (container_id, "Numof", UnresolvedMember)),
+           [],
+           UnresolvedCall ))
+  in
+  let counter_init_val =
+    if rev then numof_call else mk_expr (ConstInt (-1))
+  in
+  let mk_var name ty =
+    {
+      name;
+      location = dl;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = LocalVar;
+      type_spec = mk_ts ty;
+      initval = None;
+      index = None;
+    }
+  in
+  (* Two-phase foreach variable setup:
+     Phase 1 (alloc-only): is_private=true, no initval → allocates index, no code.
+     Phase 2 (init): is_private=true, has initval → allocator skips (name already exists),
+       codegen generates init code via normal declaration path. *)
+  let counter_alloc =
+    mk_stmt (Declarations { decl_loc = dl; is_const_decls = false;
+                            typespec = mk_ts Int;
+                            vars = [ { (mk_var counter_name Int) with is_private = true } ] })
+  in
+  (* Wrap rvalue container expressions (function calls) in RvalueRef
+     so variableAlloc creates the proper DummyRef variable *)
+  let container_expr = match arr_expr.node with
+    | Call _ -> { arr_expr with node = RvalueRef arr_expr }
+    | _ -> arr_expr
+  in
+  let container_init =
+    mk_stmt (Declarations { decl_loc = dl; is_const_decls = false;
+                            typespec = mk_ts (Ref (Array HLLParam));
+                            vars = [ { (mk_var container_name (Ref (Array HLLParam)))
+                                       with is_private = true; initval = Some container_expr } ] })
+  in
+  let counter_init =
+    mk_stmt (Declarations { decl_loc = dl; is_const_decls = false;
+                            typespec = mk_ts Int;
+                            vars = [ { (mk_var counter_name Int)
+                                       with is_private = true; initval = Some counter_init_val } ] })
+  in
+  let while_cond =
+    if rev then
+      mk_expr
+        (Binary
+           ( GTE,
+             mk_expr (Unary (ForeachDec, counter_id)),
+             mk_expr (ConstInt 0) ))
+    else
+      mk_expr
+        (Binary (LT, mk_expr (Unary (ForeachInc, counter_id)), numof_call))
+  in
+  (* Loop variable: wrap<T> (the void pair comes from the registry var replacement) *)
+  let var_decl =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts (Wrap HLLParam);
+           vars = [ mk_var var_name (Wrap HLLParam) ];
+         })
+  in
+  let var_ref_assign =
+    mk_stmt
+      (RefAssign
+         ( mk_expr (Ident (var_name, UnresolvedIdent)),
+           mk_expr (Subscript (container_id, counter_id)) ))
+  in
+  let body_stmts =
+    match body.node with Compound stmts -> stmts | _ -> [ body ]
+  in
+  let while_body =
+    mk_stmt (Compound ([ var_ref_assign ] @ body_stmts))
+  in
+  let while_stmt = mk_stmt (While (while_cond, while_body)) in
+  (* Phase 1: counter_alloc (index only). Phase 2: var_decl, container_init, counter_init.
+     container_init and counter_init have is_private+initval: allocate index AND emit code. *)
+  mk_stmt (Compound [ counter_alloc; var_decl; container_init; counter_init; while_stmt ])
+
+let rec desugar_foreach_in_stmt (stmt : statement) =
+  match stmt.node with
+  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+      desugar_foreach_in_stmt
+        (desugar_foreach_stmt stmt.loc rev var_name ivar_name arr_expr body)
+  | Compound stmts ->
+      { stmt with node = Compound (List.map stmts ~f:desugar_foreach_in_stmt) }
+  | If (test, then_, else_) ->
+      { stmt with
+        node = If (test, desugar_foreach_in_stmt then_, desugar_foreach_in_stmt else_) }
+  | While (test, body) ->
+      { stmt with node = While (test, desugar_foreach_in_stmt body) }
+  | DoWhile (test, body) ->
+      { stmt with node = DoWhile (test, desugar_foreach_in_stmt body) }
+  | For (init, test, inc, body) ->
+      { stmt with node = For (init, test, inc, desugar_foreach_in_stmt body) }
+  | Switch (expr, stmts) ->
+      { stmt with node = Switch (expr, List.map stmts ~f:desugar_foreach_in_stmt) }
+  | _ -> stmt
+
+let desugar_foreach_in_fundecl (f : fundecl) =
+  f.body <- Option.map f.body ~f:(List.map ~f:desugar_foreach_in_stmt)
+
+let desugar_foreach decls =
+  List.iter decls ~f:(function
+    | Function f | FuncTypeDef f | DelegateDef f ->
+        desugar_foreach_in_fundecl f
+    | StructDef s ->
+        List.iter s.decls ~f:(function
+          | Method f | Constructor f | Destructor f ->
+              desugar_foreach_in_fundecl f
+          | _ -> ())
+    | _ -> ())
 
 type jaf_struct = {
   name : string;
@@ -479,6 +627,13 @@ class ivisitor ctx =
           self#visit_expression arr;
           self#visit_expression i
       | Member (obj, _, _) -> self#visit_expression obj
+      | OptionalMember (obj, _, _) -> self#visit_expression obj
+      | OptionalCall (f, args, _) ->
+          self#visit_expression f;
+          List.iter args ~f:(Option.iter ~f:self#visit_expression)
+      | NullCoalesce (a, b) ->
+          self#visit_expression a;
+          self#visit_expression b
       | Call (f, args, _) ->
           self#visit_expression f;
           List.iter args ~f:(Option.iter ~f:self#visit_expression)
@@ -520,6 +675,11 @@ class ivisitor ctx =
           self#visit_statement init;
           Option.iter test ~f:self#visit_expression;
           Option.iter inc ~f:self#visit_expression;
+          self#visit_statement body;
+          self#env#pop
+      | ForEach (_, _, _, arr, body) ->
+          self#env#push;
+          self#visit_expression arr;
           self#visit_statement body;
           self#env#pop
       | Goto _ -> ()
@@ -592,6 +752,8 @@ let unary_op_to_string op =
   | PreDec -> "--"
   | PostInc -> "++"
   | PostDec -> "--"
+  | ForeachInc -> "++"
+  | ForeachDec -> "--"
 
 let binary_op_to_string op =
   match op with
@@ -652,6 +814,7 @@ let rec jaf_type_to_string = function
   | Wrap t -> "wrap<" ^ jaf_type_to_string t ^ ">"
   | HLLParam -> "hll_param"
   | HLLFunc -> "hll_func"
+  | HLLFunc2 -> "hll_func2"
   | IMainSystem -> "IMainSystem"
   | NullType -> "null"
   | TyFunction (args, ret) | TyMethod (args, ret) ->
@@ -677,7 +840,7 @@ let rec expr_to_string (e : expression) =
   | Unary (op, e) -> (
       match op with
       | PostInc | PostDec -> expr_to_string e ^ unary_op_to_string op
-      | _ -> unary_op_to_string op ^ expr_to_string e)
+      | ForeachInc | ForeachDec | _ -> unary_op_to_string op ^ expr_to_string e)
   | Binary (op, a, b) ->
       sprintf "%s %s %s" (expr_to_string a) (binary_op_to_string op)
         (expr_to_string b)
@@ -691,6 +854,11 @@ let rec expr_to_string (e : expression) =
   | Cast (t, e) -> sprintf "(%s)%s" (jaf_type_to_string t) (expr_to_string e)
   | Subscript (e, i) -> sprintf "%s[%s]" (expr_to_string e) (expr_to_string i)
   | Member (e, s, _) -> sprintf "%s.%s" (expr_to_string e) s
+  | OptionalMember (e, s, _) -> sprintf "%s?.%s" (expr_to_string e) s
+  | OptionalCall (f, args, _) ->
+      sprintf "%s%s" (expr_to_string f) (arglist_to_string args)
+  | NullCoalesce (a, b) ->
+      sprintf "%s ?? %s" (expr_to_string a) (expr_to_string b)
   | Call (f, args, _) ->
       sprintf "%s%s" (expr_to_string f) (arglist_to_string args)
   | New ts -> sprintf "new %s" (jaf_type_to_string ts.ty)
@@ -724,6 +892,10 @@ let rec stmt_to_string (stmt : statement) =
       let s_body = stmt_to_string body in
       let s_inc = expr_opt_to_string inc in
       sprintf "for (%s %s %s) %s" s_init s_test s_inc s_body
+  | ForEach (rev, var, _ivar, arr, body) ->
+      sprintf "foreach%s (%s : %s) %s"
+        (if rev then "_r" else "")
+        var (expr_to_string arr) (stmt_to_string body)
   | Goto label -> sprintf "goto %s;" label
   | Continue -> "continue;"
   | Break -> "break;"
@@ -861,6 +1033,7 @@ let rec jaf_to_ain_type = function
   | Wrap t -> Ain.Type.Wrap (jaf_to_ain_type t)
   | HLLParam -> Ain.Type.HLLParam
   | HLLFunc -> Ain.Type.HLLFunc
+  | HLLFunc2 -> Ain.Type.HLLFunc2
   | Delegate (Some (_, i)) -> Ain.Type.Delegate i
   | Delegate None -> Ain.Type.Delegate (-1)
   | FuncType (Some (_, i)) -> Ain.Type.FuncType i
@@ -891,8 +1064,15 @@ let rec ain_to_jaf_type ain = function
   | FuncType -1 -> FuncType None
   | FuncType i -> FuncType (Some ((Ain.get_functype_by_index ain i).name, i))
   | IMainSystem -> IMainSystem
-  | t ->
-      Printf.failwithf "cannot convert %s to jaf type" (Ain.Type.to_string t) ()
+  | HLLFunc2 -> HLLFunc2
+  | IFace i -> Struct ((Ain.get_struct_by_index ain i).name, i)
+  | Enum _ | Enum2 _ -> Int (* TODO: proper enum support *)
+  | Option t -> Ref (ain_to_jaf_type ain t) (* TODO: proper option support *)
+  | NullType -> NullType
+  | Unknown87 t -> Ref (ain_to_jaf_type ain t)
+  | IFaceWrap i -> Struct ((Ain.get_struct_by_index ain i).name, i)
+  | Unknown98 -> Int
+  | Function | Method -> HLLFunc
 
 let jaf_to_ain_variables j_p =
   let rec convert_params (params : variable list) (result : Ain.Variable.t list)
@@ -943,9 +1123,9 @@ let jaf_to_ain_struct j_s (a_s : Ain.Struct.t) =
     a_s with
     members;
     constructor;
-    destructor
+    destructor;
     (* TODO: interfaces *)
-    (* TODO: vmethods *);
+    (* vmethods built later from ain function table *)
   }
 
 let jaf_to_ain_functype j_f =
@@ -1052,7 +1232,9 @@ let context_from_ain ?(constants : variable list = []) ain =
           class_index;
         }
       in
-      Hashtbl.set functions ~key:f.name ~data:func);
+      (* Only register functions with real type info - skip pre-populated stubs *)
+      if List.length f.vars > 0 || not (Poly.(f.return_type = Ain.Type.Void))
+      then Hashtbl.set functions ~key:f.name ~data:func);
   Ain.functype_iter ain ~f:(fun (f : Ain.FunctionType.t) ->
       Hashtbl.add_exn functypes ~key:f.name ~data:(ain_to_jaf_functype f));
   Ain.delegate_iter ain ~f:(fun (f : Ain.FunctionType.t) ->

@@ -95,6 +95,7 @@ let rec multidim_array dims t =
 %token <string> C_CONSTANT
 %token <string> S_CONSTANT
 %token <string> IDENTIFIER
+%token <string> LAMBDA_NAME
 /* arithmetic */
 %token PLUS MINUS TIMES DIV MOD
 /* bitwise */
@@ -109,11 +110,11 @@ let rec multidim_array dims t =
 %token SWAP
 /* delimiters */
 %token LPAREN RPAREN RBRACKET LBRACKET LBRACE RBRACE
-%token QUESTION COLON COCO SEMICOLON AT COMMA DOT HASH FATARROW
+%token QUESTION QUESTION_DOT QUESTION_QUESTION COLON COCO SEMICOLON AT COMMA DOT HASH FATARROW
 /* types */
-%token VOID CHAR INT LINT FLOAT BOOL STRING HLL_PARAM HLL_FUNC HLL_DELEGATE
+%token VOID CHAR INT LINT FLOAT BOOL STRING HLL_PARAM HLL_FUNC HLL_FUNC2 HLL_DELEGATE
 /* keywords */
-%token IF ELSE WHILE DO FOR SWITCH CASE DEFAULT NULL THIS NEW
+%token IF ELSE WHILE DO FOR FOREACH FOREACH_R SWITCH CASE DEFAULT NULL THIS NEW
 %token GOTO CONTINUE BREAK RETURN JUMP JUMPS ASSERT
 %token CONST REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM
 %token FILE_MACRO LINE_MACRO DATE_MACRO TIME_MACRO GLOBALGROUP UNKNOWN_FUNCTYPE
@@ -161,6 +162,8 @@ primary_expression
   | LPAREN expression RPAREN { {$2 with loc=$sloc} }
   | parameter_list(init_declarator(IDENTIFIER)) FATARROW declaration_specifiers block
     { make_expr ~loc:$sloc (Lambda (func ~is_lambda:true $sloc $3 "<lambda>" $1 (Some $4))) }
+  | LAMBDA_NAME parameter_list(init_declarator(IDENTIFIER)) FATARROW declaration_specifiers block
+    { make_expr ~loc:$sloc (Lambda (func ~is_lambda:true $sloc $4 $1 $2 (Some $5))) }
   ;
 
 (* Due to the way menhir handles reduce/reduce conflicts, the generation rule
@@ -199,7 +202,10 @@ postfix_expression
   | primitive_type_specifier LPAREN expression RPAREN { make_expr ~loc:$sloc (Cast ($1, $3)) }
   | postfix_expression arglist { make_expr ~loc:$sloc (Call ($1, $2, UnresolvedCall)) }
   | NEW qualified_name { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
+  | NEW qualified_name LPAREN RPAREN { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
   | postfix_expression DOT IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
+  | postfix_expression DOT IDENTIFIER COCO IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3 ^ "::" ^ $5, UnresolvedMember)) }
+  | postfix_expression QUESTION_DOT IDENTIFIER { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
   | postfix_expression INC { make_expr ~loc:$sloc (Unary (PostInc, $1)) }
   | postfix_expression DEC { make_expr ~loc:$sloc (Unary (PostDec, $1)) }
   ;
@@ -282,9 +288,13 @@ logor_expression
   | logor_expression OR logand_expression { make_expr ~loc:$sloc (Binary (LogOr, $1, $3)) }
   ;
 
-cond_expression
+null_coalesce_expression
   : logor_expression { $1 }
-  | logor_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
+  | null_coalesce_expression QUESTION_QUESTION logor_expression { make_expr ~loc:$sloc (NullCoalesce ($1, $3)) }
+
+cond_expression
+  : null_coalesce_expression { $1 }
+  | null_coalesce_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
   ;
 
 assign_expression
@@ -326,6 +336,7 @@ primitive_type_specifier
   | STRUCT       { Struct("struct", -1) }
   | HLL_PARAM    { HLLParam }
   | HLL_FUNC     { HLLFunc }
+  | HLL_FUNC2    { HLLFunc2 }
   | HLL_DELEGATE { Delegate (Some ("hll_delegate", -1)) }
   | UNKNOWN_FUNCTYPE { FuncType None }
   | UNKNOWN_DELEGATE { Delegate None }
@@ -337,9 +348,10 @@ atomic_type_specifier
 
 type_specifier
   : atomic_type_specifier { $1 }
-  (* FIXME: this disallows arrays/wraps of ref-qualified types *)
   | ARRAY AT atomic_type_specifier AT I_CONSTANT { multidim_array $5 $3 }
   | ARRAY AT atomic_type_specifier { Array $3 }
+  | ARRAY AT REF atomic_type_specifier { Array (Ref $4) }
+  | ARRAY { Array HLLParam } (* bare array for v11+ HLL declarations *)
   | WRAP AT type_specifier { Wrap $3 }
 
 statement
@@ -407,7 +419,15 @@ iteration_statement
            $6,
            $8)
     }
-  ; 
+  | FOREACH LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, None, $5, $7) }
+  | FOREACH LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, Some $5, $7, $9) }
+  | FOREACH_R LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, None, $5, $7) }
+  | FOREACH_R LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, Some $5, $7, $9) }
+  ;
 
 jump_statement
   : GOTO IDENTIFIER SEMICOLON { Goto ($2) }
@@ -532,6 +552,8 @@ struct_declaration
       MemberDecl { decl_loc=$sloc; typespec=$1; is_const_decls = false; vars } }
   | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
     { Method (func $sloc $1 $2 $3 $4) }
+  | declaration_specifiers IDENTIFIER COCO IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
+    { Method (func $sloc $1 ($2 ^ "::" ^ $4) $5 $6) }
   | IDENTIFIER LPAREN VOID? RPAREN opt_body
     { Constructor (func $sloc (implicit_void $symbolstartpos) $1 [] $5) }
   | BITNOT IDENTIFIER LPAREN RPAREN opt_body

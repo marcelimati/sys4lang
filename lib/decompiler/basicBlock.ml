@@ -1856,6 +1856,12 @@ let generate_var_decls (func : Ain.Function.t) bbs =
         (Call (Builtin2 (DG_CLEAR, Deref (PageRef (LocalPage, var))), []))
       when is_uninitialized var ->
         VarDecl (var, None)
+    | Expression
+        (Call
+           ( Builtin2 (X_SET, Deref (PageRef (LocalPage, var))),
+             [ expr ] ))
+      when is_uninitialized var ->
+        VarDecl (var, Some (ASSIGN, expr))
     | stmt -> stmt
   in
   List.map bbs ~f:(function { code = terminator, stmts; _ } as bb ->

@@ -155,7 +155,7 @@ val get_function : t -> string -> Function.t option
 val get_function_by_index : t -> int -> Function.t
 val write_function : t -> Function.t -> unit
 val write_new_function : t -> Function.t -> int
-val add_function : t -> string -> Function.t
+val add_function : ?nr_args:int -> t -> string -> Function.t
 val get_struct : t -> string -> Struct.t option
 val get_struct_index : t -> string -> int option
 val get_struct_by_index : t -> int -> Struct.t
@@ -197,6 +197,7 @@ val append_bytecode : t -> CBuffer.t -> unit
 val code_size : t -> int
 val set_main_function : t -> int -> unit
 val set_message_function : t -> int -> unit
+val debug_print_header : t -> unit
 val nr_globals : t -> int
 val nr_functions : t -> int
 val nr_structs : t -> int

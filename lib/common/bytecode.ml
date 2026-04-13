@@ -1302,6 +1302,7 @@ type builtin =
   | ArraySortBy
   | ArrayReverse
   | ArrayFind
+  | ArrayAny
   | DelegateNumof
   | DelegateExist
   | DelegateErase
@@ -1342,6 +1343,7 @@ let array_builtin_of_string = function
   | "SortBy" -> Some ArraySortBy
   | "Reverse" -> Some ArrayReverse
   | "Find" -> Some ArrayFind
+  | "Any" -> Some ArrayAny
   | _ -> None
 
 let delegate_builtin_of_string = function

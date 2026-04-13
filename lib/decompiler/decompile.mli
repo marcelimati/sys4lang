@@ -28,6 +28,14 @@ val decompile :
 
 val inspect : string -> print_addr:bool -> unit
 
+val decompile_function :
+  lambdas:(int, CodeSection.function_t) Base.Hashtbl.t ->
+  CodeSection.function_t ->
+  CodeGen.function_t
+
+val process_generated_constructors :
+  CodeGen.struct_t array -> CodeSection.t -> CodeSection.t
+
 val export :
   print_addr:bool ->
   decompiled_ain ->

@@ -20,6 +20,7 @@ open Jaf
 open CompileError
 
 let lambda_index = ref 0
+let _lambda_file_index : (string, int) Hashtbl.t = Hashtbl.create (module String)
 
 (*
  * AST pass over top-level declarations register names in the .ain file.
@@ -32,19 +33,98 @@ class type_declare_visitor ctx =
     method! visit_fundecl decl =
       if decl.is_lambda then (
         lambda_index := !lambda_index + 1;
-        decl.name <- Printf.sprintf "<lambda : %d>" !lambda_index;
-        decl.class_name <-
-          (Option.value_exn self#env#current_function).class_name);
+        (* Use annotated name if provided, otherwise generate one *)
+        let lambda_name =
+          if not (String.equal decl.name "<lambda>") then
+            (* Name was set by @lambda annotation in decompiled source *)
+            decl.name
+          else
+            let pos = fst decl.loc in
+            if String.equal pos.Lexing.pos_fname "" then
+              Printf.sprintf "<lambda : %d>" !lambda_index
+            else
+              let fname = pos.Lexing.pos_fname in
+              let rel =
+                String.substr_replace_all fname ~pattern:"/" ~with_:"\\"
+              in
+              let asra_pat = "Asra3\\" in
+              let rel =
+                match String.substr_index rel ~pattern:asra_pat with
+                | Some i -> String.drop_prefix rel (i + String.length asra_pat)
+                | None -> Stdlib.Filename.basename fname
+              in
+              Printf.sprintf "<lambda : %s%d>" rel !lambda_index
+        in
+        decl.name <- lambda_name;
+        (* For annotated lambdas, the name already includes the class prefix *)
+        if String.equal lambda_name "<lambda>" || not (String.mem lambda_name '@')
+        then
+          decl.class_name <-
+            (Option.value_exn self#env#current_function).class_name);
       let name = mangled_name decl in
-      if Option.is_some decl.body then
-        decl.index <- Some (Ain.add_function ctx.ain name).index;
+      let nr_args = List.length decl.params in
+      if Option.is_some decl.body then (
+        (* v11: create undefined ghost lambda entry before the real one.
+           The original compiler creates these for delegate callback matching.
+           Ghost has addr=-1 (no code), same params, same return type. *)
+        if decl.is_lambda && Ain.version ctx.ain > 8 then (
+          let ghost = Ain.Function.create name in
+          let ghost = { ghost with
+            nr_args;
+            return_type = Jaf.jaf_to_ain_type decl.return.ty;
+            is_lambda = true;
+          } in
+          ignore (Ain.write_new_function ctx.ain ghost));
+        (* Pre-register the @2 array initializer function immediately before
+           a constructor definition. The original compiler interleaves these
+           (e.g. CASTimer@2 at index N, CASTimer@0 at N+1). The body of the
+           @2 function is generated later by arrayInit.ml, which will find
+           and reuse this pre-registered index. *)
+        (if is_constructor decl then
+           let init_name =
+             Option.value_exn decl.class_name ^ "@2"
+           in
+           match Ain.get_function ctx.ain init_name with
+           | Some _ -> ()
+           | None -> ignore (Ain.add_function ctx.ain init_name));
+        decl.index <- Some (Ain.add_function ~nr_args ctx.ain name).index);
       Hashtbl.update ctx.functions name ~f:(function
         | Some prev_decl ->
             if
               not (ft_compatible (ft_of_fundecl decl) (ft_of_fundecl prev_decl))
             then
-              compile_error "Function signature mismatch"
-                (ASTDeclaration (Function decl))
+              if Ain.version ctx.ain < 11 then
+                compile_error "Function signature mismatch"
+                  (ASTDeclaration (Function decl))
+              else (
+                (* Overloaded function (v11+): use arity-based key. *)
+                let ft = ft_of_fundecl decl in
+                let nr_params = List.length decl.params in
+                let rec find_key suffix =
+                  let key =
+                    if suffix = 0 then Printf.sprintf "%s#%d" name nr_params
+                    else Printf.sprintf "%s#%d_%d" name nr_params suffix
+                  in
+                  match Hashtbl.find ctx.functions key with
+                  | Some existing
+                    when ft_compatible ft (ft_of_fundecl existing) ->
+                      (key, Some existing)
+                  | None -> (key, None)
+                  | _ -> find_key (suffix + 1)
+                in
+                let key, matching = find_key 0 in
+                (match matching with
+                | Some overload_decl when Option.is_some decl.body ->
+                    (* Providing body for a declared overload -
+                       decl.index was already set at line 67, keep it *)
+                    overload_decl.index <- decl.index;
+                    decl.params <- overload_decl.params;
+                    Hashtbl.set ctx.functions ~key ~data:decl
+                | _ ->
+                    (* New overload declaration or definition -
+                       decl.index was already set at line 67 if body exists *)
+                    Hashtbl.set ctx.functions ~key ~data:decl);
+                prev_decl)
             else if Option.is_some prev_decl.body then
               compile_error "Duplicate function definition"
                 (ASTDeclaration (Function decl))
@@ -68,8 +148,10 @@ class type_declare_visitor ctx =
           List.iter ds.vars ~f:(fun g ->
               match Hashtbl.add ctx.globals ~key:g.name ~data:g with
               | `Duplicate ->
-                  compile_error "duplicate global definition"
-                    (ASTDeclaration decl)
+                  (* Base ain already has this global - preserve index *)
+                  let existing = Hashtbl.find_exn ctx.globals g.name in
+                  g.index <- existing.index;
+                  Hashtbl.set ctx.globals ~key:g.name ~data:g
               | `Ok ->
                   if not g.is_const then
                     g.index <- Some (Ain.add_global ctx.ain g.name gg_index))
@@ -88,19 +170,34 @@ class type_declare_visitor ctx =
                 if not (Hashtbl.mem ctx.functions (mangled_name f)) then
                   compile_error
                     (f.name ^ " is not declared in class " ^ qual)
-                    (ASTDeclaration decl)));
+                    (ASTDeclaration decl))
+              else
+                (* Try splitting one level higher for property accessors
+                   (e.g., Class::Property::get → class=Class, name=Property::get) *)
+                match Util.parse_qualified_name qual with
+                | Some qual2, prop_name
+                  when Hashtbl.mem ctx.structs qual2 ->
+                    f.name <- prop_name ^ "::" ^ name;
+                    f.class_name <- Some qual2;
+                    if not (Hashtbl.mem ctx.functions (mangled_name f)) then
+                      compile_error
+                        (f.name ^ " is not declared in class " ^ qual2)
+                        (ASTDeclaration decl)
+                | _ -> ());
           self#visit_fundecl f
       | FuncTypeDef f -> (
           match Hashtbl.add ctx.functypes ~key:f.name ~data:f with
           | `Duplicate ->
-              compile_error "duplicate functype definition"
-                (ASTDeclaration decl)
+              let existing = Hashtbl.find_exn ctx.functypes f.name in
+              f.index <- existing.index;
+              Hashtbl.set ctx.functypes ~key:f.name ~data:f
           | `Ok -> f.index <- Some (Ain.add_functype ctx.ain f.name).index)
       | DelegateDef f -> (
           match Hashtbl.add ctx.delegates ~key:f.name ~data:f with
           | `Duplicate ->
-              compile_error "duplicate delegate definition"
-                (ASTDeclaration decl)
+              let existing = Hashtbl.find_exn ctx.delegates f.name in
+              f.index <- existing.index;
+              Hashtbl.set ctx.delegates ~key:f.name ~data:f
           | `Ok -> f.index <- Some (Ain.add_delegate ctx.ain f.name).index)
       | StructDef s -> (
           let unqualified_struct_name =
@@ -152,7 +249,8 @@ class type_declare_visitor ctx =
           List.iter s.decls ~f:visit_decl;
           match Hashtbl.add ctx.structs ~key:s.name ~data:jaf_s with
           | `Duplicate ->
-              compile_error "duplicate struct definition" (ASTDeclaration decl)
+              (* Base ain already has this struct - update rather than error *)
+              Hashtbl.set ctx.structs ~key:s.name ~data:jaf_s
           | `Ok -> ())
       | Enum _ ->
           compile_error "enum types not yet supported" (ASTDeclaration decl)
@@ -273,14 +371,26 @@ class type_define_visitor ctx =
       | FuncTypeDef f -> jaf_to_ain_functype f |> Ain.write_functype ctx.ain
       | DelegateDef f -> jaf_to_ain_functype f |> Ain.write_delegate ctx.ain
       | StructDef s -> (
-          (* check for undefined methods *)
+          (* check for undefined methods - skip property accessors (::get/::set/::add/::remove) *)
+          let is_property_accessor name =
+            String.is_suffix name ~suffix:"::get"
+            || String.is_suffix name ~suffix:"::set"
+            || String.is_suffix name ~suffix:"::add"
+            || String.is_suffix name ~suffix:"::remove"
+          in
           List.iter s.decls ~f:(function
             | Method f | Constructor f | Destructor f ->
-                if Option.is_none f.index then
-                  compile_error
-                    (Printf.sprintf "No definition of %s::%s found" s.name
-                       f.name)
-                    (ASTDeclaration (Function f))
+                if Option.is_none f.index && not (is_property_accessor f.name)
+                then
+                  if Ain.version ctx.ain >= 11 then
+                    (* v11: skip undefined methods - they may be property accessors
+                       or methods from emptied files *)
+                    ()
+                  else
+                    compile_error
+                      (Printf.sprintf "No definition of %s::%s found" s.name
+                         f.name)
+                      (ASTDeclaration (Function f))
             | _ -> ());
           match Ain.get_struct ctx.ain s.name with
           | Some obj -> obj |> jaf_to_ain_struct s |> Ain.write_struct ctx.ain
@@ -329,9 +439,23 @@ let define_library ctx decls hll_name import_name =
       functions = List.map ~f:jaf_to_ain_hll_function functions;
     };
   let functions =
-    Hashtbl.create_with_key_exn
-      (module String)
-      ~get_key:(fun (d : fundecl) -> d.name)
-      functions
+    let tbl = Hashtbl.create (module String) in
+    List.iter functions ~f:(fun (d : fundecl) ->
+        (* Allow duplicate HLL function names (overloads in v11+).
+           Store unique overloads by name#arity key. First one keeps the base name. *)
+        let key = d.name in
+        if Hashtbl.mem tbl key then (
+          let arity = List.length d.params in
+          let rec find_free suffix =
+            let k =
+              if suffix = 0 then Printf.sprintf "%s#%d" d.name arity
+              else Printf.sprintf "%s#%d_%d" d.name arity suffix
+            in
+            if Hashtbl.mem tbl k then find_free (suffix + 1)
+            else k
+          in
+          Hashtbl.set tbl ~key:(find_free 0) ~data:d)
+        else Hashtbl.set tbl ~key ~data:d);
+    tbl
   in
-  Hashtbl.add_exn ctx.libraries ~key:import_name ~data:{ hll_name; functions }
+  Hashtbl.set ctx.libraries ~key:import_name ~data:{ hll_name; functions }

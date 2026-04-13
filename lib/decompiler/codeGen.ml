@@ -338,7 +338,10 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
             List.find (Stack.top_exn current_function).lambdas ~f:(fun f ->
                 Poly.equal f.func func)
           with
-          | Some func -> self#print_function ~as_lambda:true func
+          | Some func ->
+              (* Annotate with original lambda name for roundtrip *)
+              bprintf out "/* @lambda %s */ " func.func.name;
+              self#print_function ~as_lambda:true func
           | None -> Printf.failwithf "unresolved lambda %s" func.name ())
       | BoundMethod (Number -1l, f) ->
           bprintf out "&%s" (Ain.Function.parse_name f).name
@@ -417,6 +420,10 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           bprintf out "%a.%s(%a)"
             (self#pr_expr (prec_value PREC_DOT))
             obj f.name self#pr_arg_list args
+      | Call (Builtin2 (X_SET, expr), [ arg ]) ->
+          bprintf out "%a = %a"
+            (self#pr_expr 0)
+            expr (self#pr_expr 0) arg
       | Call (f, args) ->
           bprintf out "%a(%a)" self#pr_callable f self#pr_arg_list args
       | C_Ref (str, i) ->
@@ -501,26 +508,38 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | IMainSystem -> print_string out "IMainSystem"
       | FuncType ftv -> (
           match Type.TypeVar.get_value ftv with
-          | Id (n, _) -> print_string out Ain.ain.fnct.(n).name
+          | Id (n, _) ->
+              let name = Ain.ain.fnct.(n).name in
+              if String.contains name '@' then
+                print_string out "unknown_functype"
+              else print_string out name
           | Type t ->
               (* Output the first functype matching the inferred type *)
-              let ft =
-                Array.find_exn Ain.ain.fnct ~f:(fun ft ->
-                    Poly.(t = Ain.FuncType.to_type ft))
-              in
-              print_string out ft.name
+              (match
+                Array.find Ain.ain.fnct ~f:(fun ft ->
+                    Poly.(t = Ain.FuncType.to_type ft)
+                    && not (String.contains ft.name '@'))
+              with
+              | Some ft -> print_string out ft.name
+              | None -> print_string out "unknown_functype")
           | Var -> print_string out "unknown_functype")
       | StructMember _ -> failwith "cannot happen"
       | Delegate dtv -> (
           match Type.TypeVar.get_value dtv with
-          | Id (n, _) -> print_string out Ain.ain.delg.(n).name
+          | Id (n, _) ->
+              let name = Ain.ain.delg.(n).name in
+              if String.contains name '@' then
+                print_string out "unknown_delegate"
+              else print_string out name
           | Type t ->
               (* Output the first delegate type matching the inferred type *)
-              let dt =
-                Array.find_exn Ain.ain.delg ~f:(fun ft ->
-                    Poly.(t = Ain.FuncType.to_type ft))
-              in
-              print_string out dt.name
+              (match
+                Array.find Ain.ain.delg ~f:(fun ft ->
+                    Poly.(t = Ain.FuncType.to_type ft)
+                    && not (String.contains ft.name '@'))
+              with
+              | Some dt -> print_string out dt.name
+              | None -> print_string out "unknown_delegate")
           | Var -> print_string out "unknown_delegate")
       | HllFunc2 -> print_string out "hll_func2"
       | HllParam -> print_string out "hll_param"
@@ -857,12 +876,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | args -> self#println "(%a);" (pr_param_list self#pr_vardecl) args
 
     method print_hll (funcs : Ain.HLL.function_t array) =
-      let printed = Hash_set.create (module String) in
-      Array.iter funcs ~f:(fun func ->
-          if Hash_set.mem printed func.name then
-            print_string out "// (duplicated) "
-          else Hash_set.add printed func.name;
-          self#print_hll_function func)
+      Array.iter funcs ~f:(fun func -> self#print_hll_function func)
 
     method print_hll_inc =
       self#println "SystemSource = {";

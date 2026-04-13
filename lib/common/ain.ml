@@ -431,7 +431,7 @@ module Enum = struct
 end
 
 type t = {
-  is_ain2 : bool;
+  mutable is_ain2 : bool;
   mutable major_version : int;
   mutable minor_version : int;
   mutable keyc : int32;
@@ -883,6 +883,7 @@ let load filename =
     match Buffer.contents magic with
     | "AI2\x00" ->
         (* compressed ain *)
+        ain.is_ain2 <- true;
         let read_int ch =
           let buf = Buffer.create 4 in
           Option.value_exn (In_channel.input_buffer ch buf ~len:4);
@@ -951,14 +952,28 @@ let write_msg1_string buf s =
   BinBuffer.add_bytes buf tmp
 
 let rec write_variable_type ?(var = true) buf ain (t : Type.t) =
+  (* For v11, some Ref types don't have dedicated type codes - write the inner
+     type instead. The Ref is encoded by the context (e.g., variable vs return). *)
+  (* v11: HLLParam/Ref HLLParam are not valid variable type codes.
+     Map to safe defaults. This is a fallback for foreach vars not resolved during type check. *)
+  let t =
+    if version_gte ain (11, 0) then
+      match t with
+      | Type.HLLParam -> Type.Int
+      | Type.Ref Type.HLLParam -> Type.Ref Type.Int
+      | _ -> t
+    else t
+  in
   BinBuffer.add_int buf (Type.int_of_data_type ain.major_version t);
   BinBuffer.add_int buf (Type.int_of_struct_type ain.major_version t ~var);
-  BinBuffer.add_int buf (Type.int_of_rank ain.major_version t);
   if version_gte ain (11, 0) then
     match t with
-    | Array t | Wrap t | Option t | Unknown87 t ->
+    | Array t | Wrap t | Option t | Unknown87 t
+    | Ref (Array t | Wrap t | Option t | Unknown87 t) ->
+        BinBuffer.add_bool buf true;
         write_variable_type ~var buf ain t
-    | _ -> ()
+    | _ -> BinBuffer.add_bool buf false
+  else BinBuffer.add_int buf (Type.int_of_rank ain.major_version t)
 
 let write_return_type buf ain (t : Type.t) =
   if version_gte ain (11, 0) then write_variable_type ~var:false buf ain t
@@ -970,6 +985,16 @@ let write_string_option buf opt = Option.iter opt ~f:(BinBuffer.add_cstring buf)
 
 let write_variable buf ain (v : Variable.t) =
   let module BB = BinBuffer in
+  (* For v11, the type written may differ from value_type (e.g. HLLParam→Int).
+     The initval format must match the WRITTEN type, not the original type. *)
+  let written_type =
+    if version_gte ain (11, 0) then
+      match v.value_type with
+      | HLLParam -> Type.Int
+      | Ref HLLParam -> Type.Ref Type.Int
+      | _ -> v.value_type
+    else v.value_type
+  in
   let write_variable_initval (opt : Variable.initval option) =
     BB.add_bool buf (Option.is_some opt);
     match opt with
@@ -982,7 +1007,16 @@ let write_variable buf ain (v : Variable.t) =
   BB.add_cstring buf v.name;
   if_version_gte ain (12, 0) (write_string_option buf) () v.name2;
   write_variable_type buf ain v.value_type;
-  if_version_gte ain (8, 0) write_variable_initval () v.initval
+  (* Use written_type to determine initval format *)
+  let initval_for_written_type =
+    match (written_type, v.initval) with
+    | (Ref _ | Struct _ | Delegate _ | Array _), _ -> v.initval
+    | _, Some Variable.Void ->
+        (* Type was changed from Ref→Int; Void initval needs to become Int 0 *)
+        Some (Variable.Int 0l)
+    | _ -> v.initval
+  in
+  if_version_gte ain (8, 0) write_variable_initval () initval_for_written_type
 
 let write_function buf ain (f : Function.t) =
   let module BB = BinBuffer in
@@ -1153,10 +1187,12 @@ let to_buffer ain =
   (* XXX: section first appears in Oyako Rankan (mid v6) *)
   if Array.length ain.delegates > 0 then (
     BB.add_string buf "DELG";
-    BB.add_int buf 0;
-    (* FIXME: section size *)
-    BB.add_int buf (Array.length ain.delegates);
-    Array.iter ain.delegates ~f:(write_functype buf ain));
+    (* Compute section size by writing to a temp buffer first *)
+    let tmp_buf = BB.create 65536 in
+    BB.add_int tmp_buf (Array.length ain.delegates);
+    Array.iter ain.delegates ~f:(write_functype tmp_buf ain);
+    BB.add_int32 buf (Int32.of_int_exn (BB.length tmp_buf));
+    BB.add_buffer buf tmp_buf);
   if version_gte ain (5, 0) then (
     BB.add_string buf "OBJG";
     BB.add_int buf (Array.length ain.global_group_names);
@@ -1210,6 +1246,13 @@ let write ?(raw = false) ain out =
 
 let write_file ain file = Out_channel.with_file file ~f:(write ain) ~binary:true
 
+let debug_print_header ain =
+  let msgf_name = if ain.msgf >= 0 && ain.msgf < Array.length ain.functions
+    then ain.functions.(ain.msgf).name else "?" in
+  let main_name = if ain.main >= 0 && ain.main < Array.length ain.functions
+    then ain.functions.(ain.main).name else "?" in
+  Stdio.eprintf "MSGF=%d (%s) MAIN=%d (%s)\n" ain.msgf msgf_name ain.main main_name
+
 (* globals *)
 
 let get_global ain name =
@@ -1245,11 +1288,17 @@ let write_new_global ain (v : Variable.t) =
   index
 
 let add_global ain name group_index =
-  let index = Array.length ain.globals in
-  let variable = Variable.make ~index name Void in
-  let g = Global.create variable group_index in
-  ain.globals <- Array.append ain.globals [| g |];
-  index
+  match
+    Array.findi ain.globals ~f:(fun _ (g : Global.t) ->
+        String.equal g.variable.name name)
+  with
+  | Some (i, _) -> i
+  | None ->
+      let index = Array.length ain.globals in
+      let variable = Variable.make ~index name Void in
+      let g = Global.create variable group_index in
+      ain.globals <- Array.append ain.globals [| g |];
+      index
 
 let add_global_group ain name =
   match
@@ -1279,9 +1328,45 @@ let write_new_function ain f =
   ain.functions <- Array.append ain.functions [| { f with index } |];
   index
 
-let add_function ain name =
-  let no = Function.create name |> write_new_function ain in
-  ain.functions.(no)
+let add_function ?(nr_args = -1) ain name =
+  (* Try to find existing function: prefer unclaimed stubs (address=-1) *)
+  let found =
+    if nr_args >= 0 then
+      (* First try: unclaimed stub with matching name+arity *)
+      match
+        Array.find ain.functions ~f:(fun f ->
+            String.equal f.name name && f.nr_args = nr_args && f.address = -1)
+      with
+      | Some f ->
+          ain.functions.(f.index) <- { f with address = -2 };
+          Some ain.functions.(f.index)
+      | None -> (
+          match
+            Array.find ain.functions ~f:(fun f ->
+                String.equal f.name name && f.address = -1)
+          with
+          | Some f ->
+              ain.functions.(f.index) <- { f with address = -2 };
+              Some ain.functions.(f.index)
+          | None -> None)
+    else
+      (* No arity specified: find any unclaimed, or any existing *)
+      match
+        Array.find ain.functions ~f:(fun f ->
+            String.equal f.name name && f.address = -1)
+      with
+      | Some f ->
+          ain.functions.(f.index) <- { f with address = -2 };
+          Some ain.functions.(f.index)
+      | None -> get_function ain name
+  in
+  match found with
+  | Some f -> f
+  | None ->
+      let f = Function.create name in
+      let f = if nr_args >= 0 then { f with nr_args; address = -2 } else f in
+      let no = write_new_function ain f in
+      ain.functions.(no)
 
 (* structures *)
 
@@ -1302,8 +1387,11 @@ let write_new_struct ain s =
   index
 
 let add_struct ain name =
-  let no = Struct.create name |> write_new_struct ain in
-  ain.structures.(no)
+  match get_struct ain name with
+  | Some s -> s
+  | None ->
+      let no = Struct.create name |> write_new_struct ain in
+      ain.structures.(no)
 
 (* switches *)
 
@@ -1349,9 +1437,14 @@ let write_new_library ain lib =
   index
 
 let add_library ain name =
-  let lib : Library.t = { index = -1; name; functions = [] } in
-  let no = write_new_library ain lib in
-  ain.libraries.(no)
+  match
+    Array.findi ain.libraries ~f:(fun _ (l : Library.t) -> String.equal l.name name)
+  with
+  | Some (_, l) -> l
+  | None ->
+      let lib : Library.t = { index = -1; name; functions = [] } in
+      let no = write_new_library ain lib in
+      ain.libraries.(no)
 
 let function_of_hll_function_index ain lib_no fun_no : Function.t =
   let lib_fun = List.nth_exn ain.libraries.(lib_no).functions fun_no in
@@ -1401,8 +1494,14 @@ let write_new_functype ain ft =
   index
 
 let add_functype ain name =
-  let no = FunctionType.create name |> write_new_functype ain in
-  ain.function_types.(no)
+  match
+    Array.findi ain.function_types ~f:(fun _ (ft : FunctionType.t) ->
+        String.equal ft.name name)
+  with
+  | Some (_, ft) -> ft
+  | None ->
+      let no = FunctionType.create name |> write_new_functype ain in
+      ain.function_types.(no)
 
 (* TODO: should be FunctionType.to_function *)
 let function_of_functype (ft : FunctionType.t) no : Function.t =
@@ -1446,8 +1545,14 @@ let write_new_delegate ain dg =
   index
 
 let add_delegate ain name =
-  let no = FunctionType.create name |> write_new_delegate ain in
-  ain.delegates.(no)
+  match
+    Array.findi ain.delegates ~f:(fun _ (ft : FunctionType.t) ->
+        String.equal ft.name name)
+  with
+  | Some (_, ft) -> ft
+  | None ->
+      let no = FunctionType.create name |> write_new_delegate ain in
+      ain.delegates.(no)
 
 let function_of_delegate_index ain no =
   function_of_functype ain.delegates.(no) no
