@@ -234,6 +234,24 @@ let process_generated_constructors (structs : CodeGen.struct_t array)
           (fname, funcs));
   }
 
+(* Compare two [ain_type]s structurally. [Delegate] / [FuncType] wrap a
+   [TypeVar]: two [Delegate]s may point to the same underlying function
+   type through different link chains, so [Poly.equal] on the surface
+   refs is unreliable. Resolve to the root value and compare by id when
+   possible; fall back to [Poly.equal] for everything else. *)
+let ain_type_equal (t1 : Type.ain_type) (t2 : Type.ain_type) =
+  let tv_id tv =
+    match Type.TypeVar.get_value tv with
+    | Type.TypeVar.Id (n, _) -> Some n
+    | _ -> None
+  in
+  match (t1, t2) with
+  | Type.Delegate a, Type.Delegate b | Type.FuncType a, Type.FuncType b -> (
+      match (tv_id a, tv_id b) with
+      | Some n, Some n' -> n = n'
+      | _ -> false)
+  | _ -> Poly.equal t1 t2
+
 (* Detect v11 event method pairs on a struct: methods named
    [Name::add(T)] and [Name::remove(T)] with matching single-parameter
    signatures. Returns [(event_pairs, remaining_methods)]. *)
@@ -274,7 +292,7 @@ let extract_event_pairs (methods : CodeGen.function_t list) :
           match
             (Ain.Function.args add.func, Ain.Function.args remove.func)
           with
-          | [ a ], [ r ] when Poly.equal a.type_ r.type_ ->
+          | [ a ], [ r ] when ain_type_equal a.type_ r.type_ ->
               events :=
                 CodeGen.
                   {

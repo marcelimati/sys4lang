@@ -478,6 +478,17 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           bprintf out "%a.%s(%a)"
             (self#pr_expr (prec_value PREC_DOT))
             obj f.name self#pr_arg_list args
+      (* v11 [X_SET] is the array copy-assign opcode: at the bytecode
+         level [dst.Set(src)] is the lowered form of [dst = src] when
+         both sides are arrays. Emit it as a normal assignment so it
+         round-trips. *)
+      | Call (Builtin2 (X_SET, dst), [ src ]) ->
+          let op_prec = prec_value PREC_ASSIGN in
+          open_paren prec op_prec out;
+          bprintf out "%a = %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            dst (self#pr_expr op_prec) src;
+          close_paren prec op_prec out
       | Call (f, args) ->
           bprintf out "%a(%a)" self#pr_callable f self#pr_arg_list args
       | C_Ref (str, i) ->
@@ -521,6 +532,13 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | Delegate (_, e) -> self#pr_expr (prec_value PREC_DOT) out e
       | SysCall n -> print_string out syscalls.(n).name
       | HllFunc (lib, func) -> bprintf out "%s.%s" lib func.name
+      (* [(new T()).method(...)] decompiles to a [Method (New {...},
+         func)] callable. Surface it as [new T.method(...)] so the
+         output is parseable — the parenthesized [(new T()).method]
+         form would otherwise produce a syntax error in the recompile. *)
+      | Method (New { struc; args = []; _ }, func) ->
+          bprintf out "new %s.%s" Ain.ain.strt.(struc).name
+            (strip_class_name func.name)
       | Method (expr, func) ->
           bprintf out "%a.%s"
             (self#pr_expr (prec_value PREC_DOT))
