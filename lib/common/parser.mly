@@ -359,6 +359,27 @@ type_specifier
   | ARRAY AT REF atomic_type_specifier { Array (Ref $4) }
   | WRAP AT type_specifier { Wrap $3 }
 
+(* HLL declarations allow a bare `array` (meaning array of untyped
+   hll_param). Only reachable from hll_declaration / its parameter list. *)
+hll_type_specifier
+  : type_specifier { $1 }
+  | ARRAY { Array HLLParam }
+
+hll_declaration_specifiers
+  : REF hll_type_specifier { { location = $sloc; ty = Ref $2 } }
+  | hll_type_specifier { { location = $sloc; ty = $1 } }
+  ;
+
+hll_parameter_declaration
+  : hll_declaration_specifiers declarator(IDENTIFIER)
+    { vardecl Parameter false $1 { $2 with loc=$sloc } }
+  ;
+
+hll_parameter_list
+  : LPAREN separated_list(COMMA, hll_parameter_declaration) RPAREN { $2 }
+  | LPAREN VOID RPAREN { [] }
+  ;
+
 statement
   : declaration_statement { stmt $sloc $1 }
   | label_statement { stmt $sloc $1 }
@@ -574,7 +595,7 @@ bodied_accessor
   ;
 
 hll_declaration
-  : declaration_specifiers IDENTIFIER parameter_list(declarator(IDENTIFIER)) SEMICOLON
+  : hll_declaration_specifiers IDENTIFIER hll_parameter_list SEMICOLON
     { Function (func $sloc $1 $2 $3 None) }
 
 %inline struct_or_class
