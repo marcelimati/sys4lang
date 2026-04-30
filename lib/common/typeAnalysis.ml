@@ -71,6 +71,11 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
   | Array a, Array b -> type_equal a b
   | Wrap a, Wrap b -> type_equal a b
   | HLLFunc, HLLFunc -> true
+  (* v11 [hll_func2] is the polymorphic-callable wildcard used by HLL
+     bridges. Treat it as compatible with anything so HLL function
+     pointers and delegates flow through without coercion. *)
+  | HLLFunc2, _ -> true
+  | _, HLLFunc2 -> true
   | Void, _
   | Ref _, _
   | Int, _

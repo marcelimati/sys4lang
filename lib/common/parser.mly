@@ -333,6 +333,7 @@ primitive_type_specifier
   | STRUCT       { Struct("struct", -1) }
   | HLL_PARAM    { HLLParam }
   | HLL_FUNC     { HLLFunc }
+  | HLL_FUNC2    { HLLFunc2 }
   | HLL_DELEGATE { Delegate (Some ("hll_delegate", -1)) }
   | UNKNOWN_FUNCTYPE { FuncType None }
   | UNKNOWN_DELEGATE { Delegate None }

@@ -83,6 +83,7 @@ type jaf_type =
   | Wrap of jaf_type
   | HLLParam
   | HLLFunc
+  | HLLFunc2
   | Delegate of (string * int) option
   | FuncType of (string * int) option
   | IMainSystem
@@ -652,6 +653,7 @@ let rec jaf_type_to_string = function
   | Wrap t -> "wrap<" ^ jaf_type_to_string t ^ ">"
   | HLLParam -> "hll_param"
   | HLLFunc -> "hll_func"
+  | HLLFunc2 -> "hll_func2"
   | IMainSystem -> "IMainSystem"
   | NullType -> "null"
   | TyFunction (args, ret) | TyMethod (args, ret) ->
@@ -861,6 +863,7 @@ let rec jaf_to_ain_type = function
   | Wrap t -> Ain.Type.Wrap (jaf_to_ain_type t)
   | HLLParam -> Ain.Type.HLLParam
   | HLLFunc -> Ain.Type.HLLFunc
+  | HLLFunc2 -> Ain.Type.HLLFunc2
   | Delegate (Some (_, i)) -> Ain.Type.Delegate i
   | Delegate None -> Ain.Type.Delegate (-1)
   | FuncType (Some (_, i)) -> Ain.Type.FuncType i
@@ -886,6 +889,7 @@ let rec ain_to_jaf_type ain = function
   | Wrap t -> Wrap (ain_to_jaf_type ain t)
   | HLLParam -> HLLParam
   | HLLFunc -> HLLFunc
+  | HLLFunc2 -> HLLFunc2
   | Delegate -1 -> Delegate None
   | Delegate i -> Delegate (Some ((Ain.get_delegate_by_index ain i).name, i))
   | FuncType -1 -> FuncType None

@@ -445,8 +445,8 @@ class jaf_compiler ctx debug_info =
       | String -> self#write_instruction0 S_POP
       | Delegate _ -> self#write_instruction0 DG_POP
       | Struct _ -> self#write_instruction0 SR_POP
-      | IMainSystem | HLLParam | Array _ | Wrap _ | HLLFunc | NullType | Untyped
-      | Unresolved _ | MemberPtr _ | TypeUnion _ ->
+      | IMainSystem | HLLParam | Array _ | Wrap _ | HLLFunc | HLLFunc2
+      | NullType | Untyped | Unresolved _ | MemberPtr _ | TypeUnion _ ->
           compiler_bug
             ("compile_pop: unsupported value type " ^ jaf_type_to_string t)
             (Some parent)
