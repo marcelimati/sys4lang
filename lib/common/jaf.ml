@@ -30,6 +30,10 @@ type unary_op =
   | PreDec
   | PostInc
   | PostDec
+  (* v11 foreach increment/decrement on the loop counter — emitted by
+     foreach desugaring. Behaves like PreInc/PreDec for codegen. *)
+  | ForeachInc
+  | ForeachDec
 
 type binary_op =
   | Plus
@@ -209,6 +213,11 @@ and ast_statement =
   | While of expression * statement
   | DoWhile of expression * statement
   | For of statement * expression option * expression option * statement
+  (* v11 foreach: [foreach (var : array)] or [foreach_r] for reverse,
+     with optional explicit index variable name as the third field.
+     Lowered into a while loop by [desugar_foreach] before type
+     analysis runs, so codegen never sees this variant directly. *)
+  | ForEach of bool * string * string option * expression * statement
   | Goto of string
   | Continue
   | Break
@@ -539,6 +548,11 @@ class ivisitor ctx =
           Option.iter inc ~f:self#visit_expression;
           self#visit_statement body;
           self#env#pop
+      | ForEach (_, _, _, arr_expr, body) ->
+          self#env#push;
+          self#visit_expression arr_expr;
+          self#visit_statement body;
+          self#env#pop
       | Goto _ -> ()
       | Continue -> ()
       | Break -> ()
@@ -609,6 +623,8 @@ let unary_op_to_string op =
   | PreDec -> "--"
   | PostInc -> "++"
   | PostDec -> "--"
+  | ForeachInc -> "++"
+  | ForeachDec -> "--"
 
 let binary_op_to_string op =
   match op with
@@ -745,6 +761,11 @@ let rec stmt_to_string (stmt : statement) =
       let s_body = stmt_to_string body in
       let s_inc = expr_opt_to_string inc in
       sprintf "for (%s %s %s) %s" s_init s_test s_inc s_body
+  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+      let kw = if rev then "foreach_r" else "foreach" in
+      let i = match ivar_name with Some n -> ", " ^ n | None -> "" in
+      sprintf "%s (%s%s : %s) %s" kw var_name i
+        (expr_to_string arr_expr) (stmt_to_string body)
   | Goto label -> sprintf "goto %s;" label
   | Continue -> "continue;"
   | Break -> "break;"
@@ -1003,6 +1024,179 @@ let ain_to_jaf_variable ain kind (v : Ain.Variable.t) =
     initval = None;
     index = Some v.index;
   }
+
+(* v11 foreach desugar machinery. [foreach (var : array)] is rewritten
+   into a [while] loop with a synthetic counter and a synthetic alias
+   to the container so the surrounding type-resolution / codegen
+   passes don't need to know about [ForEach] directly. The counter
+   uses [ForeachInc]/[ForeachDec] in the loop test so codegen can
+   detect "this is the foreach pre-test increment" and emit the
+   matching original compiler bytecode. *)
+let foreach_counter = ref 0
+
+let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
+    (body : statement) =
+  let id =
+    foreach_counter := !foreach_counter + 1;
+    !foreach_counter
+  in
+  let counter_name =
+    match ivar_name with
+    | Some name -> name
+    | None -> Printf.sprintf "<foreach_i_%d>" id
+  in
+  let container_name = Printf.sprintf "<foreach_container_%d>" id in
+  let dl = dummy_location in
+  let mk_expr node = { ty = Untyped; node; loc = dl } in
+  let mk_stmt node = { node; delete_vars = []; loc } in
+  let mk_ts ty = { ty; location = dl } in
+  let counter_id = mk_expr (Ident (counter_name, UnresolvedIdent)) in
+  let container_id = mk_expr (Ident (container_name, UnresolvedIdent)) in
+  let numof_call =
+    mk_expr
+      (Call
+         ( mk_expr (Member (container_id, "Numof", UnresolvedMember)),
+           [],
+           UnresolvedCall ))
+  in
+  let counter_init_val =
+    if rev then numof_call else mk_expr (ConstInt (-1))
+  in
+  let mk_var name ty =
+    {
+      name;
+      location = dl;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = LocalVar;
+      type_spec = mk_ts ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let counter_alloc =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts Int;
+           vars = [ { (mk_var counter_name Int) with is_private = true } ];
+         })
+  in
+  let container_expr =
+    match arr_expr.node with
+    | Call _ -> { arr_expr with node = RvalueRef arr_expr }
+    | _ -> arr_expr
+  in
+  let container_init =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts (Ref (Array HLLParam));
+           vars =
+             [
+               {
+                 (mk_var container_name (Ref (Array HLLParam))) with
+                 is_private = true;
+                 initval = Some container_expr;
+               };
+             ];
+         })
+  in
+  let counter_init =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts Int;
+           vars =
+             [
+               {
+                 (mk_var counter_name Int) with
+                 is_private = true;
+                 initval = Some counter_init_val;
+               };
+             ];
+         })
+  in
+  let while_cond =
+    if rev then
+      mk_expr
+        (Binary
+           ( GTE,
+             mk_expr (Unary (ForeachDec, counter_id)),
+             mk_expr (ConstInt 0) ))
+    else
+      mk_expr (Binary (LT, mk_expr (Unary (ForeachInc, counter_id)), numof_call))
+  in
+  let var_decl =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts (Wrap HLLParam);
+           vars = [ mk_var var_name (Wrap HLLParam) ];
+         })
+  in
+  let var_ref_assign =
+    mk_stmt
+      (RefAssign
+         ( mk_expr (Ident (var_name, UnresolvedIdent)),
+           mk_expr (Subscript (container_id, counter_id)) ))
+  in
+  let body_stmts =
+    match body.node with Compound stmts -> stmts | _ -> [ body ]
+  in
+  let while_body = mk_stmt (Compound (var_ref_assign :: body_stmts)) in
+  let while_stmt = mk_stmt (While (while_cond, while_body)) in
+  mk_stmt
+    (Compound [ counter_alloc; var_decl; container_init; counter_init; while_stmt ])
+
+let rec desugar_foreach_in_stmt (stmt : statement) =
+  match stmt.node with
+  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+      desugar_foreach_in_stmt
+        (desugar_foreach_stmt stmt.loc rev var_name ivar_name arr_expr body)
+  | Compound stmts ->
+      { stmt with node = Compound (List.map stmts ~f:desugar_foreach_in_stmt) }
+  | If (test, then_, else_) ->
+      {
+        stmt with
+        node =
+          If (test, desugar_foreach_in_stmt then_, desugar_foreach_in_stmt else_);
+      }
+  | While (test, body) ->
+      { stmt with node = While (test, desugar_foreach_in_stmt body) }
+  | DoWhile (test, body) ->
+      { stmt with node = DoWhile (test, desugar_foreach_in_stmt body) }
+  | For (init, test, inc, body) ->
+      { stmt with node = For (init, test, inc, desugar_foreach_in_stmt body) }
+  | Switch (expr, stmts) ->
+      {
+        stmt with
+        node = Switch (expr, List.map stmts ~f:desugar_foreach_in_stmt);
+      }
+  | _ -> stmt
+
+let desugar_foreach_in_fundecl (f : fundecl) =
+  f.body <- Option.map f.body ~f:(List.map ~f:desugar_foreach_in_stmt)
+
+let desugar_foreach decls =
+  List.iter decls ~f:(function
+    | Function f | FuncTypeDef f | DelegateDef f ->
+        desugar_foreach_in_fundecl f
+    | StructDef s ->
+        List.iter s.decls ~f:(function
+          | Method f | Constructor f | Destructor f ->
+              desugar_foreach_in_fundecl f
+          | _ -> ())
+    | _ -> ())
 
 let context_from_ain ?(constants : variable list = []) ain =
   let ain_to_jaf_functype (f : Ain.FunctionType.t) =

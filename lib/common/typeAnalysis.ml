@@ -453,7 +453,8 @@ class type_analyze_visitor ctx =
           compiler_bug "unexpected MemberAddr" (Some (ASTExpression expr))
       | Unary (op, e) -> (
           match op with
-          | UPlus | UMinus | PreInc | PreDec | PostInc | PostDec ->
+          | UPlus | UMinus | PreInc | PreDec | PostInc | PostDec
+          | ForeachInc | ForeachDec ->
               check_numeric e;
               expr.ty <- e.ty
           | LogNot | BitNot ->
@@ -810,6 +811,12 @@ class type_analyze_visitor ctx =
           | For (_, test, inc, _) ->
               Option.iter ~f:(type_check (ASTStatement stmt) Int) test;
               Option.iter ~f:check_not_array inc
+          | ForEach _ ->
+              (* [desugar_foreach] in compile.ml replaces every [ForEach]
+                 with a [While] before type-checking, so a [ForEach]
+                 here means the desugar pass was skipped. *)
+              compiler_bug "ForEach not desugared before type analysis"
+                (Some (ASTStatement stmt))
           | Goto _ -> ()
           | Continue -> ()
           | Break -> ()

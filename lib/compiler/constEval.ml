@@ -108,7 +108,9 @@ class const_eval_visitor ctx =
           | PreInc -> ()
           | PreDec -> ()
           | PostInc -> ()
-          | PostDec -> ())
+          | PostDec -> ()
+          | ForeachInc -> ()
+          | ForeachDec -> ())
       | Binary (op, a, b) -> (
           let mk_compare op a b = if op a b then 1 else 0 in
           let const_eq = mk_compare ( = ) in

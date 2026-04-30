@@ -34,10 +34,10 @@ let is_variable_ref = function
   | _ -> false
 
 let incdec_instruction = function
-  | (PreInc | PostInc), LongInt -> LI_INC
-  | (PreDec | PostDec), LongInt -> LI_DEC
-  | (PreInc | PostInc), _ -> INC
-  | (PreDec | PostDec), _ -> DEC
+  | (PreInc | PostInc | ForeachInc), LongInt -> LI_INC
+  | (PreDec | PostDec | ForeachDec), LongInt -> LI_DEC
+  | (PreInc | PostInc | ForeachInc), _ -> INC
+  | (PreDec | PostDec | ForeachDec), _ -> DEC
   | _ -> compiler_bug "invalid inc/dec expression" None
 
 class jaf_compiler ctx debug_info =
@@ -589,7 +589,7 @@ class jaf_compiler ctx debug_info =
       | Unary (BitNot, e) ->
           self#compile_expression e;
           self#write_instruction0 COMPL
-      | Unary (((PreInc | PreDec) as op), e) ->
+      | Unary (((PreInc | PreDec | ForeachInc | ForeachDec) as op), e) ->
           self#compile_lvalue e;
           self#write_instruction0 DUP2;
           self#write_instruction0 (incdec_instruction (op, e.ty));
@@ -1071,15 +1071,18 @@ class jaf_compiler ctx debug_info =
              && not (Ain.Type.is_ref (self#get_local i).value_type) ->
           self#write_instruction2 SH_LOCALASSIGN i n
       | Unary
-          ( ((PreInc | PostInc | PreDec | PostDec) as op),
+          ( (( PreInc | PostInc | PreDec | PostDec | ForeachInc
+             | ForeachDec ) as op),
             { node = Ident (_, LocalVariable (i, _)); _ } )
         when ctx.version < 630
              && (not (Ain.Type.is_ref (self#get_local i).value_type))
              && Poly.(expr.ty <> LongInt) ->
           self#write_instruction1
-            (match op with PreInc | PostInc -> SH_LOCALINC | _ -> SH_LOCALDEC)
+            (match op with
+             | PreInc | PostInc | ForeachInc -> SH_LOCALINC
+             | _ -> SH_LOCALDEC)
             i
-      | Unary (((PreInc | PreDec) as op), e) ->
+      | Unary (((PreInc | PreDec | ForeachInc | ForeachDec) as op), e) ->
           self#compile_lvalue e;
           self#write_instruction0 DUP2;
           self#write_instruction0 (incdec_instruction (op, e.ty));
@@ -1186,6 +1189,12 @@ class jaf_compiler ctx debug_info =
           Option.iter break_addr ~f:(fun break_addr ->
               self#write_address_at break_addr current_address);
           self#end_loop
+      | ForEach _ ->
+          (* [Compile.desugar_pass] rewrites ForEach into a [While]
+             before any later pass; reaching codegen with [ForEach]
+             still in the AST means the desugar pass was skipped. *)
+          compiler_bug "ForEach not desugared before codegen"
+            (Some (ASTStatement stmt))
       | Goto name ->
           self#add_goto name (current_address + 2) stmt;
           self#write_instruction1 JUMP 0

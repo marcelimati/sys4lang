@@ -423,7 +423,15 @@ iteration_statement
            $6,
            $8)
     }
-  ; 
+  | FOREACH LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, None, $5, $7) }
+  | FOREACH LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, Some $5, $7, $9) }
+  | FOREACH_R LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, None, $5, $7) }
+  | FOREACH_R LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, Some $5, $7, $9) }
+  ;
 
 jump_statement
   : GOTO IDENTIFIER SEMICOLON { Goto ($2) }

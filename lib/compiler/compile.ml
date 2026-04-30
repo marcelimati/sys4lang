@@ -78,8 +78,17 @@ let codegen_pass ctx program debug_info =
         Codegen.compile ctx jaf_name jaf debug_info
     | Hll _ -> ())
 
+(* v11 foreach is desugared into a [while] loop before any
+   type-resolution / type-checking happens, so later passes only see
+   the regular control-flow shape. *)
+let desugar_pass program =
+  List.iter program ~f:(function
+    | Jaf (_, jaf) -> Jaf.desugar_foreach jaf
+    | Hll _ -> ())
+
 let compile ctx sources debug_info read_file =
   let program = parse_pass ctx sources read_file in
+  desugar_pass program;
   let program = type_resolve_pass ctx program in
   type_check_pass ctx program;
   codegen_pass ctx program debug_info
