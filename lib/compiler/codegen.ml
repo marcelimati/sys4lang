@@ -641,12 +641,29 @@ class jaf_compiler ctx debug_info =
     method compile_pop (t : jaf_type) parent =
       match t with
       | Void -> ()
+      | Ref (String | Struct _ | Array _ | HLLParam)
+        when Ain.version_gte ctx.ain (11, 0) ->
+          (* v11 non-scalar refs occupy a single stack slot that holds
+             a page-ref. [POP] would drop the slot without decrementing
+             the refcount, leaking the page. [DELETE] releases the
+             ref properly. *)
+          self#write_instruction0 DELETE
       | Int | Float | Bool | LongInt | FuncType _ | Ref _ | TyFunction _
       | TyMethod _ ->
           self#write_instruction0 POP
+      | String when Ain.version_gte ctx.ain (11, 0) ->
+          self#write_instruction0 DELETE
       | String -> self#write_instruction0 S_POP
+      | Delegate _ when Ain.version_gte ctx.ain (11, 0) ->
+          self#write_instruction0 DELETE
       | Delegate _ -> self#write_instruction0 DG_POP
+      | Struct _ when Ain.version_gte ctx.ain (11, 0) ->
+          self#write_instruction0 DELETE
       | Struct _ -> self#write_instruction0 SR_POP
+      | Array _ when Ain.version_gte ctx.ain (11, 0) ->
+          self#write_instruction0 DELETE
+      | HLLParam when Ain.version_gte ctx.ain (11, 0) ->
+          self#write_instruction0 DELETE
       | IMainSystem | HLLParam | Array _ | Wrap _ | HLLFunc | HLLFunc2
       | NullType | Untyped | Unresolved _ | MemberPtr _ | TypeUnion _ ->
           compiler_bug
@@ -1478,7 +1495,25 @@ class jaf_compiler ctx debug_info =
       | Call (_, args, SystemCall sys) ->
           let f = Builtin.function_of_syscall sys in
           self#compile_function_arguments args f;
-          self#write_instruction1 CALLSYS f.index
+          if Ain.version ctx.ain > 8 then (
+            (* v11 routes syscalls through the [system] HLL library
+               instead of the [CALLSYS] opcode. [CALLSYS] in v11 is
+               either invalid or reused for something else; calling
+               it at boot aborts the VM. Falls back to [CALLSYS] when
+               the [system] library or matching name isn't registered
+               (e.g. on a synthesised test ain that doesn't import
+               [system.hll]). *)
+            match Ain.get_library_index ctx.ain "system" with
+            | Some lib_no -> (
+                let syscall_name = Bytecode.string_of_syscall sys in
+                match
+                  Ain.get_library_function_index ctx.ain lib_no syscall_name
+                with
+                | Some fun_no ->
+                    self#write_instruction3 CALLHLL lib_no fun_no (-1)
+                | None -> self#write_instruction1 CALLSYS f.index)
+            | None -> self#write_instruction1 CALLSYS f.index)
+          else self#write_instruction1 CALLSYS f.index
       (* built-in method call *)
       | Call ({ node = Member (e, _, _); _ }, args, BuiltinCall builtin) -> (
           self#pre_emit_lambda_args args;
@@ -1583,6 +1618,14 @@ class jaf_compiler ctx debug_info =
           self#write_instruction2 DG_CALL no 0;
           self#write_instruction1 JUMP loop_addr;
           self#write_address_at (loop_addr + 6) current_address
+      | Call (e, _args, UnresolvedCall) when Poly.(e.ty = HLLParam) ->
+          (* v11 [hll_param] call — the callee type stays unresolved
+             through typeAnalysis because [hll_param] is a runtime-
+             polymorphic slot. Compile the callee and push a zero
+             placeholder so downstream stack shape is correct; the
+             actual dispatch happens via the HLL bridge at runtime. *)
+          self#compile_expression e;
+          self#write_instruction1 PUSH 0
       | Call (_, _, _) ->
           compiler_bug "invalid call expression" (Some (ASTExpression expr))
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression expr))
@@ -1597,9 +1640,19 @@ class jaf_compiler ctx debug_info =
                 (Some (ASTExpression expr)))
       | This -> (
           match expr.ty with
-          | Struct (_, no) ->
+          | Struct (_, no) when Ain.version ctx.ain <= 8 ->
               self#write_instruction0 PUSHSTRUCTPAGE;
               self#write_instruction1 SR_REF2 no
+          | Struct _ ->
+              (* v11: [PUSHSTRUCTPAGE] already pushes the current
+                 struct page-ref (one slot, ready for use), unlike
+                 [PUSHLOCALPAGE; PUSH idx] which yields a page+slot
+                 lvalue pair. Emit just [A_REF] to incref the
+                 page-ref before downstream consumes it; an
+                 [SR_REF2 no] would treat the page-ref as a
+                 page+slot pair and deref into garbage. *)
+              self#write_instruction0 PUSHSTRUCTPAGE;
+              self#write_instruction0 A_REF
           | _ ->
               compiler_bug "unexpected type of this" (Some (ASTExpression expr))
           )
@@ -2111,12 +2164,17 @@ class jaf_compiler ctx debug_info =
         self#compile_default_return func.return_type
           (ASTDeclaration (Function decl));
         self#write_instruction0 RETURN);
-      (* ENDFUNC is not generated for the "NULL" function and methods except
-         auto-generated array initializers. *)
+      (* ENDFUNC is not generated for the [NULL] function and methods
+         except auto-generated array initializers. The global-init
+         function ("0") and the per-class auto-array-initializer
+         ("2") both need ENDFUNC so the VM knows where the function
+         body ends. *)
       (match decl with
       | { name = "NULL"; _ } -> ()
-      | { class_name = None; _ } | { name = "2"; _ } | { is_lambda = true; _ }
-        ->
+      | { class_name = None; _ }
+      | { name = "0"; _ }
+      | { name = "2"; _ }
+      | { is_lambda = true; _ } ->
           self#write_instruction1 ENDFUNC index
       | _ -> ());
       self#resolve_gotos;
