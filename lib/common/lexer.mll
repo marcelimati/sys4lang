@@ -84,12 +84,15 @@ let () =
               "string",       STRING;
               "hll_param",    HLL_PARAM;
               "hll_func",     HLL_FUNC;
+              "hll_func2",    HLL_FUNC2;
               "hll_delegate", HLL_DELEGATE;
               "if",           IF;
               "else",         ELSE;
               "while",        WHILE;
               "do",           DO;
               "for",          FOR;
+              "foreach",      FOREACH;
+              "foreach_r",    FOREACH_R;
               "switch",       SWITCH;
               "case",         CASE;
               "default",      DEFAULT;
@@ -114,6 +117,7 @@ let () =
               "private",      PRIVATE;
               "public",       PUBLIC;
               "enum",         ENUM;
+              "event",        EVENT;
               "__FILE__",     FILE_MACRO;
               "__LINE__",     LINE_MACRO;
               "__DATE__",     DATE_MACRO;
@@ -194,6 +198,8 @@ rule token = parse
   | ']'                     { RBRACKET }
   | '{'                     { LBRACE }
   | '}'                     { RBRACE }
+  | "?."                    { QUESTION_DOT }
+  | "??"                    { QUESTION_QUESTION }
   | '?'                     { QUESTION }
   | '='                     { ASSIGN }
   | "+="                    { PLUSASSIGN }
