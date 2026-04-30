@@ -866,6 +866,13 @@ class jaf_compiler ctx debug_info =
              into explicit get/set method calls before codegen runs. *)
           compiler_bug "property member expression not rewritten"
             (Some (ASTExpression expr))
+      | Member (_, _, ClassEvent _) ->
+          (* Type analysis rewrites [obj.E += h] / [-= h] for user-bodied
+             events into explicit add/remove method calls before codegen
+             runs. A bare [obj.E] read on a user-bodied event has no
+             defined semantics. *)
+          compiler_bug "event member expression not rewritten"
+            (Some (ASTExpression expr))
       (* regular function call *)
       | Call (_, args, FunctionCall function_no) ->
           let f = Ain.get_function_by_index ctx.ain function_no in

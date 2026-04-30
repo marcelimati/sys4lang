@@ -613,7 +613,8 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
     method private pr_vardecl out (arg : Ain.Variable.t) =
       bprintf out "%a %s" self#pr_type arg.type_ arg.name
 
-    method print_function ?(as_lambda = false) (func : function_t) =
+    method print_function ?(as_lambda = false) ?(skip_signature = false)
+        (func : function_t) =
       let pr_label = function
         | Address label -> self#println "label%d:" label
         | CaseInt (_, k) -> self#println "case %ld:" k
@@ -785,7 +786,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
         if as_lambda then bprintf out " => %a " self#pr_type return_type
         else self#print_newline
       in
-      print_func_signature func;
+      if not skip_signature then print_func_signature func;
       let body =
         match func.body.txt with
         | Block _ -> func.body
@@ -846,22 +847,77 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
     (* v11 event prototype: round-trips as [event T Name;] in the
        class body. The original [Name::add] / [Name::remove] accessor
        functions (when present in the function table) are filtered
-       out of the per-class .jaf — their bodies are vestigial for
-       auto-events. *)
-    method private print_event_prototype (ev : event_pair) =
+       out of the per-class .jaf — for auto-events their bodies are
+       vestigial; for manual events the bodies are emitted as a
+       top-level [event T Class::Name { add { body } remove { body } }]
+       block via [print_event_def]. *)
+    method print_event_prototype (ev : event_pair) =
       self#print_indent;
       bprintf out "event %a %s" self#pr_type ev.ev_type ev.ev_name;
       self#println ";"
 
-    (* v11 auto-property prototype: round-trips as the C# auto-property
+    (* Top-level implementation of a manual event, emitted in the same
+       per-class .jaf where the original add/remove definitions lived.
+       Surface form: [event T Class::Name { add { body } remove { body } }].
+       The [event] keyword anchors the parser so [Class::Name] is read
+       as a qualified event reference rather than a regular function. *)
+    method print_event_def (ev : event_pair) =
+      let class_name =
+        match ev.ev_add.struc with Some s -> s.name | None -> ""
+      in
+      bprintf out "event %a %s::%s" self#pr_type ev.ev_type class_name
+        ev.ev_name;
+      self#print_newline;
+      self#println "{";
+      self#with_indent (fun () ->
+          self#print_indent;
+          print_string out "add";
+          self#print_function ~skip_signature:true ev.ev_add;
+          self#print_indent;
+          print_string out "remove";
+          self#print_function ~skip_signature:true ev.ev_remove);
+      self#println "}"
+
+    (* v11 property prototype: round-trips as the C# auto-property
        shape [T Name { get; set; }]. Read-only properties omit [set;];
-       write-only ones omit [get;]. *)
-    method private print_property_prototype (p : property_def) =
+       write-only ones omit [get;]. For non-auto properties the bodies
+       are emitted as a top-level [T Class::Name { get { body } set { body } }]
+       block via [print_property_def]. *)
+    method print_property_prototype (p : property_def) =
       self#print_indent;
       bprintf out "%a %s {" self#pr_type p.prop_type p.prop_name;
       Option.iter p.prop_get ~f:(fun _ -> print_string out " get;");
       Option.iter p.prop_set ~f:(fun _ -> print_string out " set;");
       self#println " }"
+
+    (* Top-level implementation of a non-auto property, emitted in the
+       per-class .jaf where the [::get] / [::set] definitions lived.
+       Surface form: [T Class::Name { get { body } set { body } }].
+       Auto-implemented properties skip this — their declaration in
+       classes.jaf is the complete source form. *)
+    method print_property_def (p : property_def) =
+      let class_name =
+        match
+          Option.first_some
+            (Option.bind p.prop_get ~f:(fun f -> f.struc))
+            (Option.bind p.prop_set ~f:(fun f -> f.struc))
+        with
+        | Some s -> s.name
+        | None -> ""
+      in
+      bprintf out "%a %s::%s" self#pr_type p.prop_type class_name p.prop_name;
+      self#print_newline;
+      self#println "{";
+      self#with_indent (fun () ->
+          Option.iter p.prop_get ~f:(fun g ->
+              self#print_indent;
+              print_string out "get";
+              self#print_function ~skip_signature:true g);
+          Option.iter p.prop_set ~f:(fun s ->
+              self#print_indent;
+              print_string out "set";
+              self#print_function ~skip_signature:true s));
+      self#println "}"
 
     method private print_class_decl (struc : struct_t) =
       bprintf out "class %s" struc.struc.name;
@@ -874,15 +930,14 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           (Array.to_list struc.struc.interfaces));
       self#println " {";
       self#println "public:";
-      (* Suppress backing fields named [<Name>] for auto-implemented
-         properties — those fields are an implementation detail of
-         [T Name { get; set; }] that the compiler re-synthesizes
-         on lowering, and the surface form would be unparseable. *)
+      (* Suppress backing fields named [<Name>] for every property
+         (auto-implemented and otherwise) — they're an implementation
+         detail re-synthesized on lowering, and the surface form would
+         be unparseable. *)
       let property_backing_field_names =
         let s = Hash_set.create (module String) in
         List.iter struc.properties ~f:(fun (p : property_def) ->
-            if p.prop_is_auto then
-              Hash_set.add s ("<" ^ p.prop_name ^ ">"));
+            Hash_set.add s ("<" ^ p.prop_name ^ ">"));
         s
       in
       self#with_indent (fun () ->

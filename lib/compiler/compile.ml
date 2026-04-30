@@ -32,18 +32,36 @@ let parse_file lexer parser file read_file =
   | Lexer.Error | Parser.Error -> CompileError.syntax_error lexbuf
   | e -> raise e
 
-(* pass 1: Parse jaf/hll files and create symbol table entries *)
+(* pass 1: Parse jaf/hll files and create symbol table entries.
+   v11 user-bodied property/event accessors are scanned across all
+   parsed jaf files BEFORE [register_type_declarations] runs so that
+   [expand_property_decl] / [expand_struct_decls] can elide the
+   matching auto-stubs and backing fields when they fire. The scan
+   has to see every top-level [T Class::Name { ... }] block in the
+   project — properties may be declared in [classes.jaf] but their
+   bodies live in per-class files.
+
+   Two-phase: parse all jaf files first, then scan, then register. *)
 let parse_pass ctx sources read_file =
-  List.map sources ~f:(function
-    | Pje.Jaf f ->
-        let jaf = parse_file Lexer.token Parser.jaf f read_file in
+  let parsed =
+    List.map sources ~f:(function
+      | Pje.Jaf f ->
+          let jaf = parse_file Lexer.token Parser.jaf f read_file in
+          `Jaf (f, jaf)
+      | Pje.Hll (f, import_name) ->
+          let hll = parse_file Lexer.token Parser.hll f read_file in
+          let hll_name = Stdlib.Filename.(chop_extension (basename f)) in
+          `Hll (hll_name, import_name, hll)
+      | _ -> failwith "unreachable")
+  in
+  List.iter parsed ~f:(function
+    | `Jaf (_, jaf) -> Declarations.scan_user_bodied_accessors ctx jaf
+    | `Hll _ -> ());
+  List.map parsed ~f:(function
+    | `Jaf (f, jaf) ->
         Declarations.register_type_declarations ctx jaf;
         Jaf (f, jaf)
-    | Pje.Hll (f, import_name) ->
-        let hll = parse_file Lexer.token Parser.hll f read_file in
-        let hll_name = Stdlib.Filename.(chop_extension (basename f)) in
-        Hll (hll_name, import_name, hll)
-    | _ -> failwith "unreachable")
+    | `Hll (hll_name, import_name, hll) -> Hll (hll_name, import_name, hll))
 
 (* pass 2: Resolve type specifiers *)
 let type_resolve_pass ctx program =

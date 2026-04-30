@@ -25,8 +25,18 @@ let lambda_index = ref 0
    struct_declaration items the later passes expect: a `<Name>` backing
    field plus synthetic `Name::get` / `Name::set` methods with trivial
    bodies that read/write the backing field. Read-only / write-only
-   forms omit the missing accessor. *)
-let expand_property_decl (p : property_decl) : struct_declaration list =
+   forms omit the missing accessor.
+
+   Backing-field elision: when EVERY declared accessor is also user-
+   bodied at top level (i.e. its [Class@Name::get|set] key is present
+   in [ctx.user_bodied_accessors]), no [<Name>] backing field is
+   emitted and the auto-stub bodies are stripped — only the prototype
+   [Method] decls remain, leaving the user's top-level definitions to
+   merge into the function-table slot. Without this elision we
+   accumulate hundreds of spurious [<PropName>] slots on HLL-heavy
+   classes, corrupting downstream member-index resolution. *)
+let expand_property_decl ~(ctx : context) ~(class_name : string)
+    (p : property_decl) : struct_declaration list =
   let loc = p.pd_loc in
   let ty = p.pd_typespec in
   let mangled_name = "<" ^ p.pd_name ^ ">" in
@@ -133,7 +143,27 @@ let expand_property_decl (p : property_decl) : struct_declaration list =
       ]
     else []
   in
-  [ backing_decl ] @ get_decl @ set_decl
+  let declared_is_user_bodied kind =
+    Hashtbl.mem ctx.user_bodied_accessors
+      (class_name ^ "@" ^ p.pd_name ^ "::" ^ kind)
+  in
+  let any_declared = !has_get || !has_set in
+  let all_declared_user_bodied =
+    any_declared
+    && (not !has_get || declared_is_user_bodied "get")
+    && (not !has_set || declared_is_user_bodied "set")
+  in
+  let strip_body = function
+    | [ Method m ] -> [ Method { m with body = None } ]
+    | other -> other
+  in
+  if all_declared_user_bodied then
+    (* Emit prototype-only Method decls (no auto-stub body) and drop
+       the backing field — the user's top-level body Function decls
+       merge into these prototypes via [merge_with_prev]'s normal
+       prototype/body match path. *)
+    strip_body get_decl @ strip_body set_decl
+  else [ backing_decl ] @ get_decl @ set_decl
 
 (* Expand a v11 event declaration `event T Name;` into a delegate-typed
    [<Name>] backing field plus prototype-only [Name::add] / [Name::remove]
@@ -204,14 +234,34 @@ let expand_event_decl (e : event_decl) : struct_declaration list =
    declaration list, collecting [property_info] entries for the
    containing struct's [properties] table. The expanded list keeps
    the original ordering; [property_info] entries are returned in
-   source order so type analysis can preserve roundtrip stability. *)
-let expand_struct_decls (decls : struct_declaration list) :
+   source order so type analysis can preserve roundtrip stability.
+
+   Also drops [<EventName>] delegate backing fields when both
+   [Name::add] and [Name::remove] are user-bodied at top level. The
+   original v11 compiler doesn't allocate storage in that case;
+   [obj.E += h] / [obj.E -= h] dispatches through the user's accessors
+   via [ClassEvent] member resolution in type analysis. *)
+let expand_struct_decls ~(ctx : context) ~(class_name : string)
+    (decls : struct_declaration list) :
     struct_declaration list * (string * property_info) list =
   let infos = ref [] in
+  let event_is_user_bodied name =
+    Hashtbl.mem ctx.user_bodied_accessors
+      (class_name ^ "@" ^ name ^ "::add")
+    && Hashtbl.mem ctx.user_bodied_accessors
+         (class_name ^ "@" ^ name ^ "::remove")
+  in
+  let drop_event_backing (v : variable) =
+    let n = String.length v.name in
+    n >= 3
+    && Char.equal v.name.[0] '<'
+    && Char.equal v.name.[n - 1] '>'
+    && event_is_user_bodied (String.sub v.name ~pos:1 ~len:(n - 2))
+  in
   let expanded =
     List.concat_map decls ~f:(function
       | PropertyDecl p ->
-          let decls = expand_property_decl p in
+          let decls = expand_property_decl ~ctx ~class_name p in
           let find_method suffix =
             List.find_map decls ~f:(function
               | Method f when String.is_suffix f.name ~suffix -> Some f
@@ -225,9 +275,45 @@ let expand_struct_decls (decls : struct_declaration list) :
           infos := (p.pd_name, info) :: !infos;
           decls
       | EventDecl e -> expand_event_decl e
+      | MemberDecl ds when not ds.is_const_decls ->
+          let kept =
+            List.filter ds.vars ~f:(fun v -> not (drop_event_backing v))
+          in
+          if List.is_empty kept then []
+          else [ MemberDecl { ds with vars = kept } ]
       | other -> [ other ])
   in
   (expanded, List.rev !infos)
+
+(* Detect the auto-synthesized property-accessor body shape that
+   [expand_property_decl] emits: a single-statement [return this.<X>]
+   getter or [this.<X> = value] setter. Used by [visit_fundecl]'s
+   merge logic to allow a user-supplied top-level body to override the
+   auto-stub without triggering a "Duplicate function definition"
+   error. *)
+let is_property_stub (f : fundecl) =
+  let is_mangled_member_access (e : expression) =
+    match e.node with
+    | Member ({ node = This; _ }, name, _) ->
+        let n = String.length name in
+        n >= 3
+        && Char.equal name.[0] '<'
+        && Char.equal name.[n - 1] '>'
+    | _ -> false
+  in
+  match f.body with
+  | Some [ { node = Return (Some e); _ } ] -> is_mangled_member_access e
+  | Some
+      [
+        {
+          node =
+            Expression
+              { node = Assign (EqAssign, lhs, { node = Ident ("value", _); _ }); _ };
+          _;
+        };
+      ] ->
+      is_mangled_member_access lhs
+  | _ -> false
 
 (*
  * AST pass over top-level declarations register names in the .ain file.
@@ -267,8 +353,17 @@ class type_declare_visitor ctx =
           compile_error "Function signature mismatch"
             (ASTDeclaration (Function decl))
         else if Option.is_some prev_decl.body && Option.is_some decl.body then
-          compile_error "Duplicate function definition"
-            (ASTDeclaration (Function decl))
+          (* Allow a user-supplied top-level body to override the
+             auto-stub emitted by [expand_property_decl]; the stub is
+             a forward declaration, not a real second definition. *)
+          if is_property_stub prev_decl then (
+            (match prev_decl.index with
+            | Some _ as idx -> decl.index <- idx
+            | None -> ());
+            decl)
+          else
+            compile_error "Duplicate function definition"
+              (ASTDeclaration (Function decl))
         else if Option.is_none decl.body then (
           (* Duplicate prototype; ignore. [-1] flags the decl as
              unowned so later passes don't try to write a body. *)
@@ -405,7 +500,9 @@ class type_declare_visitor ctx =
              accessor methods, and record property metadata on [jaf_s]
              so type analysis can rewrite [obj.Name] / [obj.Name = v]
              into accessor calls. *)
-          let expanded, prop_infos = expand_struct_decls s.decls in
+          let expanded, prop_infos =
+            expand_struct_decls ~ctx ~class_name:s.name s.decls
+          in
           s.decls <- expanded;
           List.iter prop_infos ~f:(fun (name, info) ->
               Hashtbl.set jaf_s.properties ~key:name ~data:info);
@@ -420,6 +517,33 @@ class type_declare_visitor ctx =
 
 let register_type_declarations ctx decls =
   (new type_declare_visitor ctx)#visit_toplevel decls
+
+(* Pre-scan over a parsed jaf file to record every accessor whose body
+   is supplied by a top-level [T Class::Name { ... }] or
+   [event T Class::Name { ... }] block. The parser lowers each block
+   to two/up-to-two top-level [Function] decls named
+   [Class::PropName::accessor] (with [class_name] still unset — that
+   field is populated only during pass-1 visit). [parse_qualified_name]
+   twice on the raw [f.name] recovers the [Class@Name::accessor] key
+   that [expand_property_decl] / [expand_struct_decls] check against. *)
+let scan_user_bodied_accessors ctx (decls : declaration list) =
+  let record name =
+    Hashtbl.set ctx.user_bodied_accessors ~key:name ~data:()
+  in
+  List.iter decls ~f:(function
+    | Function f when Option.is_some f.body -> (
+        match Util.parse_qualified_name f.name with
+        | Some qual, accessor
+          when String.equal accessor "get"
+               || String.equal accessor "set"
+               || String.equal accessor "add"
+               || String.equal accessor "remove" -> (
+            match Util.parse_qualified_name qual with
+            | Some class_name, prop_name ->
+                record (class_name ^ "@" ^ prop_name ^ "::" ^ accessor)
+            | None, _ -> ())
+        | _ -> ())
+    | _ -> ())
 
 (*
  * AST pass to resolve HLL-specific type aliases.
@@ -545,9 +669,25 @@ class type_define_visitor ctx =
             && (String.is_suffix f.name ~suffix:"::add"
                || String.is_suffix f.name ~suffix:"::remove")
           in
+          (* A body-less [Name::get] / [Name::set] in [s.decls] is the
+             prototype emitted by [expand_property_decl] when the user
+             provides a top-level body that elides the auto-stub. The
+             real fundecl with body and index lives in [ctx.functions]
+             after [merge_with_prev]; the prototype in [s.decls] keeps
+             [index = None]. Skip the definition-presence check for
+             those — their top-level body satisfies the contract. *)
+          let is_user_bodied_property_stub (f : fundecl) =
+            Option.is_none f.body
+            && (String.is_suffix f.name ~suffix:"::get"
+               || String.is_suffix f.name ~suffix:"::set")
+            && Hashtbl.mem ctx.user_bodied_accessors
+                 (s.name ^ "@" ^ f.name)
+          in
           List.iter s.decls ~f:(function
             | Method f | Constructor f | Destructor f ->
-                if Option.is_none f.index && not (is_event_accessor_stub f)
+                if Option.is_none f.index
+                   && (not (is_event_accessor_stub f))
+                   && not (is_user_bodied_property_stub f)
                 then
                   compile_error
                     (Printf.sprintf "No definition of %s::%s found" s.name

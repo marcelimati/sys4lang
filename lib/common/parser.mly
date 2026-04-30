@@ -136,7 +136,7 @@ let rec multidim_array dims t =
 %%
 
 jaf
-  : external_declaration* EOF { $1 }
+  : external_declaration* EOF { List.concat $1 }
   ;
 
 hll
@@ -486,28 +486,91 @@ array_allocation(X)
 
 external_declaration
   : declaration(qualified_name)
-    { Global { $1 with vars = (List.map (fun d -> { d with kind = GlobalVar }) $1.vars) } }
+    { [ Global { $1 with vars = (List.map (fun d -> { d with kind = GlobalVar }) $1.vars) } ] }
   | ioption(declaration_specifiers) qualified_funcname parameter_list(init_declarator(IDENTIFIER)) block
-    { Function (func $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $4)) }
+    { [ Function (func $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $4)) ] }
   | HASH qualified_name LPAREN VOID? RPAREN block
-    { Function { (func $sloc (implicit_void $symbolstartpos) $2 [] (Some $6)) with is_label=true } }
+    { [ Function { (func $sloc (implicit_void $symbolstartpos) $2 [] (Some $6)) with is_label=true } ] }
   | FUNCTYPE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
-    { FuncTypeDef (func $sloc $2 $3 $4 None) }
+    { [ FuncTypeDef (func $sloc $2 $3 $4 None) ] }
   | DELEGATE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
-    { DelegateDef (func $sloc $2 $3 $4 None) }
+    { [ DelegateDef (func $sloc $2 $3 $4 None) ] }
   | struct_or_class qualified_name LBRACE struct_declaration* RBRACE SEMICOLON
-    { StructDef ({ loc = $sloc; is_class = $1; name = $2; decls = $4 }) }
+    { [ StructDef ({ loc = $sloc; is_class = $1; name = $2; decls = $4 }) ] }
   | ENUM enumerator_list SEMICOLON
-    { Enum ({ loc=$sloc; name=None; values=$2 }) }
+    { [ Enum ({ loc=$sloc; name=None; values=$2 }) ] }
   | ENUM IDENTIFIER enumerator_list SEMICOLON
-    { Enum ({ loc=$sloc; name=Some $2; values=$3 }) }
+    { [ Enum ({ loc=$sloc; name=Some $2; values=$3 }) ] }
   | GLOBALGROUP IDENTIFIER SEMICOLON
-    { GlobalGroup { name = $2; loc = $loc; vardecls = [] } }
+    { [ GlobalGroup { name = $2; loc = $loc; vardecls = [] } ] }
   | GLOBALGROUP IDENTIFIER LBRACE declaration(qualified_name)* RBRACE
     {
       let update_decls ds = { ds with vars = (List.map (fun d -> { d with kind = GlobalVar }) ds.vars) } in
-      GlobalGroup { name = $2; loc = $loc; vardecls = List.map update_decls $4 }
+      [ GlobalGroup { name = $2; loc = $loc; vardecls = List.map update_decls $4 } ]
     }
+  | declaration_specifiers qualified_funcname LBRACE bodied_accessor+ RBRACE
+    (* v11 property implementation at top level:
+       [T Class::Name { get { body } set { body } }]. Either [get] or
+       [set] may be omitted for read-only / write-only properties.
+       Lowers to up to two method definitions [Class@Name::get] and
+       [Class@Name::set(T value)] which override the auto-stub bodies
+       synthesized for the matching [T Name { get; set; }] declaration
+       in the class body. *)
+    {
+      let find_accessor name = List.assoc_opt name $4 in
+      let get_body = find_accessor "get" in
+      let set_body = find_accessor "set" in
+      (match get_body, set_body with
+       | None, None -> raise Parsing.Parse_error
+       | _ -> ());
+      let value_param =
+        { name = "value"; loc = $loc($1); dims = []; initval = None }
+      in
+      let getter =
+        Option.map (fun body ->
+          Function (func $sloc $1 ($2 ^ "::get") [] (Some body))) get_body
+      in
+      let setter =
+        Option.map (fun body ->
+          Function (func $sloc
+            { location = $loc($1); ty = Void }
+            ($2 ^ "::set")
+            [ vardecl Parameter false $1 value_param ]
+            (Some body))) set_body
+      in
+      List.filter_map (fun x -> x) [ getter; setter ]
+    }
+  | EVENT declaration_specifiers qualified_funcname LBRACE bodied_accessor bodied_accessor RBRACE
+    (* v11 manual-event implementation at top level:
+       [event T Class::Name { add { body } remove { body } }]. Lowers
+       to two method definitions [Class@Name::add(T value)] and
+       [Class@Name::remove(T value)] with the supplied bodies. The
+       matching [event T Name;] prototype must appear separately in
+       the class declaration. *)
+    {
+      let value_param =
+        { name = "value"; loc = $loc($2); dims = []; initval = None }
+      in
+      let accessor_fun kind body =
+        func $sloc
+          { location = $loc($2); ty = Void }
+          ($3 ^ "::" ^ kind)
+          [ vardecl Parameter false $2 value_param ]
+          (Some body)
+      in
+      let (add_body, remove_body) =
+        match $5, $6 with
+        | ("add", b1), ("remove", b2) -> (b1, b2)
+        | ("remove", b2), ("add", b1) -> (b1, b2)
+        | _ -> raise Parsing.Parse_error
+      in
+      [ Function (accessor_fun "add" add_body);
+        Function (accessor_fun "remove" remove_body) ]
+    }
+
+bodied_accessor
+  : IDENTIFIER block { ($1, $2) }
+  ;
 
 hll_declaration
   : declaration_specifiers IDENTIFIER parameter_list(declarator(IDENTIFIER)) SEMICOLON

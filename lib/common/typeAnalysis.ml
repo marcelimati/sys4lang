@@ -650,6 +650,43 @@ class type_analyze_visitor ctx =
                   | Ref t -> ref_type_check (ASTExpression expr) t b
                   | _ -> not_an_lvalue_error a (ASTExpression expr)));
               expr.ty <- Int)
+      (* v11 user-bodied event: [obj.E += h] / [obj.E -= h] where the
+         [<E>] backing field has been elided (because the user supplied
+         add/remove bodies at top level). Lower to a call through the
+         user's accessor; the matching member resolution is in the
+         Member arm below where it synthesizes [ClassEvent]. *)
+      | Assign
+          ( ((PlusAssign | MinusAssign) as op),
+            ({ node = Member (obj, _, ClassEvent ev); _ }),
+            rhs ) ->
+          let accessor_kind, accessor_idx =
+            match op with
+            | PlusAssign -> ("add", ev.event_add_index)
+            | MinusAssign -> ("remove", ev.event_remove_index)
+            | _ -> ("add", ev.event_add_index)
+          in
+          (match accessor_idx with
+          | None ->
+              compile_error
+                (sprintf "event `%s.%s` has no %s accessor" ev.event_class
+                   ev.event_name accessor_kind)
+                (ASTExpression expr)
+          | Some idx ->
+              let f = Ain.get_function_by_index ctx.ain idx in
+              let class_idx = Option.value ~default:(-1) f.struct_type in
+              let method_name = ev.event_name ^ "::" ^ accessor_kind in
+              let accessor_expr =
+                make_expr ~ty:Void ~loc:expr.loc
+                  (Member
+                     ( obj,
+                       method_name,
+                       ClassMethod
+                         (ev.event_class ^ "@" ^ method_name, idx) ))
+              in
+              expr.node <-
+                Call
+                  (accessor_expr, [ Some rhs ], MethodCall (class_idx, idx));
+              expr.ty <- Void)
       (* v11 property write — write-only path. The LHS is still a
          [Member ClassProperty] because the getter rewrite at the end
          of [visit_expression] only fires when a getter exists. *)
@@ -876,21 +913,62 @@ class type_analyze_visitor ctx =
                         else ClassVariable (Option.value_exn member.index) );
                   expr.ty <- member.type_spec.ty
               | None -> (
-                  let fun_name = struc.name ^ "@" ^ member_name in
-                  match Hashtbl.find ctx.functions fun_name with
-                  | Some f ->
-                      if f.is_private then access_check ();
+                  (* v11 user-bodied event resolution: when [<Name>]
+                     is absent (elided because the user supplied
+                     [Name::add] / [Name::remove] bodies) but those
+                     accessors exist on this class, synthesize a
+                     [ClassEvent] member. The parent [Assign
+                     PlusAssign|MinusAssign] then rewrites to a method
+                     call. Prefer the event form over an identically-
+                     named method — the event prototype in the class
+                     declaration is what made the accessors exist. *)
+                  let event_add =
+                    Hashtbl.find ctx.functions
+                      (struc.name ^ "@" ^ member_name ^ "::add")
+                  in
+                  let event_remove =
+                    Hashtbl.find ctx.functions
+                      (struc.name ^ "@" ^ member_name ^ "::remove")
+                  in
+                  match (event_add, event_remove) with
+                  | Some add, _ | _, Some add ->
+                      let event_type =
+                        match add.params with
+                        | [ p ] -> p.type_spec.ty
+                        | _ -> Void
+                      in
                       expr.node <-
                         Member
                           ( obj,
                             member_name,
-                            ClassMethod (fun_name, Option.value_exn f.index) );
-                      expr.ty <- TyMethod (ft_of_fundecl f)
-                  | None ->
-                      (* TODO: separate error type for this? *)
-                      undefined_variable_error
-                        (struc.name ^ "." ^ member_name)
-                        (ASTExpression expr))))
+                            ClassEvent
+                              {
+                                event_class = struc.name;
+                                event_name = member_name;
+                                event_add_index =
+                                  Option.bind event_add ~f:(fun f -> f.index);
+                                event_remove_index =
+                                  Option.bind event_remove ~f:(fun f ->
+                                      f.index);
+                              } );
+                      expr.ty <- event_type
+                  | None, None -> (
+                      let fun_name = struc.name ^ "@" ^ member_name in
+                      match Hashtbl.find ctx.functions fun_name with
+                      | Some f ->
+                          if f.is_private then access_check ();
+                          expr.node <-
+                            Member
+                              ( obj,
+                                member_name,
+                                ClassMethod
+                                  (fun_name, Option.value_exn f.index) );
+                          expr.ty <- TyMethod (ft_of_fundecl f)
+                      | None ->
+                          (* TODO: separate error type for this? *)
+                          undefined_variable_error
+                            (struc.name ^ "." ^ member_name)
+                            (ASTExpression expr)))))
       (* regular function call *)
       | Call (({ node = Ident (_, FunctionName name); _ } as e), args, _) ->
           let f = self#resolve_overload name args in

@@ -480,21 +480,28 @@ let decompile ~move_to_original_file ~continue_on_error =
       s.methods <- remaining;
       s.events <- events;
       s.properties <- properties);
-  (* Drop accessor function bodies from [srcs] when their declaration
-     is reconstructed in the class body: auto-properties round-trip
-     purely via [T Name { get; set; }], and v11 event accessor pairs
-     ([Name::add] / [Name::remove]) round-trip via [event T Name;]. *)
+  (* Manual events and non-auto properties round-trip as a single
+     top-level block ([event T Class::Name { add{} remove{} }] /
+     [T Class::Name { get{} set{} }]) replacing the per-class .jaf's
+     pair of qualified-method definitions. Drop the function we DON'T
+     keep as the marker. For events the marker is [add]; for non-auto
+     properties the marker is [get] (or [set] when get is absent).
+     Auto-implemented properties have no implementation block at all,
+     so both accessors are dropped. *)
   let dropped_func_ids = Hash_set.create (module Int) in
   Array.iter structs ~f:(fun s ->
       List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
-          Hash_set.add dropped_func_ids e.ev_add.func.id;
           Hash_set.add dropped_func_ids e.ev_remove.func.id);
       List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
           if p.prop_is_auto then (
             Option.iter p.prop_get ~f:(fun g ->
                 Hash_set.add dropped_func_ids g.func.id);
             Option.iter p.prop_set ~f:(fun set ->
-                Hash_set.add dropped_func_ids set.func.id))));
+                Hash_set.add dropped_func_ids set.func.id))
+          else
+            match (p.prop_get, p.prop_set) with
+            | Some _, Some set -> Hash_set.add dropped_func_ids set.func.id
+            | _ -> ()));
   let srcs =
     List.map srcs ~f:(fun (fname, funcs) ->
         ( fname,
@@ -573,11 +580,39 @@ let export ~print_addr decompiled ain_path write_to_file =
         ("HLL/" ^ hll.name ^ ".hll")
         (fun pr -> pr#print_hll hll.functions));
   generate "HLL\\hll.inc" (fun pr -> pr#print_hll_inc);
+  (* Marker tables: when a function is the kept "marker" of a
+     non-auto property / manual event accessor pair, replace its
+     normal [print_function] emit with a [T Class::Name { ... }] /
+     [event T Class::Name { ... }] block. *)
+  let event_by_add_id : (int, CodeGen.event_pair) Hashtbl.t =
+    let tbl = Hashtbl.create (module Int) in
+    Array.iter decompiled.structs ~f:(fun (s : CodeGen.struct_t) ->
+        List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
+            Hashtbl.set tbl ~key:e.ev_add.func.id ~data:e));
+    tbl
+  in
+  let property_by_marker_id : (int, CodeGen.property_def) Hashtbl.t =
+    let tbl = Hashtbl.create (module Int) in
+    Array.iter decompiled.structs ~f:(fun (s : CodeGen.struct_t) ->
+        List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
+            if not p.prop_is_auto then
+              match p.prop_get with
+              | Some g -> Hashtbl.set tbl ~key:g.func.id ~data:p
+              | None ->
+                  Option.iter p.prop_set ~f:(fun set ->
+                      Hashtbl.set tbl ~key:set.func.id ~data:p)));
+    tbl
+  in
   List.iter decompiled.srcs ~f:(fun (fname, funcs) ->
       if not (List.is_empty funcs) then
         generate fname (fun pr ->
-            List.iter funcs ~f:(fun func ->
-                pr#print_function func;
+            List.iter funcs ~f:(fun (func : CodeGen.function_t) ->
+                (match Hashtbl.find event_by_add_id func.func.id with
+                | Some pair -> pr#print_event_def pair
+                | None -> (
+                    match Hashtbl.find property_by_marker_id func.func.id with
+                    | Some prop -> pr#print_property_def prop
+                    | None -> pr#print_function func));
                 pr#print_newline)));
   generate ~add_to_inc:false "main.inc" (fun pr ->
       pr#print_inc (List.rev !sources));

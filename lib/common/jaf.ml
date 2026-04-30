@@ -160,6 +160,19 @@ type member_type =
       prop_getter_index : int option;
       prop_setter_index : int option;
     }
+  (* v11 user-bodied event access. When a class declares
+     [event T Name;] but its [<Name>] backing field has been elided
+     because the user supplied [Name::add] / [Name::remove] bodies at
+     top level, [obj.Name += h] / [obj.Name -= h] no longer routes
+     through a delegate-typed member — type analysis rewrites the
+     [Assign] into a call through the user's [Name::add] /
+     [Name::remove] method instead. *)
+  | ClassEvent of {
+      event_class : string;
+      event_name : string;
+      event_add_index : int option;
+      event_remove_index : int option;
+    }
   | HLLFunction of string * string
   | SystemFunction of Bytecode.syscall
   | BuiltinMethod of Bytecode.builtin
@@ -463,6 +476,16 @@ type context = {
   functypes : (string, fundecl) Hashtbl.t;
   delegates : (string, fundecl) Hashtbl.t;
   libraries : (string, library) Hashtbl.t;
+  (* v11 property / event accessor names whose body the user supplies
+     at top level (as [T Class::Name { get { body } set { body } }] or
+     [event T Class::Name { add { body } remove { body } }]).
+     Populated by a pre-scan over all parsed jaf files. Keys take the
+     [Class@Name::accessor] mangled shape. Used by [expand_property_decl]
+     to elide auto-stub bodies / backing fields when the user owns
+     accessor dispatch, and by the StructDef define check to skip the
+     "no definition found" diagnostic for the prototype emitted by the
+     auto-expansion. *)
+  user_bodied_accessors : (string, unit) Hashtbl.t;
 }
 
 let find_hll_function ctx lib func =
@@ -1331,6 +1354,7 @@ let context_from_ain ?(constants : variable list = []) ain =
   let functypes = Hashtbl.create (module String) in
   let delegates = Hashtbl.create (module String) in
   let libraries = Hashtbl.create (module String) in
+  let user_bodied_accessors = Hashtbl.create (module String) in
   List.iter constants ~f:(fun v -> Hashtbl.add_exn globals ~key:v.name ~data:v);
   Ain.global_iter ain ~f:(fun g ->
       Hashtbl.add_exn globals ~key:g.variable.name
@@ -1453,4 +1477,5 @@ let context_from_ain ?(constants : variable list = []) ain =
     functypes;
     delegates;
     libraries;
+    user_bodied_accessors;
   }
