@@ -314,6 +314,15 @@ class jaf_compiler ctx debug_info =
     method compile_identifier_ref id_type =
       match id_type with
       | LocalVariable (i, _) -> self#compile_local_ref (self#get_local i).index
+      | CapturedVariable (i, level) ->
+          (* v11 lambda capture: walk [level] frames up via [X_GETENV]
+             from the current local page, then push the outer frame's
+             variable index. *)
+          self#write_instruction0 PUSHLOCALPAGE;
+          for _ = 1 to level do
+            self#write_instruction0 X_GETENV
+          done;
+          self#write_instruction1 PUSH i
       | GlobalVariable i ->
           self#compile_global_ref (Ain.get_global_by_index ctx.ain i).index
       | _ -> compiler_bug "Invalid identifier type" None
@@ -362,6 +371,18 @@ class jaf_compiler ctx debug_info =
           | v ->
               self#compile_local_ref v.index;
               compile_lvalue_after v.value_type)
+      | Ident (_, CapturedVariable (i, level)) ->
+          (* v11 lambda capture lvalue: walk [level] frames up via
+             [X_GETENV], push the outer-frame variable index, then
+             dereference using the lambda-side type — the captured
+             value is read like any local but lives in an outer
+             frame's local page. *)
+          self#write_instruction0 PUSHLOCALPAGE;
+          for _ = 1 to level do
+            self#write_instruction0 X_GETENV
+          done;
+          self#write_instruction1 PUSH i;
+          compile_lvalue_after (jaf_to_ain_type e.ty)
       | Ident (_, GlobalVariable i) -> (
           match Ain.get_global_by_index ctx.ain i with
           | {
@@ -518,6 +539,16 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH i;
               self#compile_dereference t)
+      | Ident (_, CapturedVariable (i, level)) ->
+          (* v11 captured-variable rvalue: PUSHLOCALPAGE + level *
+             X_GETENV walks frames up to the enclosing scope, then
+             read the var by index using the lambda-side type. *)
+          self#write_instruction0 PUSHLOCALPAGE;
+          for _ = 1 to level do
+            self#write_instruction0 X_GETENV
+          done;
+          self#write_instruction1 PUSH i;
+          self#compile_dereference (jaf_to_ain_type expr.ty)
       | FuncAddr (_, Some no) -> self#write_instruction1 PUSH no
       | FuncAddr (_, None) ->
           compiler_bug "unresolved FuncAddr" (Some (ASTExpression expr))

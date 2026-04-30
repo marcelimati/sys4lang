@@ -123,6 +123,9 @@ type type_specifier = { mutable ty : jaf_type; location : location }
 type ident_type =
   | UnresolvedIdent
   | LocalVariable of int * location
+  (* v11 lambda capture: [index] in the enclosing scope's local frame,
+     [level] hops upward (1 = direct parent, 2 = grandparent, …). *)
+  | CapturedVariable of int * int
   | GlobalVariable of int
   | GlobalConstant
   | FunctionName of string
@@ -458,6 +461,7 @@ class ivisitor ctx =
     val env_stack = Stack.singleton (new environment ctx None)
     val mutable current_struct_name : string option = None
     method env = Stack.top_exn env_stack
+    method env_stack = env_stack
     method current_struct_name = current_struct_name
 
     method visit_expression (e : expression) =

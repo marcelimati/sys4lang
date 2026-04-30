@@ -134,6 +134,27 @@ class variable_alloc_visitor ctx =
       | Some v -> Option.value_exn v.index
       | None -> compiler_bug ("Undefined variable: " ^ name) None
 
+    (* v11 lambda capture: how many enclosing frames to walk to find
+       [name] — 0 if local to the current function, 1 for the direct
+       parent, 2 for the grandparent, etc. Used to flip a [LocalVariable]
+       ident into a [CapturedVariable] so codegen can emit the right
+       [X_GETENV] chain. *)
+    method get_capture_level name =
+      match self#env#get_local name with
+      | Some _ -> 0
+      | None -> (
+          match Stack.to_list self#env_stack with
+          | _ :: rest ->
+              let rec find level = function
+                | [] -> 0
+                | env :: tl -> (
+                    match env#get_local name with
+                    | Some _ -> level
+                    | None -> find (level + 1) tl)
+              in
+              find 1 rest
+          | [] -> 0)
+
     method add_var (v : variable) =
       let vars = Stack.pop_exn func_vars in
       let i = List.length vars in
@@ -183,8 +204,11 @@ class variable_alloc_visitor ctx =
           (* save local variable number at identifier nodes *)
           match t with
           | LocalVariable (_, loc) ->
-              expr.node <-
-                Ident (name, LocalVariable (self#get_var_no name, loc))
+              let idx = self#get_var_no name in
+              let level = self#get_capture_level name in
+              if level > 0 then
+                expr.node <- Ident (name, CapturedVariable (idx, level))
+              else expr.node <- Ident (name, LocalVariable (idx, loc))
           | _ -> ())
       | Call (_, _, calltype) -> (
           match expr.ty with
