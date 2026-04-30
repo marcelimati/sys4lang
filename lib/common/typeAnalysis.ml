@@ -1352,7 +1352,44 @@ class type_analyze_visitor ctx =
           | Jumps e -> type_check (ASTExpression e) String e
           | Message _ -> ()
           | RefAssign (lhs, rhs) ->
-              self#check_ref_assign (ASTStatement stmt) lhs rhs
+              self#check_ref_assign (ASTStatement stmt) lhs rhs;
+              (* v11 foreach desugars the loop variable with a placeholder
+                 [wrap<hll_param>] / [ref array<hll_param>] type, since
+                 its concrete element type isn't known until the
+                 container is type-checked. When the first [RefAssign]
+                 to such a variable is analysed, narrow the lhs (and
+                 its declared type) to match the rhs — later uses like
+                 [x?.Method()] then resolve normally instead of tripping
+                 the sanity check. *)
+              let resolve_hll ty_lhs ty_rhs =
+                match ty_lhs with
+                | HLLParam | Ref HLLParam ->
+                    Some (match ty_rhs with Ref _ -> ty_rhs | t -> Ref t)
+                | Wrap HLLParam ->
+                    Some (match ty_rhs with Wrap _ -> ty_rhs | t -> Wrap t)
+                | Ref (Array HLLParam) ->
+                    Some
+                      (match ty_rhs with
+                      | Ref (Array _) -> ty_rhs
+                      | Array _ -> Ref ty_rhs
+                      | _ -> ty_lhs)
+                | Array HLLParam ->
+                    Some (match ty_rhs with Array _ -> ty_rhs | _ -> ty_lhs)
+                | _ -> None
+              in
+              (match resolve_hll lhs.ty rhs.ty with
+              | Some resolved -> (
+                  lhs.ty <- resolved;
+                  match lhs.node with
+                  | Ident (name, _) -> (
+                      match self#env#get_local name with
+                      | Some v -> (
+                          match resolve_hll v.type_spec.ty rhs.ty with
+                          | Some t -> v.type_spec.ty <- t
+                          | None -> ())
+                      | None -> ())
+                  | _ -> ())
+              | None -> ())
           | ObjSwap (lhs, rhs) ->
               self#check_lvalue lhs (ASTStatement stmt);
               self#check_lvalue rhs (ASTStatement stmt);
@@ -1361,6 +1398,17 @@ class type_analyze_visitor ctx =
 
     method! visit_variable var =
       super#visit_variable var;
+      (* v11 foreach-desugared container: [ref array<hll_param>] is a
+         placeholder narrowed from the actual initializer's type so
+         later subscript + ref-assign propagate a concrete element
+         type to the loop variable. *)
+      (match (var.type_spec.ty, var.initval) with
+      | Ref (Array HLLParam), Some { ty; _ } -> (
+          match ty with
+          | Array _ -> var.type_spec.ty <- Ref ty
+          | Ref (Array _) -> var.type_spec.ty <- ty
+          | _ -> ())
+      | _ -> ());
       let nr_dims = List.length var.array_dim in
       (* Check that there is no initializer if array has explicit dimensions *)
       if nr_dims > 0 && Option.is_some var.initval then
