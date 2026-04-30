@@ -621,6 +621,17 @@ class jaf_compiler ctx debug_info =
          access happen — both are needed before [.Y] dereferences. *)
       | OptionalMember _ ->
           self#compile_expression e
+      | Member (obj, _, ClassMethod (name, no))
+        when String.is_suffix name ~suffix:"::get"
+             || String.is_suffix name ~suffix:"::set" ->
+          (* v11 property-method as lvalue (e.g. in a [RefAssign]
+             target): push receiver then the method idx; the
+             surrounding assignment path emits the [CALLMETHOD].
+             Pre-v11 eagerly emits [CALLMETHOD] since its assignment
+             flow doesn't defer. *)
+          self#compile_lvalue obj;
+          if Ain.version ctx.ain > 8 then self#write_instruction1 PUSH no
+          else self#write_instruction1 CALLMETHOD no
       | _ ->
           compiler_bug
             ("invalid lvalue: " ^ expr_to_string e)
@@ -1270,12 +1281,82 @@ class jaf_compiler ctx debug_info =
           self#compile_function_arguments args f;
           self#write_instruction1 CALLFUNC function_no
       (* method call *)
+      (* v11 optional method call: [obj?.Method(args)]. Two receiver
+         shapes:
+         - [DummyRef _] receiver (e.g. transient call result): push
+           via [compile_lvalue], DUP, null-check; on null skip the
+           call and push the type-appropriate fat-null sentinel.
+         - variable receiver: [compile_variable_ref], [DUP2; REF],
+           null-check; same fall-through but a 2-slot pop is needed
+           for the page+index pair.
+         Both branches push a [-1] / [-1; -1] pair on the null path so
+         the surrounding stack discipline matches the call's return
+         arity (Void → 1 slot, non-Void → 2 slots). *)
+      | Call
+          ( { node = OptionalMember (e, _, _); _ },
+            args,
+            MethodCall (_, method_no) )
+        when Ain.version ctx.ain > 8 ->
+          let method_return_type =
+            (Ain.get_function_by_index ctx.ain method_no).return_type
+          in
+          let push_null_sentinel () =
+            match method_return_type with
+            | Ain.Type.Void -> self#write_instruction1 PUSH (-1)
+            | _ ->
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1)
+          in
+          let is_dummyref =
+            match e.node with DummyRef _ -> true | _ -> false
+          in
+          if is_dummyref then (
+            self#compile_lvalue e;
+            self#write_instruction0 DUP;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifnz_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            self#compile_method_call args method_no;
+            self#write_instruction1 PUSH 0;
+            let jump_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#write_address_at ifnz_addr current_address;
+            self#write_instruction0 POP;
+            push_null_sentinel ();
+            self#write_address_at jump_addr current_address)
+          else (
+            self#compile_variable_ref e;
+            self#write_instruction0 DUP2;
+            self#write_instruction0 REF;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifnz_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            self#write_instruction0 REF;
+            self#compile_method_call args method_no;
+            self#write_instruction1 PUSH 0;
+            let jump_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#write_address_at ifnz_addr current_address;
+            self#write_instruction0 POP;
+            self#write_instruction0 POP;
+            push_null_sentinel ();
+            self#write_address_at jump_addr current_address)
       | Call
           ( { node = Member (e, mname, _); _ },
             args,
             MethodCall (_, method_no) ) ->
           self#pre_emit_lambda_args args;
           self#compile_lvalue e;
+          (* v11 Wrap receiver: unwrap the fat-ref before CALLMETHOD
+             so the method dispatches on the wrapped struct, not the
+             wrapper slot. *)
+          (match e.ty with
+          | Wrap _ when Ain.version ctx.ain > 8 ->
+              self#write_instruction0 REFREF;
+              self#write_instruction0 REF
+          | _ -> ());
           (* v11 property-setter idiom: every [this.X = value] /
              [obj.X = value] property write expands to a
              [Name::set(value)] call that the original compiler emits
@@ -1319,12 +1400,80 @@ class jaf_compiler ctx debug_info =
             if is_string_setter then self#write_instruction0 DELETE
             else self#write_instruction0 POP)
           else self#compile_method_call args method_no
+      (* v11 optional HLL/method call: [array?.Duplicate(x)] etc. lower
+         to [CALLHLL] rather than [CALLMETHOD], so the OptionalMember
+         method-call arm above doesn't catch them. *)
+      | Call
+          ( { node = OptionalMember (e, _, _); _ },
+            args,
+            HLLCall (lib_no, fun_no) )
+        when Ain.version ctx.ain > 8 -> (
+          self#pre_emit_lambda_args args;
+          let f = Ain.function_of_hll_function_index ctx.ain lib_no fun_no in
+          match args with
+          | [] ->
+              compiler_bug "optional HLL call without receiver argument"
+                (Some (ASTExpression expr))
+          | _receiver :: rest_args ->
+              let params = Ain.Function.logical_parameters f in
+              let rest_params =
+                match params with _ :: tl -> tl | [] -> []
+              in
+              self#compile_variable_ref e;
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction0 REF;
+              List.iter2_exn rest_args rest_params ~f:(fun arg var ->
+                  self#compile_argument arg var.value_type);
+              let lib = Ain.get_library_by_index ctx.ain lib_no in
+              let type_id =
+                if String.equal lib.name "Array" then
+                  match e.ty with
+                  | Array t | Ref (Array t) ->
+                      Ain.Type.int_of_data_type (Ain.version ctx.ain)
+                        (jaf_to_ain_type t)
+                  | _ -> -1
+                else -1
+              in
+              self#write_instruction3 CALLHLL lib_no fun_no type_id;
+              self#write_instruction1 PUSH 0;
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              (match f.return_type with
+              | Ain.Type.Void -> self#write_instruction1 PUSH (-1)
+              | _ ->
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1));
+              self#write_address_at jump_addr current_address)
       (* HLL function call *)
       | Call (_, args, HLLCall (lib_no, fun_no)) ->
           self#pre_emit_lambda_args args;
           let f = Ain.function_of_hll_function_index ctx.ain lib_no fun_no in
           self#compile_function_arguments args f;
-          self#write_instruction2 CALLHLL lib_no fun_no
+          if Ain.version ctx.ain > 8 then
+            (* v11 [CALLHLL] carries an extra type-id operand. For Array
+               library methods it's the element type of the receiver;
+               for everything else the runtime ignores it and -1 is
+               fine. *)
+            let lib = Ain.get_library_by_index ctx.ain lib_no in
+            let type_id =
+              if String.equal lib.name "Array" then
+                match args with
+                | Some { ty = Array t | Ref (Array t); _ } :: _ ->
+                    Ain.Type.int_of_data_type (Ain.version ctx.ain)
+                      (jaf_to_ain_type t)
+                | _ -> -1
+              else -1
+            in
+            self#write_instruction3 CALLHLL lib_no fun_no type_id
+          else self#write_instruction2 CALLHLL lib_no fun_no
       (* system call *)
       | Call (_, args, SystemCall sys) ->
           let f = Builtin.function_of_syscall sys in
