@@ -454,10 +454,18 @@ class type_analyze_visitor ctx =
                 type_error (Delegate delegate) (Some expr) parent
           | NullType -> expr.ty <- Delegate delegate
           | String ->
-              (* XXX: String -> Method conversion, but needs a delegate index
-                 for DG_STR_TO_METHOD instruction *)
+              (* String -> Method conversion, but needs a delegate index
+                 for DG_STR_TO_METHOD. Pre-v11 the cast leaves a method-
+                 pointer on the stack so the surrounding [Delegate] arg
+                 path needs to know to wrap with DG_NEW_FROM_METHOD —
+                 mark [expr.ty] as [TyMethod] for that. v11's cast
+                 handler emits DG_NEW_FROM_METHOD inline, so leave the
+                 type as the natural [Delegate]; otherwise
+                 [compile_argument] would add a *second* wrap and the
+                 call would push a doubly-wrapped delegate. *)
               insert_cast (Delegate delegate) expr;
-              expr.ty <- TyMethod dt
+              if not (Ain.version_gte ctx.ain (11, 0)) then
+                expr.ty <- TyMethod dt
           | _ -> type_check parent (Delegate delegate) expr)
       | None -> (
           match expr.ty with
@@ -505,16 +513,39 @@ class type_analyze_visitor ctx =
       (* check that lhs is a reference variable of the appropriate type *)
       match lhs.node with
       | Ident (name, _) -> (
-          match self#env#resolve name with
+          let resolved =
+            match self#env#resolve name with
+            | UnresolvedName ->
+                (* v11 lambdas capture locals from enclosing scopes. *)
+                let envs = Stack.to_list self#env_stack in
+                (match envs with
+                | _ :: rest -> (
+                    match
+                      List.find_map rest ~f:(fun env -> env#get_local name)
+                    with
+                    | Some v -> ResolvedLocal v
+                    | None -> UnresolvedName)
+                | [] -> UnresolvedName)
+            | r -> r
+          in
+          match resolved with
           | ResolvedLocal v | ResolvedGlobal v -> (
               match v.type_spec.ty with
-              | Ref ty -> ref_type_check parent ty rhs
+              (* Accept [Wrap T] alongside [Ref T] — the v11 fat-ref
+                 representation flows through the same ref-assign path. *)
+              | Ref ty | Wrap ty -> ref_type_check parent ty rhs
               | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
           | UnresolvedName -> undefined_variable_error name parent
           | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
       | Member (_, _, ClassVariable _) -> (
           match lhs.ty with
-          | Ref t -> ref_type_check parent t rhs
+          | Ref t | Wrap t -> ref_type_check parent t rhs
+          | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
+      (* Subscript of an [array@ref T] yields a [ref T] slot; ref-
+         assigning into it (e.g. [arr[i] <- new T()]) is legal. *)
+      | Subscript _ -> (
+          match lhs.ty with
+          | Ref t | Wrap t -> ref_type_check parent t rhs
           | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
       | _ ->
           (* FIXME? this isn't really a _type_ error *)
@@ -638,8 +669,30 @@ class type_analyze_visitor ctx =
           | ResolvedBuiltin builtin ->
               expr.node <- Ident (name, BuiltinFunction builtin);
               expr.ty <- Void
-          | UnresolvedName -> undefined_variable_error name (ASTExpression expr)
-          )
+          | UnresolvedName -> (
+              (* v11 lambdas capture names from enclosing scopes. When
+                 resolution fails in the current env, walk parent
+                 environments looking for a matching local — keep the
+                 [LocalVariable] tag here; [variableAlloc]'s capture
+                 pass later flips the tag to [CapturedVariable] with
+                 the proper depth. *)
+              let envs = Stack.to_list self#env_stack in
+              let captured =
+                match envs with
+                | _ :: rest ->
+                    List.find_map rest ~f:(fun env -> env#get_local name)
+                | [] -> None
+              in
+              match captured with
+              | Some v ->
+                  expr.node <-
+                    Ident
+                      ( name,
+                        LocalVariable
+                          (Option.value v.index ~default:0, v.location) );
+                  expr.ty <- v.type_spec.ty
+              | None ->
+                  undefined_variable_error name (ASTExpression expr)))
       | FuncAddr (name, _) -> (
           match Hashtbl.find ctx.functions name with
           | Some f ->
