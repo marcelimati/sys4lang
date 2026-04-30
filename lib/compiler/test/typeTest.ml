@@ -887,3 +887,192 @@ let%expect_test "v11 free-function overload" =
       }
     |};
   [%expect {| ok |}]
+
+let%expect_test "v11 method overload: differ in arity" =
+  type_test_v11
+    {|
+      struct C {
+        void f(int x);
+        void f(int x, int y);
+      };
+      void C::f(int x) {}
+      void C::f(int x, int y) {}
+      void g(ref C c) {
+        c.f(1);
+        c.f(1, 2);
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 method overload: duplicate body with identical params rejected" =
+  type_test_v11
+    {|
+      class C {
+        void f(int x);
+        void f(float x);
+      };
+      void C::f(float x) {}
+      void C::f(float x) {}
+    |};
+  [%expect
+    {|
+    -:7:7-28: Duplicate function definition
+        7 |       void C::f(float x) {}
+                  ^^^^^^^^^^^^^^^^^^^^^
+    |}]
+
+let%expect_test "bare array type rejected in non-hll context" =
+  type_test_v11 {|
+    void f() {
+      array xs;
+    }
+  |};
+  [%expect
+    {|
+    -:3:13-15: Syntax error
+        3 |       array xs;
+                        ^^
+    |}]
+
+let%expect_test "v11 array ref type syntax" =
+  type_test_v11 {|
+    class C {};
+    array@ref C xs;
+    void f(ref array@ref C ys) {}
+  |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 property declaration: get/set, get-only, set-only" =
+  type_test_v11
+    {|
+      class C {
+        int Alpha { get; set; }
+        string Name { get; }
+        int Counter { set; }
+      };
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 property: read dispatches to getter, write to setter" =
+  type_test_v11
+    {|
+      class C {
+        int Alpha { get; set; }
+        void Use();
+      };
+      void C::Use() {
+        int x = this.Alpha;
+        this.Alpha = 5;
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 property: read-only write is an error" =
+  type_test_v11
+    {|
+      class C {
+        int Alpha { get; }
+        void Use();
+      };
+      void C::Use() {
+        this.Alpha = 5;
+      }
+    |};
+  [%expect
+    {|
+    -:7:9-23: property `Alpha` is read-only
+        7 |         this.Alpha = 5;
+                    ^^^^^^^^^^^^^^
+    |}]
+
+let%expect_test "v11 property: unknown accessor name rejected" =
+  type_test_v11
+    {|
+      class C {
+        int Alpha { wat; }
+      };
+    |};
+  [%expect
+    {|
+    -:3:9-12: unknown property accessor `wat` (expected `get` or `set`)
+        3 |         int Alpha { wat; }
+                    ^^^
+    |}]
+
+let%expect_test "v11 event member: declaration parses and `obj.Name` resolves to `<Name>`" =
+  type_test_v11
+    {|
+      delegate void DG_Foo(int);
+      class C {
+        event DG_Foo MyEvent;
+        void Use(DG_Foo cb);
+      };
+      void C::Use(DG_Foo cb) {
+        this.MyEvent += cb;
+        this.MyEvent -= cb;
+        this.MyEvent(0);
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 optional member access compiles end-to-end" =
+  type_test_v11
+    {|
+      class C {
+        int Value { get; set; }
+      };
+      void f(ref C c) {
+        int a = c?.Value ?? 0;
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "string getpart with omitted length: accepted on v11" =
+  type_test_v11
+    {|
+      void f(string s) {
+        s.GetPart(1);
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "string getpart with omitted length: rejected pre-v11" =
+  type_test
+    {|
+      void f(string s) {
+        s.GetPart(1);
+      }
+    |};
+  [%expect
+    {|
+    -:3:9-21: Wrong number of arguments to function GetPart (expected 2; got 1)
+        3 |         s.GetPart(1);
+                    ^^^^^^^^^^^^
+    |}]
+
+(* v11 relaxes the "no member access on temporary object" rule for
+   call results (and a few other rvalue producers): variableAlloc
+   wraps such expressions in a DummyRef-backed local so the receiver
+   has a stable address. The same source that errors pre-v11 should
+   typecheck cleanly under v11. *)
+let%expect_test "v11 allows member access on call results" =
+  type_test_v11
+    {|
+      class C {
+        int n;
+        void f() {}
+      };
+      C get_C() { C c; return c; }
+      void test() {
+        get_C().n;
+        get_C().f();
+      }
+    |};
+  [%expect {|
+    -:8:9-18: C::n is not public
+        8 |         get_C().n;
+                    ^^^^^^^^^
+    -:9:9-18: C::f is not public
+        9 |         get_C().f();
+                    ^^^^^^^^^
+    |}]
