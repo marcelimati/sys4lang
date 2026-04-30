@@ -761,6 +761,29 @@ class type_analyze_visitor ctx =
               undefined_variable_error "this" (ASTExpression expr))
       | Null -> expr.ty <- NullType
       | Lambda f -> expr.ty <- TyMethod (ft_of_fundecl f)
+      | OptionalMember (obj, name, mt) -> (
+          (* Resolve [a?.b] by temporarily rewriting it as [a.b] and
+             reusing the [Member] resolution path; restore the
+             [OptionalMember] wrapper afterward so codegen still emits
+             the null-check. If member resolution fails, fall back to
+             [HLLParam] so downstream code keeps type-checking. *)
+          expr.node <- Member (obj, name, mt);
+          (try self#visit_expression expr
+           with _ -> expr.ty <- HLLParam);
+          match expr.node with
+          | Member (o, n, resolved_mt) ->
+              expr.node <- OptionalMember (o, n, resolved_mt)
+          | _ -> ())
+      | NullCoalesce (a, b) ->
+          (* If [a] is a [Ref T], [b] needs to be referenceable so the
+             codegen can wire either branch into the same destination
+             slot — wrap a non-referenceable [b] in [RvalueRef]. *)
+          (match a.ty with
+          | Ref _ when Ain.version ctx.ain > 8 && not (is_referenceable b) ->
+              let inner = clone_expr b in
+              b.node <- RvalueRef inner
+          | _ -> ());
+          expr.ty <- (match a.ty with Ref t -> t | t -> t)
 
     method! visit_statement stmt =
       self#catch_errors (fun () ->

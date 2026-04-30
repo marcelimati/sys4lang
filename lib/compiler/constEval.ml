@@ -192,6 +192,8 @@ class const_eval_visitor ctx =
           | Some e -> const_replace expr e.node
           | None -> const_error v)
       | Member (_, _, _) -> ()
+      | OptionalMember _ -> ()
+      | NullCoalesce _ -> ()
       | Call (_, _, _) -> ()
       | New _ -> ()
       | DummyRef _ -> ()

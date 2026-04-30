@@ -207,6 +207,7 @@ postfix_expression
   | postfix_expression arglist { make_expr ~loc:$sloc (Call ($1, $2, UnresolvedCall)) }
   | NEW qualified_name { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
   | postfix_expression DOT IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
+  | postfix_expression QUESTION_DOT IDENTIFIER { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
   | postfix_expression INC { make_expr ~loc:$sloc (Unary (PostInc, $1)) }
   | postfix_expression DEC { make_expr ~loc:$sloc (Unary (PostDec, $1)) }
   ;
@@ -289,9 +290,15 @@ logor_expression
   | logor_expression OR logand_expression { make_expr ~loc:$sloc (Binary (LogOr, $1, $3)) }
   ;
 
-cond_expression
+null_coalesce_expression
   : logor_expression { $1 }
-  | logor_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
+  | null_coalesce_expression QUESTION_QUESTION logor_expression
+    { make_expr ~loc:$sloc (NullCoalesce ($1, $3)) }
+  ;
+
+cond_expression
+  : null_coalesce_expression { $1 }
+  | null_coalesce_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
   ;
 
 assign_expression

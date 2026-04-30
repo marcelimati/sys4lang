@@ -171,6 +171,14 @@ and ast_expression =
   | Assign of assign_op * expression * expression
   | Seq of expression * expression
   | Ternary of expression * expression * expression
+  (* v11 optional member access [a?.b]: evaluate [a]; if non-NULL
+     produce its [.b] member, else short-circuit to NULL. Resolved
+     in type analysis much like [Member]. *)
+  | OptionalMember of expression * string * member_type
+  (* v11 null-coalesce [a ?? b]: evaluate [a]; if NULL evaluate [b]
+     and return that, else return [a]. Both sides must produce a
+     compatible type. *)
+  | NullCoalesce of expression * expression
   | Cast of jaf_type * expression
   | Subscript of expression * expression
   | Member of expression * string * member_type
@@ -475,6 +483,10 @@ class ivisitor ctx =
           self#visit_expression a;
           self#visit_expression b;
           self#visit_expression c
+      | OptionalMember (obj, _, _) -> self#visit_expression obj
+      | NullCoalesce (a, b) ->
+          self#visit_expression a;
+          self#visit_expression b
       | Cast (_, obj) -> self#visit_expression obj
       | Subscript (arr, i) ->
           self#visit_expression arr;
@@ -690,6 +702,9 @@ let rec expr_to_string (e : expression) =
   | Ternary (a, b, c) ->
       sprintf "%s ? %s : %s" (expr_to_string a) (expr_to_string b)
         (expr_to_string c)
+  | OptionalMember (obj, name, _) -> sprintf "%s?.%s" (expr_to_string obj) name
+  | NullCoalesce (a, b) ->
+      sprintf "%s ?? %s" (expr_to_string a) (expr_to_string b)
   | Cast (t, e) -> sprintf "(%s)%s" (jaf_type_to_string t) (expr_to_string e)
   | Subscript (e, i) -> sprintf "%s[%s]" (expr_to_string e) (expr_to_string i)
   | Member (e, s, _) -> sprintf "%s.%s" (expr_to_string e) s

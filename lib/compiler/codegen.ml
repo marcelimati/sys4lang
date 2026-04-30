@@ -430,6 +430,12 @@ class jaf_compiler ctx debug_info =
           self#write_address_at ifz_addr current_address;
           self#compile_lvalue alt;
           self#write_address_at jump_addr current_address
+      (* Chained optional access [obj?.X.Y]: the outer [.Y] lvalue's
+         receiver is the whole [obj?.X] chain. Compile the
+         [OptionalMember] as an rvalue so the null-check AND the [.X]
+         access happen — both are needed before [.Y] dereferences. *)
+      | OptionalMember _ ->
+          self#compile_expression e
       | _ ->
           compiler_bug
             ("invalid lvalue: " ^ expr_to_string e)
@@ -983,6 +989,46 @@ class jaf_compiler ctx debug_info =
           self#write_address_at jump_addr current_address;
           self#write_instruction0 PUSHSTRUCTPAGE;
           self#write_instruction1 PUSH (Option.value_exn f.index)
+      | OptionalMember (obj, name, mt) ->
+          (* [a?.b] rvalue: evaluate [a]; if the result is the [-1]
+             null sentinel, push the type-appropriate default; else
+             access [.b] on [a]. *)
+          self#compile_expression obj;
+          self#write_instruction0 DUP;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 EQUALE;
+          let ifnz_addr = current_address + 2 in
+          self#write_instruction1 IFNZ 0;
+          (match mt with
+          | ClassMethod (_, no) -> self#write_instruction1 PUSH no
+          | ClassVariable var_no ->
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF
+          | _ ->
+              let member_expr = { expr with node = Member (obj, name, mt) } in
+              self#compile_expression member_expr);
+          let jump_addr = current_address + 2 in
+          self#write_instruction1 JUMP 0;
+          self#write_address_at ifnz_addr current_address;
+          self#write_instruction0 POP;
+          (match expr.ty with
+           | Ref _ | Struct _ | Delegate _ -> self#write_instruction1 PUSH (-1)
+           | String -> self#write_instruction1 S_PUSH 0
+           | Float -> self#write_instruction1_float F_PUSH 0.0
+           | _ -> self#write_instruction1 PUSH 0);
+          self#write_address_at jump_addr current_address
+      | NullCoalesce (a, b) ->
+          (* [a ?? b]: evaluate [a]; if it's the [-1] null sentinel,
+             drop it and evaluate [b], else keep [a]. *)
+          self#compile_expression a;
+          self#write_instruction0 DUP;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 EQUALE;
+          let ifz_addr = current_address + 2 in
+          self#write_instruction1 IFZ 0;
+          self#write_instruction0 POP;
+          self#compile_expression b;
+          self#write_address_at ifz_addr current_address
 
     method compile_expr_and_pop (expr : expression) =
       match expr.node with
