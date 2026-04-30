@@ -206,6 +206,7 @@ postfix_expression
   | primitive_type_specifier LPAREN expression RPAREN { make_expr ~loc:$sloc (Cast ($1, $3)) }
   | postfix_expression arglist { make_expr ~loc:$sloc (Call ($1, $2, UnresolvedCall)) }
   | NEW qualified_name { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
+  | NEW qualified_name LPAREN RPAREN { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
   | postfix_expression DOT IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
   | postfix_expression QUESTION_DOT IDENTIFIER { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
   | postfix_expression INC { make_expr ~loc:$sloc (Unary (PostInc, $1)) }

@@ -549,7 +549,16 @@ class type_analyze_visitor ctx =
           | _ -> type_error t (Some rhs) parent)
       | Int | LongInt | Bool | Float ->
           type_check_numeric parent rhs;
-          insert_cast t rhs
+          (* v11 skips the int→bool cast for assignments — the VM
+             treats them interchangeably and the gratuitous [ITOB]
+             would diverge from the original compiler's output.
+             Pre-v11 keeps the explicit cast. *)
+          if
+            Ain.version_gte ctx.ain (11, 0)
+            && Poly.(t = Bool)
+            && (match rhs.ty with Int | LongInt -> true | _ -> false)
+          then ()
+          else insert_cast t rhs
       | Struct _ -> (
           match rhs.ty with
           | Ref t' when type_equal t t' -> ()
