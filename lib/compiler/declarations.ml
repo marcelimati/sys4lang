@@ -274,7 +274,11 @@ let expand_struct_decls ~(ctx : context) ~(class_name : string)
           in
           infos := (p.pd_name, info) :: !infos;
           decls
-      | EventDecl e -> expand_event_decl e
+      | EventDecl e ->
+          let decls = expand_event_decl e in
+          if event_is_user_bodied e.ed_name then
+            List.filter decls ~f:(function MemberDecl _ -> false | _ -> true)
+          else decls
       | MemberDecl ds when not ds.is_const_decls ->
           let kept =
             List.filter ds.vars ~f:(fun v -> not (drop_event_backing v))

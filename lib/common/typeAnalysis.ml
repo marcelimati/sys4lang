@@ -1146,6 +1146,40 @@ class type_analyze_visitor ctx =
                       } );
               expr.ty <- prop_info_ty info
           | None -> (
+              let event_add =
+                Hashtbl.find ctx.functions
+                  (struc.name ^ "@" ^ member_name ^ "::add")
+              in
+              let event_remove =
+                Hashtbl.find ctx.functions
+                  (struc.name ^ "@" ^ member_name ^ "::remove")
+              in
+              let user_bodied_event =
+                Hashtbl.mem ctx.user_bodied_accessors
+                  (struc.name ^ "@" ^ member_name ^ "::add")
+                && Hashtbl.mem ctx.user_bodied_accessors
+                     (struc.name ^ "@" ^ member_name ^ "::remove")
+              in
+              match (user_bodied_event, event_add, event_remove) with
+              | true, (Some add), _ | true, _, (Some add) ->
+                  let event_type =
+                    match add.params with [ p ] -> p.type_spec.ty | _ -> Void
+                  in
+                  expr.node <-
+                    Member
+                      ( obj,
+                        member_name,
+                        ClassEvent
+                          {
+                            event_class = struc.name;
+                            event_name = member_name;
+                            event_add_index =
+                              Option.bind event_add ~f:(fun f -> f.index);
+                            event_remove_index =
+                              Option.bind event_remove ~f:(fun f -> f.index);
+                          } );
+                  expr.ty <- event_type
+              | _ -> (
               match lookup_member member_name with
               | Some member ->
                   if member.is_private then access_check ();
@@ -1166,14 +1200,6 @@ class type_analyze_visitor ctx =
                      call. Prefer the event form over an identically-
                      named method — the event prototype in the class
                      declaration is what made the accessors exist. *)
-                  let event_add =
-                    Hashtbl.find ctx.functions
-                      (struc.name ^ "@" ^ member_name ^ "::add")
-                  in
-                  let event_remove =
-                    Hashtbl.find ctx.functions
-                      (struc.name ^ "@" ^ member_name ^ "::remove")
-                  in
                   match (event_add, event_remove) with
                   | Some add, _ | _, Some add ->
                       let event_type =
@@ -1212,7 +1238,7 @@ class type_analyze_visitor ctx =
                           (* TODO: separate error type for this? *)
                           undefined_variable_error
                             (struc.name ^ "." ^ member_name)
-                            (ASTExpression expr)))))
+                            (ASTExpression expr))))))
       (* Already-resolved AND type-checked Call — re-entered through
          the [OptionalMember] handler's recursive [self#visit_expression]
          (which re-walks the OM's child obj). Skip: re-running
