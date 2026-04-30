@@ -1328,9 +1328,8 @@ let%expect_test "v11 ref array decl from global" =
     054: EOF
     |}]
 
-(* v11 emits NOT, then ASSIGN — the legacy ITOB after NOT is redundant
-   (NOT already produces a 0/1 bool) and is omitted on v11. *)
-let%expect_test "v11 NOT assign to int skips ITOB" =
+(* v11 emits NOT, then normalizes through ITOB before assignment. *)
+let%expect_test "v11 NOT assign emits ITOB" =
   compile_test ~ain_version:11
     {|
       class C {
@@ -1349,12 +1348,13 @@ let%expect_test "v11 NOT assign to int skips ITOB" =
     016: PUSH 0
     022: REF
     024: NOT
-    026: ASSIGN
-    028: POP
-    030: RETURN
-    032: EOF test.jaf
-    038: FUNC NULL
-    044: EOF
+    026: ITOB
+    028: ASSIGN
+    030: POP
+    032: RETURN
+    034: EOF test.jaf
+    040: FUNC NULL
+    046: EOF
     |}]
 
 (* v11 SR_ASSIGN drops its struct-type-id operand. Pre-v11 needs

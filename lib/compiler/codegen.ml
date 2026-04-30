@@ -447,6 +447,20 @@ class jaf_compiler ctx debug_info =
     method compile_delete_var (v : Ain.Variable.t) =
       match v.value_type with
       | Ref _ | Struct _ -> self#write_instruction1 SH_LOCALDELETE v.index
+      | Array _ when Ain.version ctx.ain > 8 -> (
+          match Ain.get_library_index ctx.ain "Array" with
+          | Some lib_no -> (
+              match Ain.get_library_function_index ctx.ain lib_no "Free" with
+              | Some fun_no ->
+                  let elem_type =
+                    ain_to_jaf_type ctx.ain v.value_type
+                    |> self#array_element_type_code
+                  in
+                  self#compile_local_ref v.index;
+                  self#write_instruction0 REF;
+                  self#write_instruction3 CALLHLL lib_no fun_no elem_type
+              | None -> self#write_instruction1 SH_LOCALDELETE v.index)
+          | None -> self#write_instruction1 SH_LOCALDELETE v.index)
       | Array _ ->
           self#compile_local_ref v.index;
           self#write_instruction0 A_FREE
@@ -559,6 +573,10 @@ class jaf_compiler ctx debug_info =
     method compile_lvalue (e : expression) =
       let compile_lvalue_after (t : Ain.Type.t) =
         match t with
+        | Wrap (Int | Float | Bool | LongInt) -> self#write_instruction0 REFREF
+        | Wrap String ->
+            self#write_instruction0 REFREF;
+            self#write_instruction0 REF
         | Ref (Int | Float | Bool | LongInt) -> self#write_instruction0 REFREF
         | Ref (String | Array _ | Struct _) -> self#write_instruction0 REF
         | String | Array _ | Struct _ | Delegate _ ->
@@ -1105,7 +1123,8 @@ class jaf_compiler ctx debug_info =
           self#write_instruction0 (match e.ty with Float -> F_INV | _ -> INV)
       | Unary (LogNot, e) ->
           self#compile_expression e;
-          self#write_instruction0 NOT
+          self#write_instruction0 NOT;
+          if Ain.version ctx.ain > 8 then self#write_instruction0 ITOB
       | Unary (BitNot, e) ->
           self#compile_expression e;
           self#write_instruction0 COMPL
@@ -1299,6 +1318,16 @@ class jaf_compiler ctx debug_info =
           self#compile_lvalue lhs;
           self#compile_expression rhs;
           match (op, rhs.ty) with
+          | EqAssign, _ when Poly.(lhs.ty = Bool) ->
+              (if Ain.version ctx.ain > 8 then
+                 match rhs.node with
+                 | ConstInt _ -> self#write_instruction0 ITOB
+                 | _
+                   when (not (TypeAnalysis.is_bool_producing_expr rhs))
+                        && (match rhs.ty with Bool -> false | _ -> true) ->
+                     self#write_instruction0 ITOB
+                 | _ -> ());
+              self#write_instruction0 ASSIGN
           | EqAssign, (Int | Bool | TyFunction _ | FuncType _) ->
               self#write_instruction0 ASSIGN
           | PlusAssign, (Int | Bool) -> self#write_instruction0 PLUSA
@@ -1460,7 +1489,9 @@ class jaf_compiler ctx debug_info =
           self#compile_expression b
       | Ternary (test, con, alt) ->
           self#compile_expression test;
-          self#maybe_emit_condition_itob test;
+          (match test.node with
+          | Member (_, _, ClassVariable _) when Ain.version ctx.ain > 8 -> ()
+          | _ -> self#maybe_emit_condition_itob test);
           let ifz_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           self#compile_expression con;
@@ -2041,17 +2072,27 @@ class jaf_compiler ctx debug_info =
                 (Some (ASTExpression expr)))
       | Lambda f ->
           let lambda_idx = Option.value_exn f.index in
+          let emit_lambda_receiver () =
+            match current_function with
+            | Some f
+              when Option.is_some f.struct_type
+                   || String.is_substring f.name ~substring:"@" ->
+                self#write_instruction0 PUSHSTRUCTPAGE
+            | _ -> self#write_instruction1 PUSH (-1)
+          in
           (* v11 pre-emit: if the enclosing call has already written
              the lambda body via [pre_emit_lambda_args], don't emit it
              again — re-registering would shift downstream addresses
              and double the function-table entry. Just push the
              receiver+index. *)
-          if not (Hashtbl.mem pre_emitted_lambdas lambda_idx) then (
+          if Hashtbl.mem pre_emitted_lambdas lambda_idx then
+            emit_lambda_receiver ()
+          else (
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
             self#compile_function f;
-            self#write_address_at jump_addr current_address);
-          self#write_instruction0 PUSHSTRUCTPAGE;
+            self#write_address_at jump_addr current_address;
+            emit_lambda_receiver ());
           self#write_instruction1 PUSH lambda_idx
       | OptionalMember (obj, name, mt) ->
           (* [a?.b] rvalue: evaluate [a]; if the result is the [-1]
@@ -2193,6 +2234,34 @@ class jaf_compiler ctx debug_info =
       match expr.node with
       | Assign
           ( EqAssign,
+            ( {
+                node =
+                  Member
+                    ( _,
+                      member_name,
+                      ClassVariable _
+                    );
+                ty = String;
+                _;
+              } as lhs ),
+            ({ node = Ident ("value", LocalVariable _); ty = String; _ } as rhs)
+          )
+        when Ain.version ctx.ain > 8
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match current_function with
+                | Some f -> String.is_suffix f.name ~suffix:"::set"
+                | None -> false) ->
+          (* Auto string-property setters use the backing slot transfer
+             shape directly; the generic string assignment path would
+             add A_REF/DELETE and diverge from v11 output. *)
+          self#compile_lvalue lhs;
+          self#compile_lvalue rhs;
+          self#write_instruction0 S_ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP
+      | Assign
+          ( EqAssign,
             { node = Ident (_, LocalVariable (i, _)); _ },
             { node = ConstInt n; _ } )
         when ctx.version < 630
@@ -2241,7 +2310,11 @@ class jaf_compiler ctx debug_info =
       | DummyRef _ ->
           self#compile_lvalue expr;
           before_pop ();
-          self#compile_pop expr.ty (ASTExpression expr)
+          (match expr.ty with
+          | Ref (String | Struct _ | Array _ | HLLParam)
+            when Ain.version_gte ctx.ain (11, 0) ->
+              self#write_instruction0 POP
+          | _ -> self#compile_pop expr.ty (ASTExpression expr))
       | _ ->
           self#compile_expression expr;
           before_pop ();
@@ -2253,7 +2326,8 @@ class jaf_compiler ctx debug_info =
       DebugInfo.add_loc debug_info current_address stmt.loc;
       (* delete locals that will be out-of-scope after this statement *)
       List.iter (List.rev stmt.delete_vars) ~f:(fun i ->
-          self#compile_delete_var (self#get_local i));
+          if List.mem inline_deleted_dummies i ~equal:Int.equal then ()
+          else self#compile_delete_var (self#get_local i));
       match stmt.node with
       | EmptyStatement -> ()
       | Declarations decls ->
@@ -2396,6 +2470,7 @@ class jaf_compiler ctx debug_info =
           (* self#set_continue_addr loop_addr; *)
           Option.iter inc ~f:self#compile_expr_and_pop;
           self#write_instruction1 JUMP test_addr;
+          if Ain.version ctx.ain > 8 then self#write_instruction1 JUMP test_addr;
           (* loop body *)
           self#write_address_at body_addr current_address;
           self#compile_statement body;
@@ -2874,7 +2949,15 @@ class jaf_compiler ctx debug_info =
                   in
                   make_expr ~ty:decl.type_spec.ty value
             in
+            let vars_before =
+              match Stack.top scopes with
+              | Some scope -> List.length scope.vars
+              | None -> 0
+            in
             self#compile_expr_and_pop
+              ~before_pop:(fun () ->
+                if Ain.version ctx.ain > 8 then
+                  self#cleanup_condition_dummyrefs vars_before)
               {
                 node = Assign (EqAssign, lhs, rhs);
                 ty = rhs.ty;
@@ -2894,14 +2977,35 @@ class jaf_compiler ctx debug_info =
                     loc = decl.location;
                   };
                 self#compile_expression e;
-                self#write_instruction1 PUSH sno;
+                if Ain.version ctx.ain <= 8 then self#write_instruction1 PUSH sno;
                 self#write_instruction0 SR_ASSIGN;
                 self#compile_pop decl.type_spec.ty (ASTVariable decl)
             | None -> ())
         | Array _ ->
             let has_dims = List.length decl.array_dim > 0 in
             self#compile_local_ref v.index;
-            if has_dims then (
+            if Ain.version ctx.ain > 8 then (
+              self#write_instruction0 REF;
+              match decl.initval with
+              | Some e ->
+                  self#compile_expression e;
+                  self#write_instruction0 X_SET;
+                  self#write_instruction0 DELETE
+              | None ->
+                  let elem_ty =
+                    self#array_element_type_code decl.type_spec.ty
+                  in
+                  if has_dims then (
+                    List.iter decl.array_dim ~f:self#compile_expression;
+                    for _ = 1 to 4 - List.length decl.array_dim do
+                      self#write_instruction1 PUSH (-1)
+                    done;
+                    self#compile_CALLHLL "Array" "Alloc" elem_ty
+                      (ASTVariable decl))
+                  else
+                    self#compile_CALLHLL "Array" "Free" elem_ty
+                      (ASTVariable decl))
+            else if has_dims then (
               List.iter decl.array_dim ~f:self#compile_expression;
               self#write_instruction1 PUSH (List.length decl.array_dim);
               self#write_instruction0 A_ALLOC)
@@ -2919,7 +3023,8 @@ class jaf_compiler ctx debug_info =
             | Some ({ ty = Delegate _; _ } as e) ->
                 self#compile_expression e;
                 self#write_instruction0 DG_ASSIGN;
-                self#write_instruction0 DG_POP
+                if Ain.version ctx.ain > 8 then self#write_instruction0 DELETE
+                else self#write_instruction0 DG_POP
             | Some _ ->
                 compiler_bug "invalid delegate initval"
                   (Some (ASTVariable decl))
