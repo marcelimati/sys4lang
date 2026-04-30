@@ -1457,7 +1457,7 @@ let argtype_of_int = function
   | 14 -> Switch
   | _ -> failwith "invalid argument type"
 
-let args_of_opcode version = function
+let args_of_opcode ?(version = 8) = function
   | PUSH -> [ Int ]
   | POP -> []
   | REF -> []

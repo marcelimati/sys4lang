@@ -21,7 +21,9 @@ let get_instruction dasm =
   | None ->
       let op_i = Stdlib.Bytes.get_int16_le (Ain.get_code dasm.ain) dasm.addr in
       let opcode = Bytecode.opcode_of_int op_i in
-      let args = Bytecode.args_of_opcode (Ain.version dasm.ain) opcode in
+      let args =
+        Bytecode.args_of_opcode ~version:(Ain.version dasm.ain) opcode
+      in
       let instr = { op_i; args } in
       (match opcode with
       | Bytecode.FUNC ->

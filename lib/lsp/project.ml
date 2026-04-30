@@ -196,7 +196,7 @@ let filename_of_func ain (func : Ain.Function.t) =
         let i = Stdlib.Bytes.get_int32_le code (addr + 2) in
         Ain.get_file ain (Int32.to_int_exn i)
     | op ->
-        let nr_args = List.length (Bytecode.args_of_opcode (Ain.version ain) op) in
+        let nr_args = List.length (Bytecode.args_of_opcode ~version:(Ain.version ain) op) in
         find_eof (addr + 2 + (nr_args * 4))
   in
   find_eof func.address
