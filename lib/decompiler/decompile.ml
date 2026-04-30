@@ -301,11 +301,13 @@ let extract_event_pairs (methods : CodeGen.function_t list) :
                     ev_add = add;
                     ev_remove = remove;
                   }
-                :: !events
-          | _ -> unpaired := add :: remove :: !unpaired)
+                :: !events;
+              Hashtbl.remove removes base
+          | _ -> unpaired := add :: !unpaired)
       | Some add, None -> unpaired := add :: !unpaired
-      | None, Some remove -> unpaired := remove :: !unpaired
+      | None, Some _ -> ()
       | None, None -> ());
+  Hashtbl.iter removes ~f:(fun m -> unpaired := m :: !unpaired);
   (!events, List.rev !others @ !unpaired)
 
 (* Detect v11 property method groups on a struct: methods named

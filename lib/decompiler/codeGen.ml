@@ -474,6 +474,32 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           bprintf out "%a.%s"
             (self#pr_expr (prec_value PREC_DOT))
             expr (strip_class_name name)
+      (* v11 manual-event use sites: [obj.Name::add(x)] / [::remove(x)]
+         were synthesized from [obj.Name += x] / [-= x]. Rewrite back. *)
+      | Call (Method (obj, func), [ arg ])
+        when String.is_suffix func.name ~suffix:"::add"
+             || String.is_suffix func.name ~suffix:"::remove" ->
+          let method_name = strip_class_name func.name in
+          let base, op =
+            if String.is_suffix method_name ~suffix:"::add" then
+              (String.drop_suffix method_name 5, "+=")
+            else (String.drop_suffix method_name 8, "-=")
+          in
+          bprintf out "%a.%s %s %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            obj base op (self#pr_expr 0) arg
+      (* v11 property use sites: [obj.Name::get()] came from a
+         property read [obj.Name]; [obj.Name::set(v)] from a write
+         [obj.Name = v]. The Getter arm above already covers
+         [::get]; here we add [::set] (the master Setter arm only
+         fires for assignment LHS, not standalone Call rewrites). *)
+      | Call (Method (obj, func), [ arg ])
+        when String.is_suffix func.name ~suffix:"::set" ->
+          let method_name = strip_class_name func.name in
+          let base = String.drop_suffix method_name 5 in
+          bprintf out "%a.%s = %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            obj base (self#pr_expr 0) arg
       | Call (HllFunc (hll, f), obj :: args) when is_builtin_hll hll ->
           bprintf out "%a.%s(%a)"
             (self#pr_expr (prec_value PREC_DOT))
