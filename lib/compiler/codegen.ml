@@ -354,6 +354,15 @@ class jaf_compiler ctx debug_info =
           | None -> compile_error "No HLL function found for built-in" parent)
       | None -> compile_error "No HLL library found for built-in" parent
 
+    (** Element-type code for the [Array] HLL's polymorphic-type
+        operand. Used as the third operand of [CALLHLL Array.*] in
+        v11; [-1] when the receiver isn't actually an array. *)
+    method array_element_type_code (ty : Jaf.jaf_type) =
+      match ty with
+      | Array t | Ref (Array t) ->
+          Ain.Type.int_of_data_type (Ain.version ctx.ain) (jaf_to_ain_type t)
+      | _ -> -1
+
     method write_instruction0 op =
       CBuffer.write_int16 buffer (int_of_opcode op);
       current_address <- current_address + 2
@@ -1576,25 +1585,91 @@ class jaf_compiler ctx debug_info =
           | StringErase ->
               self#write_instruction1 PUSH 1;
               self#write_instruction0 S_ERASE2
+          | ArrayAlloc when Ain.version ctx.ain > 8 ->
+              (* v11 [Array.Alloc] is 4-dimensional — pad missing dims
+                 with [-1] so the HLL sees a complete parameter list. *)
+              let n_dims = List.length args in
+              for _ = 1 to 4 - n_dims do
+                self#write_instruction1 PUSH (-1)
+              done;
+              self#compile_CALLHLL "Array" "Alloc"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayAlloc ->
               self#write_instruction1 PUSH (List.length args);
               self#write_instruction0 A_ALLOC
+          | ArrayRealloc when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Realloc"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayRealloc ->
               (* FIXME: this built-in should be variadic *)
               self#write_instruction1 PUSH 1;
               self#write_instruction0 A_REALLOC
+          | ArrayFree when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Free"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayFree -> self#write_instruction0 A_FREE
+          | ArrayNumof when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Numof"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayNumof -> self#write_instruction0 A_NUMOF
+          | ArrayCopy when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Copy"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayCopy -> self#write_instruction0 A_COPY
+          | ArrayFill when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Fill"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayFill -> self#write_instruction0 A_FILL
+          | ArrayPushBack when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "PushBack"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayPushBack -> self#write_instruction0 A_PUSHBACK
+          | ArrayPopBack when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "PopBack"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayPopBack -> self#write_instruction0 A_POPBACK
+          | ArrayEmpty when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Empty"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayEmpty -> self#write_instruction0 A_EMPTY
+          | ArrayErase when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Erase"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayErase -> self#write_instruction0 A_ERASE
+          | ArrayInsert when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Insert"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayInsert -> self#write_instruction0 A_INSERT
+          | ArraySort when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Sort"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArraySort -> self#write_instruction0 A_SORT
+          | ArraySortBy when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "SortMem"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArraySortBy -> self#write_instruction0 A_SORT_MEM
+          | ArrayReverse when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Reverse"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayReverse -> self#write_instruction0 A_REVERSE
+          | ArrayFind when Ain.version ctx.ain > 8 ->
+              self#compile_CALLHLL "Array" "Find"
+                (self#array_element_type_code !receiver_ty)
+                (ASTExpression expr)
           | ArrayFind -> self#write_instruction0 A_FIND
           | DelegateNumof -> self#write_instruction0 DG_NUMOF
           | DelegateExist -> self#write_instruction0 DG_EXIST
@@ -1744,17 +1819,111 @@ class jaf_compiler ctx debug_info =
            | _ -> self#write_instruction1 PUSH 0);
           self#write_address_at jump_addr current_address
       | NullCoalesce (a, b) ->
-          (* [a ?? b]: evaluate [a]; if it's the [-1] null sentinel,
-             drop it and evaluate [b], else keep [a]. *)
-          self#compile_expression a;
-          self#write_instruction0 DUP;
-          self#write_instruction1 PUSH (-1);
-          self#write_instruction0 EQUALE;
-          let ifz_addr = current_address + 2 in
-          self#write_instruction1 IFZ 0;
-          self#write_instruction0 POP;
-          self#compile_expression b;
-          self#write_address_at ifz_addr current_address
+          let a_inner =
+            match a.node with DummyRef (_, inner) -> inner | _ -> a
+          in
+          let unwrap_dummy (e : expression) =
+            match e.node with DummyRef (_, inner) -> inner | _ -> e
+          in
+          let is_optional_result e =
+            match (unwrap_dummy e).node with
+            | Call ({ node = OptionalMember _; _ }, _, _) -> true
+            | _ -> false
+          in
+          let is_optional =
+            match a_inner.node with
+            | Call ({ node = OptionalMember _; _ }, _, _) -> true
+            | _ -> false
+          in
+          if
+            Ain.version ctx.ain > 8
+            && (not is_optional)
+            && match a.ty with Ref _ -> true | _ -> false
+          then (
+            (* v11 ref-typed [a ?? b]: [a] is a [Ref T] lvalue. Push
+               via [compile_lvalue], duplicate (DUP for non-scalar
+               1-slot, DUP_U2 for scalar 2-slot), null-check via PUSH
+               -1; EQUALE. On null, drop the dup'd value and evaluate
+               [b]; otherwise keep [a]. The trailing REF (scalar) /
+               A_REF (non-scalar) deref the page-ref to the surface
+               value the consumer expects. *)
+            let scalar_ref_result =
+              match expr.ty with
+              | Int | Float | Bool | LongInt | FuncType _ | HLLParam -> true
+              | _ -> false
+            in
+            self#compile_lvalue a;
+            self#write_instruction0
+              (if scalar_ref_result then DUP_U2 else DUP);
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifz_addr = current_address + 2 in
+            self#write_instruction1 IFZ 0;
+            if scalar_ref_result then (
+              self#write_instruction0 POP;
+              self#write_instruction0 POP)
+            else self#write_instruction0 POP;
+            (match (scalar_ref_result, b.node) with
+            | true, DummyRef (dummy_idx, inner) ->
+                self#compile_expression inner;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH dummy_idx;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH dummy_idx
+            | _ -> self#compile_lvalue b);
+            self#write_address_at ifz_addr current_address;
+            match expr.ty with
+            | Int | Float | Bool | LongInt | FuncType _ | HLLParam ->
+                self#write_instruction0 REF
+            | String | Struct _ | Array _ | Delegate _ ->
+                self#write_instruction0 A_REF
+            | _ ->
+                compiler_bug
+                  ("unsupported v11 null-coalesce ref result type "
+                  ^ jaf_type_to_string expr.ty)
+                  (Some (ASTExpression expr)))
+          else (
+            self#compile_expression a_inner;
+            if is_optional then (
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              if is_optional_result b then (
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#write_instruction1 PUSH 0;
+                self#write_address_at jump_addr current_address)
+              else self#write_address_at ifz_addr current_address)
+            else
+              let b =
+                match b.node with
+                | DummyRef (_, inner) -> inner
+                | _ -> b
+              in
+              (match a_inner.node with
+              | NullCoalesce _ -> ()
+              | _ -> self#write_instruction0 DUP);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              if is_optional_result b then (
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#write_instruction1 PUSH 0;
+                self#write_address_at jump_addr current_address)
+              else self#write_address_at ifz_addr current_address)
 
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
@@ -1989,12 +2158,54 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 SP_INC
           | Ref (String | Struct _ | Array _), _ ->
               self#compile_lvalue e;
+              (match e.ty with
+              | Wrap _ when Ain.version ctx.ain > 8 ->
+                  (* v11 [Wrap T] return: unwrap the fat-ref to the
+                     underlying page-ref before [DUP; SP_INC]. *)
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 REF
+              | _ -> ());
               self#write_instruction0 DUP;
               self#write_instruction0 SP_INC
           | Ref _, _ ->
               compile_error "return statement not implemented for ref type"
                 (ASTStatement stmt)
-          | _ -> self#compile_expression e);
+          | _ ->
+              self#compile_expression e;
+              (* v11: when returning a [String]/[Struct]/[Array]
+                 produced by a ref-returning call OR a [new]
+                 expression (both stored in a [DummyRef] slot via
+                 [compile_lvalue]), the dummy's [SH_LOCALDELETE] on
+                 function exit would free the page before the caller
+                 reads the return value. Emit [A_REF] after the dummy
+                 ASSIGN so the stack value retains an owning ref the
+                 caller takes over. Chained-call receivers don't need
+                 it — there's no [SH_LOCALDELETE] between the dummy
+                 and the consuming [CALLMETHOD]. *)
+              if Ain.version ctx.ain > 8 then (
+                let rec inner_expr (e : expression) =
+                  match e.node with
+                  | DummyRef (_, inner) -> inner_expr inner
+                  | _ -> e
+                in
+                let inner = inner_expr e in
+                let needs_a_ref =
+                  match e.node with
+                  | DummyRef _ -> (
+                      match inner.node with
+                      | New _ -> true
+                      | Call _ -> (
+                          match self#ain_call_return_type inner with
+                          | Some (Ain.Type.Ref _) -> true
+                          | _ -> false)
+                      | _ -> false)
+                  | _ -> false
+                in
+                if needs_a_ref then
+                  match (Option.value_exn current_function).return_type with
+                  | String | Struct _ | Array _ ->
+                      self#write_instruction0 A_REF
+                  | _ -> ()));
           self#write_instruction0 RETURN
       | Jump funcname ->
           let no = Ain.add_string ctx.ain funcname in
@@ -2011,13 +2222,75 @@ class jaf_compiler ctx debug_info =
       | RefAssign (lhs, rhs) ->
           self#compile_lock_peek;
           self#compile_variable_ref lhs;
-          self#compile_delete_ref lhs.ty;
-          (match (lhs.ty, rhs.node) with
-          | _, Null -> ()
-          | _ -> self#write_instruction0 DUP2);
-          self#compile_lvalue rhs;
           (match lhs.ty with
+          | Wrap _ -> (
+              (* v11 [Wrap T] LHS: foreach loop-var rebind. Different
+                 rhs shapes need different idioms — Subscript /
+                 [DummyRef New _] / Null / fallthrough each have a
+                 specific bytecode pattern alice emits. *)
+              match rhs.node with
+              | Subscript _ ->
+                  self#compile_variable_ref rhs;
+                  self#write_instruction0 R_ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP
+              | DummyRef (dummy_idx, { node = New _; _ })
+                when Ain.version ctx.ain > 8 ->
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 DUP2;
+                  self#write_instruction0 REF;
+                  self#write_instruction0 DELETE;
+                  self#compile_lvalue rhs;
+                  self#write_instruction0 DUP;
+                  self#write_instruction0 SP_INC;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 SH_LOCALDELETE dummy_idx
+              | Null when Ain.version ctx.ain > 8 ->
+                  (* v11 [foreach loop-var <- NULL]: unwrap the Wrap
+                     fat-ref, release the current binding, then store
+                     the null sentinel. Emitting bare [R_ASSIGN] with
+                     a missing rhs leaves only [page; slot] on the
+                     stack and trips "R_ASSIGN: unexpected stack
+                     structure" at decompile. *)
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 DUP2;
+                  self#write_instruction0 REF;
+                  self#write_instruction0 DELETE;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP
+              | _ ->
+                  self#write_instruction0 R_ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP)
+          | _ when is_ref_scalar lhs.ty && Ain.version ctx.ain > 8 -> (
+              (* v11 scalar-ref RefAssign: release the old target,
+                 compute the rhs ref, then [DUP_U2; SP_INC; R_ASSIGN;
+                 POP; POP]. [DUP_U2] duplicates the page+idx pair
+                 *under* the rhs value so [SP_INC] increfs it before
+                 [R_ASSIGN] stores the ref. Skipping [DUP_U2]/[SP_INC]
+                 leaves the new reference's refcount one short and
+                 the local-page release on RETURN aborts. *)
+              self#compile_delete_ref lhs.ty;
+              self#compile_lvalue rhs;
+              match rhs.node with
+              | Null ->
+                  self#write_instruction0 R_ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP
+              | _ ->
+                  self#write_instruction0 DUP_U2;
+                  self#write_instruction0 SP_INC;
+                  self#write_instruction0 R_ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP)
           | _ when is_ref_scalar lhs.ty -> (
+              self#compile_delete_ref lhs.ty;
+              (match rhs.node with
+              | Null -> ()
+              | _ -> self#write_instruction0 DUP2);
+              self#compile_lvalue rhs;
               (* NOTE: SDK compiler emits [DUP_U2; SP_INC; R_ASSIGN; POP; POP] here *)
               self#write_instruction0 R_ASSIGN;
               self#write_instruction0 POP;
@@ -2027,7 +2300,51 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 POP;
                   self#write_instruction0 REF;
                   self#write_instruction0 SP_INC)
+          | Ref (String | Struct _ | Array _ | HLLParam)
+            when Ain.version ctx.ain > 8 ->
+              (* v11 [ref X = rvalue]: rhs has been wrapped in a
+                 [DummyRef] (variableAlloc) so [compile_lvalue] stores
+                 the produced value into the dummy slot, then
+                 [ASSIGN; SP_INC; SH_LOCALDELETE dummy] writes into
+                 the lhs ref, balances refcount, and releases the
+                 dummy. Also releases any extra DummyRef slots
+                 allocated during a chained rhs like [a.GetX().GetY()]
+                 — each intermediate call's ref-returning result has
+                 its own dummy and all must be released or the local
+                 page's refcount never reaches zero. *)
+              let vars_before =
+                match Stack.top scopes with
+                | Some scope -> List.length scope.vars
+                | None -> 0
+              in
+              self#compile_delete_ref lhs.ty;
+              self#compile_lvalue rhs;
+              (match rhs.node with
+              | Null ->
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP
+              | DummyRef (_, { node = New _; _ }) ->
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 SP_INC
+              | _ ->
+                  self#write_instruction0 DUP;
+                  self#write_instruction0 SP_INC;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP);
+              (match Stack.top scopes with
+              | Some scope ->
+                  let n_new = List.length scope.vars - vars_before in
+                  if n_new > 0 then
+                    List.iter
+                      (List.rev (List.take scope.vars n_new))
+                      ~f:self#compile_delete_var
+              | None -> ())
           | Ref (String | Struct _ | Array _) -> (
+              self#compile_delete_ref lhs.ty;
+              (match (lhs.ty, rhs.node) with
+              | _, Null -> ()
+              | _ -> self#write_instruction0 DUP2);
+              self#compile_lvalue rhs;
               (* NOTE: SDK compiler emits [DUP; SP_INC; ASSIGN; POP] here *)
               self#write_instruction0 ASSIGN;
               match rhs.node with
@@ -2049,18 +2366,193 @@ class jaf_compiler ctx debug_info =
             Ain.Type.int_of_data_type (Ain.version ctx.ain)
               (jaf_to_ain_type a.ty)
           in
-          self#write_instruction1 PUSH type_no;
-          self#write_instruction0 OBJSWAP
+          (* Pre-v11 [OBJSWAP] reads its type off the stack; v11+
+             encodes it as a direct int operand. *)
+          if Ain.version ctx.ain > 8 then
+            self#write_instruction1 OBJSWAP type_no
+          else (
+            self#write_instruction1 PUSH type_no;
+            self#write_instruction0 OBJSWAP)
 
     (** Emit the code for a variable declaration. If the variable has an
         initval, the initval expression is computed and assigned to the
         variable. Otherwise a default value is assigned. *)
     method compile_variable_declaration (decl : variable) =
       if decl.is_const then ()
+      else if
+        Ain.version ctx.ain > 8
+        && decl.is_private
+        && Option.is_none decl.initval
+      then
+        (* v11 two-phase private declaration (the foreach desugar
+           pre-allocates counter / container / loop-var slots): phase
+           1 has no initval — register the slot for cleanup; phase 2
+           has an initval and emits the real init via the normal
+           path. Skipping code emission here prevents a spurious
+           default-init that shifts every downstream address and
+           trips the VM's refcount bookkeeping at RETURN. Pre-v11
+           keeps the default-init path since its foreach desugar
+           emits a single combined declaration. *)
+        let v = self#get_local (Option.value_exn decl.index) in
+        self#scope_add_var v
       else
         let v = self#get_local (Option.value_exn decl.index) in
         self#scope_add_var v;
         match v.value_type with
+        | Ref _ when Ain.version ctx.ain > 8 -> (
+            (* v11 ref-init paths. Each handles a specific shape; the
+               final fallback rewrites to a [RefAssign] like pre-v11. *)
+            let vars_before () =
+              match Stack.top scopes with
+              | Some scope -> List.length scope.vars
+              | None -> 0
+            in
+            match decl.initval with
+            | None ->
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction0 DELETE;
+                (match ain_to_jaf_type ctx.ain v.value_type with
+                | Ref (Int | Bool | LongInt | Float | FuncType _) ->
+                    self#write_instruction1 PUSH (-1);
+                    (match ain_to_jaf_type ctx.ain v.value_type with
+                    | Ref Float -> self#write_instruction1_float F_PUSH 0.0
+                    | _ -> self#write_instruction1 PUSH 0);
+                    self#write_instruction0 R_ASSIGN;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP
+                | Ref String ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 ASSIGN;
+                    self#write_instruction0 SP_INC
+                | Ref (Struct _ | Array _ | HLLParam) ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 ASSIGN;
+                    self#write_instruction0 POP
+                | _ ->
+                    compiler_bug "invalid ref declaration default"
+                      (Some (ASTVariable decl)))
+            | Some e
+              when decl.is_private
+                   && (match e.node with DummyRef _ -> false | _ -> true)
+                   && not (is_ref_scalar e.ty) ->
+                (* Two-phase private ref init (foreach containers): the
+                   slot is already empty, so skip the delete-old-value
+                   path and use rhs-first CHECKUDO + ASSIGN + SP_INC. *)
+                let vb = vars_before () in
+                self#compile_lvalue e;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 REF;
+                self#write_instruction0 CHECKUDO;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vb
+            | Some e
+              when match v.value_type with
+                   | Ref (Array _) -> true
+                   | _ -> false ->
+                (* Array-ref init: push raw ref via [compile_lvalue]
+                   into the freshly-declared slot using ASSIGN; SP_INC. *)
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#compile_delete_ref decl.type_spec.ty;
+                self#compile_lvalue e;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC
+            | Some e
+              when is_ref_scalar (ain_to_jaf_type ctx.ain v.value_type)
+                   && (match e.node with DummyRef _ -> false | _ -> true) ->
+                (* Scalar-ref init [ref int x = arr[i]]: dest-lvalue +
+                   delete-empty-target + R_ASSIGN + SP_INC. *)
+                let vb = vars_before () in
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#compile_delete_ref decl.type_spec.ty;
+                self#compile_lvalue e;
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vb
+            | Some e
+              when (match e.node with DummyRef _ -> false | _ -> true)
+                   && not (is_ref_scalar e.ty) ->
+                (* Non-DummyRef non-scalar ref init: push dest +
+                   compile_delete_ref (DUP2;REF;DELETE) + rhs lvalue +
+                   ASSIGN + SP_INC. [compile_lvalue] keeps the raw ref
+                   on the stack without the extra A_REF that
+                   [compile_expression] would add for struct/array. *)
+                let vb = vars_before () in
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#compile_delete_ref decl.type_spec.ty;
+                self#compile_lvalue e;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vb
+            | Some e
+              when match e.node with DummyRef _ -> false | _ -> true ->
+                (* Scalar-ref init with non-DummyRef rhs: CHECKUDO +
+                   R_ASSIGN pattern. The freshly-declared slot starts
+                   empty, so no old-value release. *)
+                let vb = vars_before () in
+                self#compile_expression e;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 REF;
+                self#write_instruction0 CHECKUDO;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vb
+            | Some ({ node = DummyRef (dummy_idx, inner); _ } as e)
+              when (match v.value_type with
+                   | Ref (Struct _ | String | Array _ | HLLParam) -> true
+                   | _ -> false)
+                   && (match inner.node with New _ -> false | _ -> true) ->
+                (* [ref X y = method()] decl. [compile_delete_ref]
+                   balances the freshly-declared slot (empty) before
+                   the inner method's result lvalue is assigned and
+                   the dummy cleanup fires. Distinct from RefAssign
+                   (DUP;SP_INC;ASSIGN;POP) because that pattern bumps
+                   a refcount on the "previous" value, which doesn't
+                   exist at decl time. *)
+                self#compile_lock_peek;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#compile_delete_ref decl.type_spec.ty;
+                self#compile_lvalue e;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC;
+                self#write_instruction1 SH_LOCALDELETE dummy_idx
+            | _ ->
+                let lhs =
+                  {
+                    node =
+                      Ident (decl.name, LocalVariable (v.index, decl.location));
+                    ty = decl.type_spec.ty;
+                    loc = decl.location;
+                  }
+                and rhs =
+                  match decl.initval with
+                  | Some e -> e
+                  | None -> make_expr ~ty:decl.type_spec.ty Null
+                in
+                self#compile_statement
+                  {
+                    node = RefAssign (lhs, rhs);
+                    delete_vars = [];
+                    loc = decl.location;
+                  })
         | Ref _ ->
             let lhs =
               {
