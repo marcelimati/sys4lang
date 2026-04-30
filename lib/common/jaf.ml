@@ -435,7 +435,17 @@ let new_jaf_struct name loc index =
     properties = Hashtbl.create (module String);
   }
 
-type library = { hll_name : string; functions : (string, fundecl) Hashtbl.t }
+(* HLL libraries can declare multiple functions with the same name but
+   different parameter signatures (v11). The first-seen declaration is
+   stored in [functions] under its plain name; any same-name declaration
+   with distinct parameter types appends to [overloads] so call-site
+   resolution can pick by argument types. Empty [overloads] for non-v11
+   libraries. *)
+type library = {
+  hll_name : string;
+  functions : (string, fundecl) Hashtbl.t;
+  overloads : (string, fundecl list) Hashtbl.t;
+}
 
 type context = {
   ain : Ain.t;
@@ -1384,6 +1394,7 @@ let context_from_ain ?(constants : variable list = []) ain =
       Hashtbl.add_exn delegates ~key:f.name ~data:(ain_to_jaf_functype f));
   Ain.library_iter ain ~f:(fun (l : Ain.Library.t) ->
       let functions = Hashtbl.create (module String) in
+      let lib_overloads = Hashtbl.create (module String) in
       List.iter l.functions ~f:(fun (f : Ain.Library.Function.t) ->
           let func =
             {
@@ -1420,9 +1431,17 @@ let context_from_ain ?(constants : variable list = []) ain =
               class_index = None;
             }
           in
-          Hashtbl.set functions ~key:f.name ~data:func);
+          (* v11 HLL libraries may have multiple entries with the same
+             name. The first goes in [functions]; later same-name entries
+             append to [overloads]. *)
+          match Hashtbl.find functions f.name with
+          | None -> Hashtbl.set functions ~key:f.name ~data:func
+          | Some _ ->
+              Hashtbl.update lib_overloads f.name ~f:(function
+                | None -> [ func ]
+                | Some xs -> func :: xs));
       Hashtbl.add_exn libraries ~key:l.name
-        ~data:{ hll_name = l.name; functions });
+        ~data:{ hll_name = l.name; functions; overloads = lib_overloads });
   let version = (Ain.version ain * 100) + Ain.minor_version ain in
   {
     ain;

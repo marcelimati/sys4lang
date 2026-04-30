@@ -270,6 +270,96 @@ class type_analyze_visitor ctx =
           | fd :: _ -> fd
           | [] -> primary)
 
+    (* v11 HLL overload resolution: pick the library function matching
+       the actual call's arity. Among same-arity candidates, prefer one
+       whose param types specifically accept a function/lambda argument
+       when one is being passed (e.g. [Array.Find(int, int, hll_func2)]
+       over [Array.Find(int, int, hll_param)] when the user passes a
+       lambda; the reverse when passing values). [skip_self] is true for
+       built-in HLL methods, where [params.[0]] is the implicit receiver
+       and only [params.[1..]] participate in matching against the
+       user-visible call args. *)
+    method resolve_hll_overload (lib : library) (fun_name : string)
+        ~(skip_self : bool) (args : expression option list) =
+      let primary = Hashtbl.find_exn lib.functions fun_name in
+      let alternates =
+        Option.value ~default:[] (Hashtbl.find lib.overloads fun_name)
+      in
+      match alternates with
+      | [] -> primary
+      | _ ->
+          let nr_user_args = List.length args in
+          let user_params (fd : fundecl) =
+            if skip_self then List.tl_exn fd.params else fd.params
+          in
+          let arity_matches (fd : fundecl) =
+            List.length (user_params fd) = nr_user_args
+          in
+          let candidates = primary :: alternates in
+          let by_arity = List.filter candidates ~f:arity_matches in
+          let call_has_func_arg =
+            List.exists args ~f:(function
+              | Some { ty = TyMethod _ | TyFunction _ | HLLFunc | HLLFunc2; _ }
+                ->
+                  true
+              | Some { node = Lambda _; _ } -> true
+              | _ -> false)
+          in
+          let prefers_func_param (fd : fundecl) =
+            List.exists (user_params fd) ~f:(fun p ->
+                match p.type_spec.ty with
+                | HLLFunc | HLLFunc2 -> true
+                | _ -> false)
+          in
+          let fn_overloads, non_fn_overloads =
+            List.partition_tf by_arity ~f:prefers_func_param
+          in
+          let ordered =
+            if call_has_func_arg then fn_overloads @ non_fn_overloads
+            else non_fn_overloads @ fn_overloads
+          in
+          (match ordered with
+          | fd :: _ -> fd
+          | [] -> primary)
+
+    (* Map a chosen HLL fundecl back to its ain library-function index.
+       [Ain.get_library_function_index] looks up by name and returns
+       the first matching entry, which is wrong when the library has
+       multiple ain entries sharing a name. Walk the library's
+       functions array looking for an entry whose argument types
+       match the chosen fundecl's parameter types; fall back to the
+       first same-arity entry, then to the name-keyed lookup. *)
+    method resolve_hll_ain_index (lib_no : int) (f : fundecl) =
+      let lib = Ain.get_library_by_index ctx.ain lib_no in
+      let expected_arity = List.length f.params in
+      let param_types_match (lf : Ain.Library.Function.t) =
+        List.length lf.arguments = expected_arity
+        && List.for_all2_exn lf.arguments f.params ~f:(fun la p ->
+               Poly.equal la.value_type (jaf_to_ain_type p.type_spec.ty))
+      in
+      let arity_matches (lf : Ain.Library.Function.t) =
+        List.length lf.arguments = expected_arity
+      in
+      let by_full_match =
+        List.find lib.functions ~f:(fun lf ->
+            String.equal lf.name f.name && param_types_match lf)
+      in
+      match by_full_match with
+      | Some lf ->
+          fst
+            (Option.value_exn
+               (List.findi lib.functions ~f:(fun _ x -> phys_equal x lf)))
+      | None -> (
+          let by_arity =
+            List.findi lib.functions ~f:(fun _ lf ->
+                String.equal lf.name f.name && arity_matches lf)
+          in
+          match by_arity with
+          | Some (i, _) -> i
+          | None ->
+              Option.value_exn
+                (Ain.get_library_function_index ctx.ain lib_no f.name))
+
     (*
      * Assigning to a functype or delegate variable is special.
      * The RHS should be an expression like &foo, which has type
@@ -835,15 +925,12 @@ class type_analyze_visitor ctx =
             args,
             _ ) ->
           let lib = Hashtbl.find_exn ctx.libraries import_name in
-          let f = Hashtbl.find_exn lib.functions fun_name in
+          let f = self#resolve_hll_overload lib fun_name ~skip_self:false args in
           let args = check_call f.name f.params args in
           let lib_no =
             Option.value_exn (Ain.get_library_index ctx.ain lib.hll_name)
           in
-          let fun_no =
-            Option.value_exn
-              (Ain.get_library_function_index ctx.ain lib_no fun_name)
-          in
+          let fun_no = self#resolve_hll_ain_index lib_no f in
           expr.node <- Call (e, args, HLLCall (lib_no, fun_no));
           expr.ty <- f.return.ty
       (* system call *)
@@ -870,15 +957,12 @@ class type_analyze_visitor ctx =
             args,
             _ ) ->
           let lib = Hashtbl.find_exn ctx.libraries lib_name in
-          let f = Hashtbl.find_exn lib.functions fun_name in
+          let f = self#resolve_hll_overload lib fun_name ~skip_self:true args in
           let args = check_call f.name (List.tl_exn f.params) args in
           let lib_no =
             Option.value_exn (Ain.get_library_index ctx.ain lib.hll_name)
           in
-          let fun_no =
-            Option.value_exn
-              (Ain.get_library_function_index ctx.ain lib_no fun_name)
-          in
+          let fun_no = self#resolve_hll_ain_index lib_no f in
           insert_rvalue_ref obj;
           expr.node <- Call (e, Some obj :: args, HLLCall (lib_no, fun_no));
           expr.ty <- f.return.ty

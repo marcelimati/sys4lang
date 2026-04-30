@@ -280,10 +280,15 @@ let define_library ctx decls hll_name import_name =
   in
   Ain.write_library ctx.ain
     { lib with functions = List.map ~f:jaf_to_ain_hll_function functions };
-  let functions =
-    Hashtbl.create_with_key_exn
-      (module String)
-      ~get_key:(fun (d : fundecl) -> d.name)
-      functions
-  in
-  Hashtbl.set ctx.libraries ~key:import_name ~data:{ hll_name; functions }
+  let functions_tbl = Hashtbl.create (module String) in
+  let overloads_tbl = Hashtbl.create (module String) in
+  List.iter functions ~f:(fun (d : fundecl) ->
+      match Hashtbl.find functions_tbl d.name with
+      | None -> Hashtbl.set functions_tbl ~key:d.name ~data:d
+      | Some _ ->
+          Hashtbl.update overloads_tbl d.name ~f:(function
+            | None -> [ d ]
+            | Some xs -> d :: xs));
+  Hashtbl.set ctx.libraries ~key:import_name
+    ~data:
+      { hll_name; functions = functions_tbl; overloads = overloads_tbl }

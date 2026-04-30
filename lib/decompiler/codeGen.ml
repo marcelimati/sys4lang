@@ -964,9 +964,16 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | args -> self#println "(%a);" (pr_param_list self#pr_vardecl) args
 
     method print_hll (funcs : Ain.HLL.function_t array) =
+      (* v11 HLL libraries can declare multiple functions sharing a name
+         but differing in parameter types — emit all entries so the
+         compiler can resolve calls to the right overload. Older sys4c
+         can't parse same-name duplicates, so on pre-v11 ain files keep
+         the existing comment-out behavior to preserve round-tripping
+         against older toolchains. *)
+      let v11 = Ain.ain.vers >= 11 in
       let printed = Hash_set.create (module String) in
       Array.iter funcs ~f:(fun func ->
-          if Hash_set.mem printed func.name then
+          if (not v11) && Hash_set.mem printed func.name then
             print_string out "// (duplicated) "
           else Hash_set.add printed func.name;
           self#print_hll_function func)
