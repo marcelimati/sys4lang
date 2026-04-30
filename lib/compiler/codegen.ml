@@ -147,6 +147,20 @@ class jaf_compiler ctx debug_info =
                 (ASTStatement (snd (List.last_exn gotos))));
       Hashtbl.clear labels
 
+    (** v11: ain-level return type of a [Call] node, or [None] for
+        anything else. Used to detect ref-returning calls so the
+        surrounding assignment / argument-pass site can insert an
+        [A_REF] before the dummy slot's [SH_LOCALDELETE] frees the
+        only owner. *)
+    method ain_call_return_type (expr : expression) =
+      match expr.node with
+      | Call (_, _, (FunctionCall fno | MethodCall (_, fno))) ->
+          Some (Ain.get_function_by_index ctx.ain fno).return_type
+      | Call (_, _, HLLCall (lib_no, fun_no)) ->
+          let lib = Ain.get_library_by_index ctx.ain lib_no in
+          Some (List.nth_exn lib.functions fun_no).return_type
+      | _ -> None
+
     (** v11: release every DummyRef slot allocated since [vars_before]
         in the topmost scope, in LIFO (newest-first) order. Records
         each released index in [inline_deleted_dummies] (so a goto /
@@ -624,8 +638,46 @@ class jaf_compiler ctx debug_info =
       match expr with
       | None -> compiler_bug "missing argument" None
       | Some expr -> (
+          let rec dummy_ref_inner (arg_expr : expression) =
+            match arg_expr.node with
+            | DummyRef (_, inner) -> Some inner
+            | Cast (_, inner) | RvalueRef inner -> dummy_ref_inner inner
+            | _ -> None
+          in
+          let dummy_inner_returns_ref =
+            match dummy_ref_inner expr with
+            | Some inner -> (
+                match self#ain_call_return_type inner with
+                | Some (Ain.Type.Ref _) -> true
+                | _ -> ( match inner.ty with Ref _ -> true | _ -> false))
+            | None -> false
+          in
           match t with
-          | Ref _ -> self#compile_lvalue expr
+          | (Struct _ | Array _) when Ain.version ctx.ain > 8 ->
+              (* v11 struct / array arg: the language-level [Ref] is
+                 collapsed by typeAnalysis, but the call site still
+                 needs the page-ref. Push the value and append [A_REF]
+                 when the source is a [DummyRef]'d ref-returning call
+                 so the dummy's [SH_LOCALDELETE] doesn't free the only
+                 owner. *)
+              self#compile_expression expr;
+              if dummy_inner_returns_ref then self#write_instruction0 A_REF
+          | Ref _ ->
+              self#compile_lvalue expr;
+              (* v11 [Wrap T] lvalue (foreach loop var, etc.): the
+                 [compile_lvalue_after] tail for non-string Wrap leaves
+                 page+slot of the wrap on the stack. A [ref T] callee
+                 wants the underlying page-ref instead — unpack the
+                 wrap with [REFREF; REF]. Without this, passing a
+                 [foreach] loop var (typed [Wrap HLLParam]) to a
+                 [ref Struct] parameter pushes one extra slot and the
+                 callee pops one fewer arg than declared. *)
+              (match expr.ty with
+              | Wrap (String | Int | Float | Bool | LongInt) -> ()
+              | Wrap _ when Ain.version ctx.ain > 8 ->
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 REF
+              | _ -> ())
           | Method ->
               (* XXX: for delegate builtins *)
               self#compile_expression expr
@@ -634,6 +686,58 @@ class jaf_compiler ctx debug_info =
               match expr.ty with
               | TyMethod _ -> self#write_instruction0 DG_NEW_FROM_METHOD
               | _ -> ())
+          | Bool when Ain.version ctx.ain > 8 ->
+              (* v11 distinguishes [Int] and [Bool] at the value-slot
+                 level. The type checker accepts them as
+                 interchangeable, but HLL (and other typed) calls with
+                 a [bool] parameter need a normalised 0/1 value when
+                 the source is an int-valued computation. The original
+                 compiler skips [ITOB] when the arg is already
+                 statically 0/1 — a bool-typed expression, a literal
+                 [ConstInt 0|1], or a comparison / logical op whose
+                 result is naturally 0/1 — and inserts it otherwise. *)
+              self#compile_expression expr;
+              let is_bool_shape (e : expression) =
+                match (e.ty, e.node) with
+                | Bool, _ -> true
+                | _, ConstInt (0 | 1) -> true
+                | ( _,
+                    Binary
+                      ( ( Equal | NEqual | LT | GT | LTE | GTE | LogOr
+                        | LogAnd ),
+                        _,
+                        _ ) ) ->
+                    true
+                | _, Unary (LogNot, _) -> true
+                | _ -> false
+              in
+              if not (is_bool_shape expr) then self#write_instruction0 ITOB
+          | HLLParam when Ain.version ctx.ain > 8 -> (
+              (* v11 [hll_param]: when the arg is a local whose ain
+                 slot is a [Ref (Struct|Array|String)], push the raw
+                 1-slot ref via [compile_lvalue] instead of the
+                 [compile_expression] deref path. HLL callees expect
+                 the bare page-ref; the extra dereference would leave
+                 the dereffed value on the stack, corrupting the call
+                 frame. When the arg is a [DummyRef]'d ref-returning
+                 call, append [A_REF] so the dummy's eventual
+                 [SH_LOCALDELETE] doesn't free the page before the
+                 HLL bridge reads it. *)
+              match expr.node with
+              | _ when is_variable_ref expr.node -> (
+                  match expr.ty with
+                  | Ref (Struct _ | Array _ | String) ->
+                      self#compile_lvalue expr
+                  | _ -> self#compile_expression expr)
+              | _ ->
+                  self#compile_expression expr;
+                  let inner_is_call =
+                    match dummy_ref_inner expr with
+                    | Some { node = Call _; _ } -> true
+                    | _ -> false
+                  in
+                  if dummy_inner_returns_ref && inner_is_call then
+                    self#write_instruction0 A_REF)
           | _ -> self#compile_expression expr)
 
     (** v11: write [JUMP-over-body; body] for every [Lambda] argument
@@ -931,10 +1035,36 @@ class jaf_compiler ctx debug_info =
               | Delegate (Some (_, dg_i)) ->
                   self#write_instruction1 PUSH (-1);
                   self#write_instruction0 SWAP;
-                  self#write_instruction1 PUSH dg_i;
-                  self#write_instruction0 DG_STR_TO_METHOD;
-                  self#write_instruction0 DG_SET
-              | String -> self#write_instruction0 S_ASSIGN
+                  (* v11 [DG_STR_TO_METHOD] takes the delegate type as
+                     a 1-int operand; the follow-up sequence wraps
+                     into a delegate via [DG_NEW_FROM_METHOD] then
+                     [DG_ASSIGN; DELETE]. Pre-v11 took no operand and
+                     used [DG_SET]. *)
+                  if Ain.version ctx.ain > 8 then (
+                    self#write_instruction1 DG_STR_TO_METHOD dg_i;
+                    self#write_instruction0 DG_NEW_FROM_METHOD;
+                    self#write_instruction0 DG_ASSIGN;
+                    self#write_instruction0 DELETE)
+                  else (
+                    self#write_instruction1 PUSH dg_i;
+                    self#write_instruction0 DG_STR_TO_METHOD;
+                    self#write_instruction0 DG_SET)
+              | String ->
+                  (* v11 [local_string = method_returning_ref_string()]:
+                     the rhs's [DummyRef]'d ref-returning call leaves a
+                     page-ref on the stack but the dummy's [ASSIGN]
+                     stored it without an incref. Insert an [A_REF]
+                     before [S_ASSIGN] so the dummy's eventual
+                     [SH_LOCALDELETE] doesn't free the only owner. *)
+                  (if Ain.version ctx.ain > 8 then
+                     match rhs.node with
+                     | DummyRef (_, ({ node = Call _; _ } as inner)) -> (
+                         match self#ain_call_return_type inner with
+                         | Some (Ain.Type.Ref _) ->
+                             self#write_instruction0 A_REF
+                         | _ -> ())
+                     | _ -> ());
+                  self#write_instruction0 S_ASSIGN
               | _ ->
                   compiler_bug "invalid string assignment"
                     (Some (ASTExpression expr)))
@@ -943,22 +1073,85 @@ class jaf_compiler ctx debug_info =
               | Delegate (Some (_, dg_i)) ->
                   self#write_instruction1 PUSH (-1);
                   self#write_instruction0 SWAP;
-                  self#write_instruction1 PUSH dg_i;
-                  self#write_instruction0 DG_STR_TO_METHOD;
-                  self#write_instruction0 DG_ADD
+                  if Ain.version ctx.ain > 8 then (
+                    self#write_instruction1 DG_STR_TO_METHOD dg_i;
+                    self#write_instruction0 DG_NEW_FROM_METHOD;
+                    self#write_instruction0 DG_PLUSA;
+                    self#write_instruction0 DELETE)
+                  else (
+                    self#write_instruction1 PUSH dg_i;
+                    self#write_instruction0 DG_STR_TO_METHOD;
+                    self#write_instruction0 DG_ADD)
               | String -> self#write_instruction0 S_PLUSA2
               | _ ->
                   compiler_bug "invalid string assignment"
                     (Some (ASTExpression expr)))
-          | EqAssign, TyMethod _ -> self#write_instruction0 DG_SET
+          | EqAssign, TyMethod _ ->
+              if Ain.version ctx.ain > 8 then (
+                (* v11 assigns full delegates via [DG_ASSIGN], not the
+                   single-entry [DG_SET]. If the rhs is a raw method
+                   pointer (Member / Lambda / FuncAddr, possibly cast),
+                   wrap it in a one-entry delegate via
+                   [DG_NEW_FROM_METHOD] first. A Cast from [String] has
+                   already been wrapped by the Cast case above. *)
+                (match rhs.node with
+                | Member (_, _, ClassMethod _)
+                | Cast (_, { node = Member (_, _, ClassMethod _); _ })
+                | Lambda _ | FuncAddr _
+                | Cast (_, { node = FuncAddr _; _ })
+                | Cast (_, { node = Lambda _; _ }) ->
+                    self#write_instruction0 DG_NEW_FROM_METHOD
+                | _ -> ());
+                self#write_instruction0 DG_ASSIGN;
+                self#write_instruction0 DELETE)
+              else self#write_instruction0 DG_SET
           | EqAssign, Delegate _ -> self#write_instruction0 DG_ASSIGN
-          | PlusAssign, TyMethod _ -> self#write_instruction0 DG_ADD
+          | PlusAssign, TyMethod _ ->
+              if Ain.version ctx.ain > 8 then (
+                (match rhs.node with
+                | Member (_, _, ClassMethod _)
+                | Cast (_, { node = Member (_, _, ClassMethod _); _ })
+                | Lambda _ | FuncAddr _
+                | Cast (_, { node = FuncAddr _; _ })
+                | Cast (_, { node = Lambda _; _ }) ->
+                    self#write_instruction0 DG_NEW_FROM_METHOD
+                | _ -> ());
+                self#write_instruction0 DG_PLUSA;
+                self#write_instruction0 DELETE)
+              else self#write_instruction0 DG_ADD
           | PlusAssign, Delegate _ -> self#write_instruction0 DG_PLUSA
           | MinusAssign, TyMethod _ -> self#write_instruction0 DG_ERASE
           | MinusAssign, Delegate _ -> self#write_instruction0 DG_MINUSA
           | EqAssign, Struct (_, sno) | EqAssign, Ref (Struct (_, sno)) ->
-              self#write_instruction1 PUSH sno;
+              (* Pre-v11 [SR_ASSIGN] reads the struct type id from a
+                 prior [PUSH]; v11 dropped that operand. v11 also
+                 wants an explicit [A_REF] before [SR_ASSIGN] when the
+                 rhs is a [DummyRef]'d call result — the call leaves a
+                 single page-ref on the stack, the dummy's [ASSIGN]
+                 stores it without an incref, and without an [A_REF]
+                 the dummy's [SH_LOCALDELETE] frees the only owner.
+                 Applies to plain function calls, HLL/array calls,
+                 property getters, and chained method calls. *)
+              if Ain.version ctx.ain <= 8 then
+                self#write_instruction1 PUSH sno
+              else (
+                ignore sno;
+                match rhs.node with
+                | DummyRef (_, { node = Call _; _ }) ->
+                    self#write_instruction0 A_REF
+                | _ -> ());
               self#write_instruction0 SR_ASSIGN
+          (* v11 array copy-assign: [X_SET] deletes the lhs's old
+             contents, assigns the rhs, and leaves the result on the
+             stack for the enclosing [compile_expr_and_pop] to clean
+             up. Also used for the [hll_param] wildcard. *)
+          | EqAssign, (Array _ | Ref (Array _) | HLLParam)
+            when Ain.version_gte ctx.ain (11, 0) ->
+              (match rhs.node with
+              | DummyRef (_, { node = Call _; _ }) ->
+                  self#write_instruction0 A_REF
+              | _ -> ());
+              self#write_instruction0 X_SET
           | _, _ ->
               compiler_bug "invalid assignment" (Some (ASTExpression expr)))
       | Seq (a, b) ->
