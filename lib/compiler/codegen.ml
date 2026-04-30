@@ -91,6 +91,14 @@ class jaf_compiler ctx debug_info =
     val pre_emitted_lambdas : (int, unit) Hashtbl.t =
       Hashtbl.create (module Int)
 
+    (* v11 property-setter argument context. Set true while compiling
+       arguments for a property setter call (the [DUP_X2 + CALLMETHOD
+       + DELETE/POP] idiom). Suppresses [compile_argument]'s [A_REF]
+       after the dummy ASSIGN for [Ref (Struct|Array)] args, since the
+       setter idiom owns the page-ref via [DUP_X2] + the slot's
+       [SH_LOCALDELETE] without an extra incref. *)
+    val mutable in_prop_setter_arg : bool = false
+
     (* The currentl active scopes. *)
     val scopes = Stack.create ()
 
@@ -782,8 +790,19 @@ class jaf_compiler ctx debug_info =
     *)
     method compile_method_call args method_no =
       let f = Ain.get_function_by_index ctx.ain method_no in
-      self#compile_function_arguments args f;
-      self#write_instruction1 CALLMETHOD method_no
+      if Ain.version ctx.ain > 8 then (
+        (* v11 [CALLMETHOD] takes the argument count as its operand;
+           the method's function index is supplied via a preceding
+           [PUSH], so the VM can dispatch virtually by popping it.
+           [nr_args] from the ain function header accounts for the
+           ref void-slot padding that [compile_function_arguments]
+           would otherwise shift past. *)
+        self#write_instruction1 PUSH method_no;
+        self#compile_function_arguments args f;
+        self#write_instruction1 CALLMETHOD f.nr_args)
+      else (
+        self#compile_function_arguments args f;
+        self#write_instruction1 CALLMETHOD method_no)
 
     (** Emit the code to compute an expression. Computing an expression produces
         a value (of the expression's value type) on the stack. *)
@@ -1251,11 +1270,55 @@ class jaf_compiler ctx debug_info =
           self#compile_function_arguments args f;
           self#write_instruction1 CALLFUNC function_no
       (* method call *)
-      | Call ({ node = Member (e, _, _); _ }, args, MethodCall (_, method_no))
-        ->
+      | Call
+          ( { node = Member (e, mname, _); _ },
+            args,
+            MethodCall (_, method_no) ) ->
           self#pre_emit_lambda_args args;
           self#compile_lvalue e;
-          self#compile_method_call args method_no
+          (* v11 property-setter idiom: every [this.X = value] /
+             [obj.X = value] property write expands to a
+             [Name::set(value)] call that the original compiler emits
+             with the assignment-expression-value bookkeeping pair —
+             [DUP_X2] before [CALLMETHOD] shuffles the rhs under the
+             receiver/method, and a trailing [DELETE]/[POP] discards
+             it. The duplicated value is immediately discarded but the
+             VM relies on the pattern (likely for refcount /
+             assignment-tracking). *)
+          let is_prop_setter =
+            Ain.version ctx.ain > 8
+            && String.is_suffix mname ~suffix:"::set"
+            && List.length args = 1
+            &&
+            let f = Ain.get_function_by_index ctx.ain method_no in
+            Poly.equal f.return_type Ain.Type.Void
+          in
+          if is_prop_setter then (
+            let f = Ain.get_function_by_index ctx.ain method_no in
+            self#write_instruction1 PUSH method_no;
+            let prev = in_prop_setter_arg in
+            Exn.protect
+              ~f:(fun () ->
+                in_prop_setter_arg <- true;
+                self#compile_function_arguments args f)
+              ~finally:(fun () -> in_prop_setter_arg <- prev);
+            self#write_instruction0 DUP_X2;
+            (* String setters need an extra [A_REF] before [CALLMETHOD]
+               so the trailing [DELETE] correctly releases the
+               duplicated page-ref left on the stack. Other types
+               (Bool/Int/Float/Struct) don't need this — scalars
+               carry no refcount and Struct comes through a DummyRef
+               whose [SH_LOCALDELETE] handles cleanup. *)
+            let is_string_setter =
+              match List.hd (Ain.Function.logical_parameters f) with
+              | Some { value_type = String; _ } -> true
+              | _ -> false
+            in
+            if is_string_setter then self#write_instruction0 A_REF;
+            self#write_instruction1 CALLMETHOD f.nr_args;
+            if is_string_setter then self#write_instruction0 DELETE
+            else self#write_instruction0 POP)
+          else self#compile_method_call args method_no
       (* HLL function call *)
       | Call (_, args, HLLCall (lib_no, fun_no)) ->
           self#pre_emit_lambda_args args;
