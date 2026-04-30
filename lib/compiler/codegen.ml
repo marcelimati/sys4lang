@@ -392,19 +392,55 @@ class jaf_compiler ctx debug_info =
         already on the stack. *)
     method compile_dereference (t : Ain.Type.t) =
       match t with
+      | Wrap inner ->
+          (* v11 fat-ref: [REFREF] then [REF] appropriate for the inner
+             type. Strings need the extra [A_REF] the v11 VM requires
+             for string dereference. *)
+          self#write_instruction0 REFREF;
+          self#write_instruction0 REF;
+          (match inner with
+          | String when Ain.version ctx.ain > 8 ->
+              self#write_instruction0 A_REF
+          | _ -> ())
       | Ref (Int | Float | Bool | LongInt | FuncType _) ->
           self#write_instruction0 REFREF;
           self#write_instruction0 REF
       | Int | Float | Bool | LongInt | FuncType _ -> self#write_instruction0 REF
-      | String | Ref String -> self#write_instruction0 S_REF
+      | String | Ref String ->
+          (* v11 uses [REF; A_REF] instead of [S_REF] for string
+             dereference — [S_REF] doesn't incref/copy in v11 and the
+             VM panics when the returned string is freed. *)
+          if Ain.version ctx.ain > 8 then (
+            self#write_instruction0 REF;
+            self#write_instruction0 A_REF)
+          else self#write_instruction0 S_REF
       | Array _ | Ref (Array _) ->
+          self#write_instruction0 REF;
+          self#write_instruction0 A_REF
+      | (Struct _ | Ref (Struct _)) when Ain.version ctx.ain > 8 ->
+          (* v11 struct dereference is [REF; A_REF], not [SR_REF no].
+             [SR_REF] doesn't incref the destination in v11 and the VM
+             panics when the caller frees the returned struct. *)
           self#write_instruction0 REF;
           self#write_instruction0 A_REF
       | Struct no | Ref (Struct no) -> self#write_instruction1 SR_REF no
       | Delegate _ | Ref (Delegate _) ->
-          self#write_instruction0 REF;
-          self#write_instruction0 DG_COPY
-      | Void | IMainSystem | HLLFunc2 | HLLParam | Ref _ | Wrap _ | Option _
+          (* v11: delegate deref is [REF; A_REF] (same pattern as
+             struct / array). [DG_COPY] is pre-v11 only; in v11 it
+             doesn't incref the returned delegate and the VM panics
+             when the caller frees it. *)
+          if Ain.version ctx.ain > 8 then (
+            self#write_instruction0 REF;
+            self#write_instruction0 A_REF)
+          else (
+            self#write_instruction0 REF;
+            self#write_instruction0 DG_COPY)
+      | (HLLParam | Ref HLLParam) when Ain.version ctx.ain > 8 ->
+          (* v11 [hll_param] is the polymorphic wildcard; a single
+             [REF] returns the underlying value without an A_REF
+             incref (the callee doesn't take ownership). *)
+          self#write_instruction0 REF
+      | Void | IMainSystem | HLLFunc2 | HLLParam | Ref _ | Option _
       | Unknown87 _ | IFace _ | Enum2 _ | Enum _ | HLLFunc | Unknown98
       | IFaceWrap _ | Function | Method | NullType ->
           compiler_bug "dereference not supported for type" None
