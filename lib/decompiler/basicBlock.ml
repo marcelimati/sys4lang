@@ -1858,9 +1858,32 @@ let generate_var_decls (func : Ain.Function.t) bbs =
         VarDecl (var, None)
     | stmt -> stmt
   in
-  List.map bbs ~f:(function { code = terminator, stmts; _ } as bb ->
-      let stmts' =
-        List.rev_map (List.rev stmts) ~f:(fun stmt ->
-            { stmt with txt = replace_stmt stmt.txt })
-      in
-      { bb with code = (terminator, stmts') })
+  let bbs =
+    List.map bbs ~f:(function { code = terminator, stmts; _ } as bb ->
+        let stmts' =
+          List.rev_map (List.rev stmts) ~f:(fun stmt ->
+              { stmt with txt = replace_stmt stmt.txt })
+        in
+        { bb with code = (terminator, stmts') })
+  in
+  (* Locals still in [uninitialized_vars] after the pass above are
+     referenced in the body without any of the patterns that promote
+     them to a [VarDecl] — typically v11 binaries that elide
+     [SH_LOCALCREATE] for struct-typed locals (e.g. a method receiver
+     [foo.Method(...)] on an undeclared local). Emit a plain declaration
+     for each at the end of the first block so the decompiled source
+     parses; skip dummy / [void] slots that are pure compiler internals. *)
+  let missing =
+    List.filter !uninitialized_vars ~f:(fun v ->
+        (not (Ain.Variable.is_dummy v))
+        && match v.type_ with Type.Void -> false | _ -> true)
+  in
+  let implicit_decls =
+    List.map missing ~f:(fun var ->
+        { txt = VarDecl (var, None); addr = -1; end_addr = -1 })
+  in
+  match (bbs, implicit_decls) with
+  | _, [] -> bbs
+  | ({ code = terminator, stmts; _ } as bb) :: rest, decls ->
+      { bb with code = (terminator, stmts @ List.rev decls) } :: rest
+  | [], _ -> bbs
