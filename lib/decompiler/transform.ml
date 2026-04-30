@@ -399,6 +399,18 @@ let remove_optional_arguments =
       foreach_r (var : array_expr) { body }
     ]} *)
 let recognize_foreach stmt =
+  (* The foreach lowering compiler-side names its synthesized container
+     and counter locals [<foreach_container_N>] / [<foreach_i_N>] when
+     they're not dummies (e.g. a sub-block scope where dummy locals
+     can't be reused). Accept either shape so a roundtripped foreach
+     re-emits as [foreach] instead of staying as the lowered while. *)
+  let is_foreach_container (v : Ain.Variable.t) =
+    Ain.Variable.is_dummy v
+    || String.is_prefix v.name ~prefix:"<foreach_container_"
+  in
+  let is_foreach_index (v : Ain.Variable.t) =
+    Ain.Variable.is_dummy v || String.is_prefix v.name ~prefix:"<foreach_i_"
+  in
   let maybe_match_foreach i_assign arr_assign while_stmt =
     match (i_assign, arr_assign, while_stmt) with
     | ( { txt = VarDecl (arr_dummy, Some (ASSIGN, array_expr)); _ },
@@ -421,47 +433,56 @@ let recognize_foreach stmt =
                 Number 0l ) )
           when phys_equal i_var i_var'
                && phys_equal arr_dummy arr_var
-               && Ain.Variable.is_dummy arr_dummy -> (
+               && is_foreach_container arr_dummy -> (
             let body_stmts =
               match while_body.txt with
               | Block stmts -> stmts
               | s -> [ { while_body with txt = s } ]
             in
+            (* Loop-var init can be either an [ArrayRef] (scalar
+               element) or an [ObjRef] (struct element). Roundtripped
+               foreach over a struct array shows the latter. *)
+            let foreach_item_ref = function
+              | DerefRef
+                  (( ArrayRef
+                       ( Deref (PageRef (LocalPage, arr_var'')),
+                         Deref (PageRef (LocalPage, i_var'')) )
+                   | ObjRef
+                       ( Deref (PageRef (LocalPage, arr_var'')),
+                         Deref (PageRef (LocalPage, i_var'')) ) )) ->
+                  Some (arr_var'', i_var'')
+              | _ -> None
+            in
             match List.rev body_stmts with
             | {
-                txt =
-                  VarDecl
-                    ( loop_var,
-                      Some
-                        ( R_ASSIGN,
-                          DerefRef
-                            (ArrayRef
-                               ( Deref (PageRef (LocalPage, arr_var'')),
-                                 Deref (PageRef (LocalPage, i_var'')) )) ) );
+                txt = VarDecl (loop_var, Some (R_ASSIGN, loop_var_init));
                 _;
               }
-              :: body_rest ->
-                if phys_equal arr_var arr_var'' && phys_equal i_var i_var'' then
-                  let new_body = make_block (List.rev body_rest) in
-                  let foreach_stmt =
-                    {
-                      txt =
-                        ForEach
-                          {
-                            rev = not Poly.(i_init = Number (-1l));
-                            var = loop_var;
-                            ivar =
-                              (if Ain.Variable.is_dummy i_var then None
-                               else Some i_var);
-                            array = array_expr;
-                            body = new_body;
-                          };
-                      addr;
-                      end_addr;
-                    }
-                  in
-                  Some foreach_stmt
-                else None
+              :: body_rest -> (
+                match foreach_item_ref loop_var_init with
+                | Some (arr_var'', i_var'')
+                  when phys_equal arr_var arr_var''
+                       && phys_equal i_var i_var'' ->
+                    let new_body = make_block (List.rev body_rest) in
+                    let foreach_stmt =
+                      {
+                        txt =
+                          ForEach
+                            {
+                              rev = not Poly.(i_init = Number (-1l));
+                              var = loop_var;
+                              ivar =
+                                (if is_foreach_index i_var then None
+                                 else Some i_var);
+                              array = array_expr;
+                              body = new_body;
+                            };
+                        addr;
+                        end_addr;
+                      }
+                    in
+                    Some foreach_stmt
+                | _ -> None)
             | _ -> None)
         | _ -> None)
     | _ -> None
