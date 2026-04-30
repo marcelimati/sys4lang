@@ -620,21 +620,42 @@ class jaf_compiler ctx debug_info =
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression e))
       | DummyRef (var_no, ref_expr) -> (
           self#scope_add_var (self#get_local var_no);
-          (* prepare for assign to dummy variable *)
-          self#write_instruction0 PUSHLOCALPAGE;
-          self#write_instruction1 PUSH var_no;
           match ref_expr with
-          | { node = New { ty = Struct (_, s_no); _ }; _ } ->
-              self#write_instruction1 PUSH s_no;
-              self#compile_lock_peek;
-              self#write_instruction0 NEW;
-              (* assign to dummy variable *)
-              self#write_instruction0 ASSIGN;
-              self#compile_unlock_peek
+          | { node = New { ty = Struct (_, s_no); _ }; _ }
+            when Ain.version ctx.ain > 8 ->
+              (* v11 NEW is a 2-operand opcode (struct-id + ctor-id).
+                 Prepare the dummy slot, release any previous value via
+                 [REF; CHECKUDO], then [PUSHLOCALPAGE; PUSH i; NEW s c;
+                 ASSIGN] stores the freshly constructed object. The
+                 pre-v11 form [PUSH s; NEW] would leave the operand
+                 bytes unread by the v11 disassembler. *)
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 CHECKUDO;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              let ctor =
+                (Ain.get_struct_by_index ctx.ain s_no).constructor
+              in
+              self#write_instruction2 NEW s_no ctor;
+              self#write_instruction0 ASSIGN
           | _ ->
-              self#compile_expression ref_expr;
-              self#write_instruction0
-                (if is_ref_scalar ref_expr.ty then R_ASSIGN else ASSIGN))
+              (* Pre-v11 path: PUSH struct id, then 0-arg NEW which
+                 reads the id off the stack. *)
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              (match ref_expr with
+              | { node = New { ty = Struct (_, s_no); _ }; _ } ->
+                  self#write_instruction1 PUSH s_no;
+                  self#compile_lock_peek;
+                  self#write_instruction0 NEW;
+                  self#write_instruction0 ASSIGN;
+                  self#compile_unlock_peek
+              | _ ->
+                  self#compile_expression ref_expr;
+                  self#write_instruction0
+                    (if is_ref_scalar ref_expr.ty then R_ASSIGN else ASSIGN)))
       | RvalueRef e ->
           (* TODO: Insert <dummy : 右辺値参照化用> variable *)
           self#compile_expression e
