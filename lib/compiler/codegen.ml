@@ -82,6 +82,15 @@ class jaf_compiler ctx debug_info =
        list doesn't double-emit [SH_LOCALDELETE] for them. *)
     val mutable inline_deleted_dummies : int list = []
 
+    (* v11: lambda body indexes whose JUMP-over-body has already been
+       written by [pre_emit_lambda_args] before the enclosing call
+       evaluates its arguments. The [Lambda] expression case consults
+       this to skip the inline JUMP+body path — re-emitting would
+       register the body at a shifted address and corrupt the
+       function table. *)
+    val pre_emitted_lambdas : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
     (* The currentl active scopes. *)
     val scopes = Stack.create ()
 
@@ -591,6 +600,37 @@ class jaf_compiler ctx debug_info =
               | _ -> ())
           | _ -> self#compile_expression expr)
 
+    (** v11: write [JUMP-over-body; body] for every [Lambda] argument
+        BEFORE any arg evaluation runs, recording each pre-emitted
+        lambda's index in [pre_emitted_lambdas]. The [Lambda]
+        expression case consults that set so its inline [JUMP+body]
+        path doesn't run a second time. Pre-emitting places the
+        lambda body outside the call's argument-eval range, which
+        the original v11 compiler and the v11 VM expect — emitting
+        the body inline puts it inside another function's byte range,
+        shifting every downstream address. *)
+    method pre_emit_lambda_args args =
+      if Ain.version ctx.ain > 8 then
+        let rec find_lambda (e : expression) =
+          match e.node with
+          | Lambda f -> Some f
+          | Cast (_, inner) -> find_lambda inner
+          | _ -> None
+        in
+        List.iter args ~f:(function
+          | Some expr -> (
+              match find_lambda expr with
+              | Some f ->
+                  let lambda_idx = Option.value_exn f.index in
+                  if not (Hashtbl.mem pre_emitted_lambdas lambda_idx) then (
+                    let jump_addr = current_address + 2 in
+                    self#write_instruction1 JUMP 0;
+                    self#compile_function f;
+                    self#write_address_at jump_addr current_address;
+                    Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
+              | None -> ())
+          | None -> ())
+
     method compile_function_arguments args (f : Ain.Function.t) =
       let compile_arg arg (var : Ain.Variable.t) =
         self#compile_argument arg var.value_type
@@ -646,7 +686,13 @@ class jaf_compiler ctx debug_info =
           done;
           self#write_instruction1 PUSH i;
           self#compile_dereference (jaf_to_ain_type expr.ty)
-      | FuncAddr (_, Some no) -> self#write_instruction1 PUSH no
+      | FuncAddr (_, Some no) ->
+          (* v11 method-refs are 2-slot values (object_page +
+             func_index). Free functions use [-1] as the null
+             object-page sentinel. Pre-v11 passes a single slot
+             (func_index only). *)
+          if Ain.version ctx.ain > 8 then self#write_instruction1 PUSH (-1);
+          self#write_instruction1 PUSH no
       | FuncAddr (_, None) ->
           compiler_bug "unresolved FuncAddr" (Some (ASTExpression expr))
       | MemberAddr (_, _, v) -> self#write_instruction1 PUSH v
@@ -978,10 +1024,12 @@ class jaf_compiler ctx debug_info =
       (* method call *)
       | Call ({ node = Member (e, _, _); _ }, args, MethodCall (_, method_no))
         ->
+          self#pre_emit_lambda_args args;
           self#compile_lvalue e;
           self#compile_method_call args method_no
       (* HLL function call *)
       | Call (_, args, HLLCall (lib_no, fun_no)) ->
+          self#pre_emit_lambda_args args;
           let f = Ain.function_of_hll_function_index ctx.ain lib_no fun_no in
           self#compile_function_arguments args f;
           self#write_instruction2 CALLHLL lib_no fun_no
@@ -992,6 +1040,7 @@ class jaf_compiler ctx debug_info =
           self#write_instruction1 CALLSYS f.index
       (* built-in method call *)
       | Call ({ node = Member (e, _, _); _ }, args, BuiltinCall builtin) -> (
+          self#pre_emit_lambda_args args;
           let receiver_ty = ref Void in
           (match builtin with
           | (StringLength | StringLengthByte) when is_variable_ref e.node ->
@@ -1115,20 +1164,43 @@ class jaf_compiler ctx debug_info =
           )
       | Null -> (
           match expr.ty with
-          | FuncType _ | IMainSystem -> self#write_instruction1 PUSH 0
+          | FuncType _ | IMainSystem | HLLParam ->
+              self#write_instruction1 PUSH 0
           | Delegate _ -> self#write_instruction0 DG_NEW
           | String -> self#write_instruction1 S_PUSH 0
+          | Ref (String | Struct _ | Array _ | HLLParam)
+            when Ain.version ctx.ain > 8 ->
+              (* v11 non-scalar ref is a single-slot page-ref. [PUSH -1]
+                 is the null-page sentinel. Pushing a second [PUSH 0]
+                 would leave an unmatched slot on the stack that
+                 downstream POP / DELETE never accounts for. *)
+              self#write_instruction1 PUSH (-1)
+          | Struct _ | Array _ when Ain.version ctx.ain > 8 ->
+              self#write_instruction1 PUSH (-1)
+          | Ref _ ->
+              (* Scalar ref (2-slot page+index) or pre-v11. *)
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0
+          | Int | Bool | Float | LongInt | NullType ->
+              self#write_instruction1 PUSH 0
           | ty ->
               compiler_bug
                 ("unimplemented: NULL rvalue of type " ^ jaf_type_to_string ty)
                 (Some (ASTExpression expr)))
       | Lambda f ->
-          let jump_addr = current_address + 2 in
-          self#write_instruction1 JUMP 0;
-          self#compile_function f;
-          self#write_address_at jump_addr current_address;
+          let lambda_idx = Option.value_exn f.index in
+          (* v11 pre-emit: if the enclosing call has already written
+             the lambda body via [pre_emit_lambda_args], don't emit it
+             again — re-registering would shift downstream addresses
+             and double the function-table entry. Just push the
+             receiver+index. *)
+          if not (Hashtbl.mem pre_emitted_lambdas lambda_idx) then (
+            let jump_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#compile_function f;
+            self#write_address_at jump_addr current_address);
           self#write_instruction0 PUSHSTRUCTPAGE;
-          self#write_instruction1 PUSH (Option.value_exn f.index)
+          self#write_instruction1 PUSH lambda_idx
       | OptionalMember (obj, name, mt) ->
           (* [a?.b] rvalue: evaluate [a]; if the result is the [-1]
              null sentinel, push the type-appropriate default; else
