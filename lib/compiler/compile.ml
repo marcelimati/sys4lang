@@ -96,6 +96,62 @@ let codegen_pass ctx program debug_info =
         Codegen.compile ctx jaf_name jaf debug_info
     | Hll _ -> ())
 
+(* v11 struct vtable population. After all functions have been
+   registered, walk every struct and collect the indices of functions
+   whose name starts with [Class@]. The v11 VM reads [Struct.vmethods]
+   to resolve virtual method calls — without this the field is empty
+   and [CALLMETHOD] dispatch finds nothing. Pre-v11 doesn't use
+   [vmethods] for dispatch, so the pass is a no-op there. *)
+let populate_vtables ctx =
+  if Ain.version ctx.ain > 8 then
+    Ain.struct_iter ctx.ain ~f:(fun (s : Ain.Struct.t) ->
+        let prefix = s.name ^ "@" in
+        let methods = ref [] in
+        Ain.function_iter ctx.ain ~f:(fun (f : Ain.Function.t) ->
+            if String.is_prefix f.name ~prefix then
+              methods := f.index :: !methods);
+        Ain.write_struct ctx.ain { s with vmethods = List.rev !methods })
+
+(* Emit minimal stub bytecode for any function still flagged as
+   un-emitted ([address] of [-1] or [-2]). These are typically ghost
+   lambda entries pre-allocated by the v11 delegate-callback
+   registration plus stub-aware [add_function] reuse: the slot exists
+   in the function table but no compile_function ever ran on it.
+   Without a body, [CALLMETHOD] / [CALLFUNC] resolved to that slot
+   would jump into uninitialised bytecode. Emit a [FUNC; PUSH 0;
+   RETURN; ENDFUNC] shape so the slot is safe. The "NULL" function is
+   special and skipped. *)
+let emit_undefined_function_stubs ctx =
+  Ain.function_iter ctx.ain ~f:(fun (f : Ain.Function.t) ->
+      if
+        (f.address = -1 || f.address = -2)
+        && not (String.equal f.name "NULL")
+      then (
+        let buf = CBuffer.create 64 in
+        let addr = Ain.code_size ctx.ain in
+        CBuffer.write_int16 buf 0x61;
+        (* FUNC *)
+        CBuffer.write_int32 buf f.index;
+        (match f.return_type with
+        | Ain.Type.Void -> ()
+        | Ain.Type.Float ->
+            CBuffer.write_int16 buf 0x03;
+            CBuffer.write_float buf 0.0
+        | Ain.Type.String ->
+            CBuffer.write_int16 buf 0x0a;
+            CBuffer.write_int32 buf 0
+        | _ ->
+            CBuffer.write_int16 buf 0x00;
+            (* PUSH *)
+            CBuffer.write_int32 buf 0);
+        CBuffer.write_int16 buf 0x2f;
+        (* RETURN *)
+        CBuffer.write_int16 buf 0x7e;
+        (* ENDFUNC *)
+        CBuffer.write_int32 buf f.index;
+        Ain.append_bytecode ctx.ain buf;
+        Ain.write_function ctx.ain { f with address = addr + 6 }))
+
 (* v11 foreach is desugared into a [while] loop before any
    type-resolution / type-checking happens, so later passes only see
    the regular control-flow shape. *)
@@ -109,4 +165,6 @@ let compile ctx sources debug_info read_file =
   desugar_pass program;
   let program = type_resolve_pass ctx program in
   type_check_pass ctx program;
-  codegen_pass ctx program debug_info
+  populate_vtables ctx;
+  codegen_pass ctx program debug_info;
+  emit_undefined_function_stubs ctx
