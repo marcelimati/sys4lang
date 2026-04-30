@@ -244,33 +244,70 @@ class type_declare_visitor ctx =
         decl.class_name <-
           (Option.value_exn self#env#current_function).class_name);
       let name = mangled_name decl in
+      let decl_param_types = List.map decl.params ~f:(fun p -> p.type_spec.ty) in
+      (* Two decls denote the same overload iff their parameter types
+         match exactly. Return type is not part of the signature
+         (matches the C-family / v11 convention). *)
+      let same_overload (other : fundecl) =
+        params_compatible decl_param_types
+          (List.map other.params ~f:(fun p -> p.type_spec.ty))
+      in
       if Option.is_some decl.body then
-        decl.index <- Some (Ain.add_function ctx.ain name).index;
-      Hashtbl.update ctx.functions name ~f:(function
-        | Some prev_decl ->
-            if
-              not (ft_compatible (ft_of_fundecl decl) (ft_of_fundecl prev_decl))
-            then
-              compile_error "Function signature mismatch"
-                (ASTDeclaration (Function decl))
-            else if Option.is_some prev_decl.body then
-              compile_error "Duplicate function definition"
-                (ASTDeclaration (Function decl))
-            else if Option.is_none decl.body then (
-              (* Duplicate method declaration. Ignore the later one. *)
-              decl.index <- Some (-1);
-              prev_decl)
-            else (
-              prev_decl.index <- decl.index;
-              (* Make sure the declaration has the default parameters specified
-                 in the method declaration (default values cannot be specified
-                 in method definition) *)
-              if Option.is_some decl.body then decl.params <- prev_decl.params;
-              (* Out-of-class definitions don't carry access modifiers; preserve
-                 the visibility set during struct registration. *)
-              decl.is_private <- prev_decl.is_private;
-              decl)
-        | None -> decl);
+        decl.index <-
+          Some
+            (Ain.add_function ~nr_args:(List.length decl.params) ctx.ain name)
+              .index;
+      (* Merge a body or prototype into an existing same-overload entry.
+         [prev_decl] has identical parameter types to [decl]; only the
+         return type or body presence may differ. *)
+      let merge_with_prev (prev_decl : fundecl) =
+        if
+          not (jaf_type_equal decl.return.ty prev_decl.return.ty)
+        then
+          compile_error "Function signature mismatch"
+            (ASTDeclaration (Function decl))
+        else if Option.is_some prev_decl.body && Option.is_some decl.body then
+          compile_error "Duplicate function definition"
+            (ASTDeclaration (Function decl))
+        else if Option.is_none decl.body then (
+          (* Duplicate prototype; ignore. [-1] flags the decl as
+             unowned so later passes don't try to write a body. *)
+          decl.index <- Some (-1);
+          prev_decl)
+        else (
+          (* [decl] supplies the body for an existing prototype. *)
+          prev_decl.index <- decl.index;
+          decl.params <- prev_decl.params;
+          decl.is_private <- prev_decl.is_private;
+          decl)
+      in
+      let overloading_allowed = Ain.version_gte ctx.ain (11, 0) in
+      (match Hashtbl.find ctx.functions name with
+      | None -> Hashtbl.set ctx.functions ~key:name ~data:decl
+      | Some primary when same_overload primary ->
+          Hashtbl.set ctx.functions ~key:name ~data:(merge_with_prev primary)
+      | Some _ when not overloading_allowed ->
+          (* Pre-v11: same-name decls with different parameter types
+             are a signature error, not an overload. *)
+          compile_error "Function signature mismatch"
+            (ASTDeclaration (Function decl))
+      | Some _ ->
+          (* [decl] shares a mangled name with the primary but has
+             different parameter types — a v11 overload. Match against
+             entries previously stashed in [ctx.overloads]; append a new
+             one if no same-overload prototype exists. *)
+          let overs =
+            Hashtbl.find ctx.overloads name |> Option.value ~default:[]
+          in
+          (match List.findi overs ~f:(fun _ o -> same_overload o) with
+          | Some (i, prev) ->
+              let merged = merge_with_prev prev in
+              let updated =
+                List.mapi overs ~f:(fun j x -> if j = i then merged else x)
+              in
+              Hashtbl.set ctx.overloads ~key:name ~data:updated
+          | None ->
+              Hashtbl.set ctx.overloads ~key:name ~data:(decl :: overs)));
       super#visit_fundecl decl
 
     method! visit_declaration decl =

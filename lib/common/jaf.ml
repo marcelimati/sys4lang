@@ -443,6 +443,13 @@ type context = {
   globals : (string, variable) Hashtbl.t;
   structs : (string, jaf_struct) Hashtbl.t;
   functions : (string, fundecl) Hashtbl.t;
+  (* v11 overloaded methods / functions, keyed by [mangled_name]
+     ([Class@Name] for methods, plain function name otherwise). The
+     entry in [functions] holds the first-seen declaration; any
+     overload with distinct parameter types is appended here. Resolved
+     at call sites by matching against the actual argument types. Empty
+     for pre-v11 programs. *)
+  overloads : (string, fundecl list) Hashtbl.t;
   functypes : (string, fundecl) Hashtbl.t;
   delegates : (string, fundecl) Hashtbl.t;
   libraries : (string, library) Hashtbl.t;
@@ -1310,6 +1317,7 @@ let context_from_ain ?(constants : variable list = []) ain =
   let globals = Hashtbl.create (module String) in
   let structs = Hashtbl.create (module String) in
   let functions = Hashtbl.create (module String) in
+  let overloads = Hashtbl.create (module String) in
   let functypes = Hashtbl.create (module String) in
   let delegates = Hashtbl.create (module String) in
   let libraries = Hashtbl.create (module String) in
@@ -1360,7 +1368,16 @@ let context_from_ain ?(constants : variable list = []) ain =
           class_index;
         }
       in
-      Hashtbl.set functions ~key:f.name ~data:func);
+      (* v11 may have multiple ain entries sharing a mangled name
+         (overloaded methods / functions). The first goes into
+         [functions]; subsequent same-name entries land in [overloads]
+         so call-site resolution can pick by parameter types. *)
+      match Hashtbl.find functions f.name with
+      | None -> Hashtbl.set functions ~key:f.name ~data:func
+      | Some _ ->
+          Hashtbl.update overloads f.name ~f:(function
+            | None -> [ func ]
+            | Some xs -> func :: xs));
   Ain.functype_iter ain ~f:(fun (f : Ain.FunctionType.t) ->
       Hashtbl.add_exn functypes ~key:f.name ~data:(ain_to_jaf_functype f));
   Ain.delegate_iter ain ~f:(fun (f : Ain.FunctionType.t) ->
@@ -1407,4 +1424,14 @@ let context_from_ain ?(constants : variable list = []) ain =
       Hashtbl.add_exn libraries ~key:l.name
         ~data:{ hll_name = l.name; functions });
   let version = (Ain.version ain * 100) + Ain.minor_version ain in
-  { ain; version; globals; structs; functions; functypes; delegates; libraries }
+  {
+    ain;
+    version;
+    globals;
+    structs;
+    functions;
+    overloads;
+    functypes;
+    delegates;
+    libraries;
+  }

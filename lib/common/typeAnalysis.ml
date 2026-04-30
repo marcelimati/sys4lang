@@ -233,6 +233,43 @@ class type_analyze_visitor ctx =
     method check_referenceable e parent =
       if not (is_referenceable e) then not_an_lvalue_error e parent
 
+    (* v11 overload resolution: a name registered in [ctx.functions]
+       may have alternates in [ctx.overloads]. Pick the candidate
+       whose parameter types match the actual argument types; fall
+       back to the primary so [check_call] can produce its own
+       diagnostics on mismatch. Empty alternate list (the pre-v11 /
+       non-overloaded common case) returns the primary unchanged. *)
+    method resolve_overload (name : string) (args : expression option list) =
+      let primary = Hashtbl.find_exn ctx.functions name in
+      match Hashtbl.find ctx.overloads name with
+      | None | Some [] -> primary
+      | Some alternates ->
+          let arg_types =
+            List.map args ~f:(function Some a -> Some a.ty | None -> None)
+          in
+          let arg_compat_with_param (param : variable) (arg_ty : jaf_type) =
+            match (param.type_spec.ty, arg_ty) with
+            | Delegate _, (TyMethod _ | TyFunction _) -> true
+            | FuncType _, (TyMethod _ | TyFunction _) -> true
+            (* A [ref T] argument satisfies a plain [T] parameter; the
+               reference is dereffed at call time. *)
+            | pt, Ref at when jaf_type_equal pt at -> true
+            | _ -> jaf_type_equal param.type_spec.ty arg_ty
+          in
+          let param_matches (fd : fundecl) =
+            List.length fd.params = List.length arg_types
+            && List.for_all2_exn fd.params arg_types ~f:(fun p at ->
+                   match at with
+                   | None -> true (* default argument; accept *)
+                   | Some t -> arg_compat_with_param p t)
+          in
+          (match
+             List.filter (primary :: alternates) ~f:param_matches
+           with
+          | [ fd ] -> fd
+          | fd :: _ -> fd
+          | [] -> primary)
+
     (*
      * Assigning to a functype or delegate variable is special.
      * The RHS should be an expression like &foo, which has type
@@ -766,7 +803,7 @@ class type_analyze_visitor ctx =
                         (ASTExpression expr))))
       (* regular function call *)
       | Call (({ node = Ident (_, FunctionName name); _ } as e), args, _) ->
-          let f = Hashtbl.find_exn ctx.functions name in
+          let f = self#resolve_overload name args in
           let fno = Option.value_exn f.index in
           let args = check_call f.name f.params args in
           expr.node <- Call (e, args, FunctionCall fno);
@@ -784,7 +821,7 @@ class type_analyze_visitor ctx =
       (* method call *)
       | Call (({ node = Member (_, _, ClassMethod (name, _)); _ } as e), args, _)
         ->
-          let f = Hashtbl.find_exn ctx.functions name in
+          let f = self#resolve_overload name args in
           let args = check_call f.name f.params args in
           let mcall =
             MethodCall (Option.value_exn f.class_index, Option.value_exn f.index)

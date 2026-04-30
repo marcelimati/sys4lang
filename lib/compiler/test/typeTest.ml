@@ -26,6 +26,15 @@ let type_test input =
   with CompileError.Compile_error e ->
     CompileError.print_error e (fun _ -> Some input)
 
+let type_test_v11 input =
+  let ctx = Jaf.context_from_ain (Ain.create 11 0) in
+  let debug_info = DebugInfo.create () in
+  try
+    Compile.compile ctx [ Pje.Jaf "-" ] debug_info (fun _ -> input);
+    Stdio.print_endline "ok"
+  with CompileError.Compile_error e ->
+    CompileError.print_error e (fun _ -> Some input)
+
 let%expect_test "empty jaf" =
   type_test {||};
   [%expect {| ok |}]
@@ -798,3 +807,83 @@ let%expect_test "stray case" =
     -:9:9-16: switch case outside of switch statement
         9 |         case 2:
                     ^^^^^^^ |}]
+
+(* v11 method / function overloading: same name, different parameter
+   types coexist; call sites pick by argument types. *)
+
+let%expect_test "v11 method overload: same arity, different param type" =
+  type_test_v11
+    {|
+      struct S {
+        void f(int x);
+        void f(string x);
+      };
+      void S::f(int x) {}
+      void S::f(string x) {}
+      void g(ref S s) {
+        s.f(1);
+        s.f("hi");
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 method overload: three overloads" =
+  type_test_v11
+    {|
+      struct S {
+        void f();
+        void f(int x);
+        void f(int x, string y);
+      };
+      void S::f() {}
+      void S::f(int x) {}
+      void S::f(int x, string y) {}
+      void g(ref S s) {
+        s.f();
+        s.f(1);
+        s.f(1, "hi");
+      }
+    |};
+  [%expect {| ok |}]
+
+let%expect_test "v11 overload: return-type-only difference is rejected" =
+  type_test_v11
+    {|
+      struct S {
+        void f(int x);
+        int f(int x);
+      };
+    |};
+  [%expect
+    {|
+    -:4:9-22: Function signature mismatch
+        4 |         int f(int x);
+                    ^^^^^^^^^^^^^
+    |}]
+
+let%expect_test "v11 overload: duplicate definition still rejected" =
+  type_test_v11
+    {|
+      struct S {
+        void f(int x) {}
+      };
+      void S::f(int x) {}
+    |};
+  [%expect
+    {|
+    -:5:7-26: Duplicate function definition
+        5 |       void S::f(int x) {}
+                  ^^^^^^^^^^^^^^^^^^^
+    |}]
+
+let%expect_test "v11 free-function overload" =
+  type_test_v11
+    {|
+      int abs(int x) { return x < 0 ? -x : x; }
+      float abs(float x) { return x < 0.0 ? -x : x; }
+      void g() {
+        abs(-1);
+        abs(-1.5);
+      }
+    |};
+  [%expect {| ok |}]

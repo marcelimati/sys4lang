@@ -277,15 +277,15 @@ class variable_alloc_visitor ctx =
         self#end_scope ScopeAnon;
         self#resolve_gotos;
 
-        (* write updated fundecl to ain file *)
+        (* write updated fundecl to ain file. Look up by index, not by
+           name: a v11 overload set has multiple ain entries sharing
+           the mangled name, so a name-based lookup would always
+           return the first overload and clobber it for every body
+           in the set. *)
         let vars = List.rev (Stack.pop_exn func_vars) in
-        (match Ain.get_function ctx.ain (mangled_name f) with
-        | Some obj ->
-            obj |> jaf_to_ain_function f |> add_vars vars
-            |> Ain.write_function ctx.ain
-        | None ->
-            compiler_bug "Undefined function"
-              (Some (ASTDeclaration (Function f))));
+        let obj = Ain.get_function_by_index ctx.ain (Option.value_exn f.index) in
+        obj |> jaf_to_ain_function f |> add_vars vars
+        |> Ain.write_function ctx.ain;
         labels <- parent_labels)
   end
 
