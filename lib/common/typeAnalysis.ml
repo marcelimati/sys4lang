@@ -228,6 +228,22 @@ let check_not_array (e : expression) =
           compile_error "array expression not allowed here" (ASTExpression e))
   | _ -> ()
 
+(** True if the expression already produces a 0/1 bool at bytecode
+    level (comparisons, logical ops, [LogNot], explicit Bool cast).
+    v11 codegen uses this to decide whether to insert an [ITOB]
+    normalisation before [IFZ]. *)
+let is_bool_producing_expr (e : expression) =
+  match e.node with
+  | Binary (op, _, _) -> (
+      match op with
+      | Equal | NEqual | LT | GT | LTE | GTE | RefEqual | RefNEqual | LogOr
+      | LogAnd ->
+          true
+      | _ -> false)
+  | Unary (LogNot, _) -> true
+  | Cast (Bool, _) -> true
+  | _ -> false
+
 (* Substitute the polymorphic [HLLParam] wildcard with the concrete
    element type of the receiver. v11 HLL Array methods like
    [EmplaceBack] declare their result as [ref hll_param]; on a typed

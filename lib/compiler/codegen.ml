@@ -155,6 +155,25 @@ class jaf_compiler ctx debug_info =
                 (ASTStatement (snd (List.last_exn gotos))));
       Hashtbl.clear labels
 
+    (** v11: emit [ITOB] before the [IFZ] that consumes a condition
+        expression unless the expression is already known to produce a
+        0/1 bool. Pre-v11 [IFZ] tolerates non-zero values; v11 [IFZ]
+        leaves non-comparison expressions (e.g. a plain [int] or
+        dereffed ref) at whatever numeric value they evaluated to,
+        and the [Bool] type's runtime cast makes the branch unstable
+        without normalisation. No-op on pre-v11. *)
+    method maybe_emit_condition_itob (test : expression) =
+      if
+        Ain.version ctx.ain > 8
+        && (not (TypeAnalysis.is_bool_producing_expr test))
+        && (match test.ty with Bool -> false | _ -> true)
+        &&
+        match test.node with
+        | ConstInt _ -> false
+        | Call (_, _, (HLLCall _ | SystemCall _)) -> false
+        | _ -> true
+      then self#write_instruction0 ITOB
+
     (** v11: ain-level return type of a [Call] node, or [None] for
         anything else. Used to detect ref-returning calls so the
         surrounding assignment / argument-pass site can insert an
@@ -1206,6 +1225,7 @@ class jaf_compiler ctx debug_info =
           self#compile_expression b
       | Ternary (test, con, alt) ->
           self#compile_expression test;
+          self#maybe_emit_condition_itob test;
           let ifz_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           self#compile_expression con;
@@ -1831,14 +1851,23 @@ class jaf_compiler ctx debug_info =
           (* v11: release condition-local dummies before the IFZ so
              both the taken and not-taken branch see them cleaned up. *)
           self#cleanup_condition_dummyrefs vars_before;
+          self#maybe_emit_condition_itob test;
           let ifz_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           self#compile_statement con;
-          let jump_addr = current_address + 2 in
-          self#write_instruction1 JUMP 0;
-          self#write_address_at ifz_addr current_address;
-          self#compile_statement alt;
-          self#write_address_at jump_addr current_address
+          (match alt.node with
+          | EmptyStatement when Ain.version ctx.ain > 8 ->
+              (* v11 omits the trailing JUMP-over-alt when there's no
+                 else branch. Pre-v11 always emits the JUMP — keep
+                 that layout for pre-v11 since some pre-v11 expected
+                 bytecode/address tests rely on it. *)
+              self#write_address_at ifz_addr current_address
+          | _ ->
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifz_addr current_address;
+              self#compile_statement alt;
+              self#write_address_at jump_addr current_address)
       | While (test, body) ->
           (* loop test *)
           let loop_addr = current_address in
@@ -1853,6 +1882,7 @@ class jaf_compiler ctx debug_info =
              both the continue and the exit branch see them cleaned
              up, not just the body-executes path. *)
           self#cleanup_condition_dummyrefs vars_before;
+          self#maybe_emit_condition_itob test;
           let break_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           (* loop body *)
@@ -1875,6 +1905,7 @@ class jaf_compiler ctx debug_info =
           in
           self#compile_expression test;
           self#cleanup_condition_dummyrefs vars_before;
+          self#maybe_emit_condition_itob test;
           let break_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           (* loop body *)
@@ -1901,6 +1932,7 @@ class jaf_compiler ctx debug_info =
           let break_addr =
             Option.map test ~f:(fun e ->
                 self#compile_expression e;
+                self#maybe_emit_condition_itob e;
                 let break_addr = current_address + 2 in
                 self#write_instruction1 IFZ 0;
                 break_addr)
