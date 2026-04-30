@@ -611,15 +611,38 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 SH_STRUCTREF member_no
           | _ ->
               self#compile_lvalue obj;
+              (* v11 foreach loop var typed [Wrap (Struct _)] needs the
+                 Wrap fat-ref unwrapped to the struct page-ref before
+                 the member offset is pushed. *)
+              (match obj.ty with
+              | Wrap _ when Ain.version ctx.ain > 8 ->
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 REF
+              | _ -> ());
               self#write_instruction1 PUSH member_no;
               compile_lvalue_after (self#member_type e))
       | Subscript (obj, index) ->
           self#compile_lvalue obj;
+          (* Same Wrap-receiver unwrap for subscript into [Wrap<array>]. *)
+          (match obj.ty with
+          | Wrap _ when Ain.version ctx.ain > 8 ->
+              self#write_instruction0 REFREF;
+              self#write_instruction0 REF
+          | _ -> ());
           self#compile_expression index;
           compile_lvalue_after (jaf_to_ain_type e.ty)
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression e))
       | DummyRef (var_no, ref_expr) -> (
           self#scope_add_var (self#get_local var_no);
+          let call_returns_ref =
+            match self#ain_call_return_type ref_expr with
+            | Some (Ain.Type.Ref _) -> true
+            | _ -> false
+          in
+          let dummy_is_ref_scalar =
+            is_ref_scalar
+              (ain_to_jaf_type ctx.ain (self#get_local var_no).value_type)
+          in
           match ref_expr with
           | { node = New { ty = Struct (_, s_no); _ }; _ }
             when Ain.version ctx.ain > 8 ->
@@ -640,6 +663,101 @@ class jaf_compiler ctx debug_info =
               in
               self#write_instruction2 NEW s_no ctor;
               self#write_instruction0 ASSIGN
+          | _
+            when Ain.version ctx.ain > 8
+                 && not
+                      (is_ref_scalar ref_expr.ty
+                      || (call_returns_ref && dummy_is_ref_scalar)) ->
+              (* v11 rvalue-into-dummy (non-scalar): variableAlloc
+                 wrapped a non-referenceable rvalue so it can serve as a
+                 [ref T] argument. Evaluate the rvalue first, release
+                 whatever the dummy currently holds via [REF; CHECKUDO],
+                 then SWAP-dance an [ASSIGN] so the stored value is
+                 left on the stack for the surrounding caller / null
+                 check. Original SDK: [.LOCALREF dummy; CHECKUDO;
+                 .LOCALASSIGN2 dummy]. *)
+              let emit_checkudo_assign () =
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH var_no;
+                self#write_instruction0 REF;
+                self#write_instruction0 CHECKUDO;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH var_no;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ASSIGN
+              in
+              (match ref_expr.node with
+              | Call
+                  ( { node = OptionalMember (obj, _, _); _ },
+                    args,
+                    MethodCall (_, method_no) ) ->
+                  (* Inline [obj?.Method()] handling for ref-returning
+                     methods stored into a dummy: the CHECKUDO+ASSIGN
+                     belongs INSIDE the not-null branch (after the
+                     method call), and a second null-check on the
+                     result converts a NULL method result to the
+                     [(-1, -1)] fat-null pair. Trailing fat-null
+                     normalization collapses [(page, -1)] to a single
+                     [-1] for callers expecting a single page-ref. *)
+                  self#compile_lvalue obj;
+                  self#write_instruction0 DUP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#compile_method_call args method_no;
+                  emit_checkudo_assign ();
+                  self#write_instruction0 DUP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz2_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction1 PUSH 0;
+                  let jump_end_inner = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz2_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_address_at jump_end_inner current_address;
+                  let jump_end_outer = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_address_at jump_end_outer current_address;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz3_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  let jump_norm_end = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz3_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_address_at jump_norm_end current_address
+              | _ ->
+                  self#compile_expression ref_expr;
+                  emit_checkudo_assign ())
+          | _ when Ain.version ctx.ain > 8 ->
+              (* v11 ref-scalar (2 VM stack slots per ref value):
+                 same pattern but with [DUP_X2; POP] in place of [SWAP]
+                 to rotate through 2-slot values, and [R_ASSIGN]
+                 instead of [ASSIGN]. *)
+              self#compile_expression ref_expr;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 CHECKUDO;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction0 R_ASSIGN
           | _ ->
               (* Pre-v11 path: PUSH struct id, then 0-arg NEW which
                  reads the id off the stack. *)
@@ -991,7 +1109,19 @@ class jaf_compiler ctx debug_info =
       | Unary (BitNot, e) ->
           self#compile_expression e;
           self#write_instruction0 COMPL
-      | Unary (((PreInc | PreDec | ForeachInc | ForeachDec) as op), e) ->
+      | Unary (((ForeachInc | ForeachDec) as op), e) ->
+          (* Rvalue context: evaluate the counter-modify expression
+             and leave the new value on the stack. [INC]/[DEC]
+             increments in-place and consumes the [page, idx] pair,
+             so reload the counter via [compile_lvalue; REF] for the
+             updated value. A plain [REF] here would dereference stale
+             stack contents (whatever was left after [INC] consumed
+             the pair). *)
+          self#compile_lvalue e;
+          self#write_instruction0 (incdec_instruction (op, e.ty));
+          self#compile_lvalue e;
+          self#write_instruction0 REF
+      | Unary (((PreInc | PreDec) as op), e) ->
           self#compile_lvalue e;
           self#write_instruction0 DUP2;
           self#write_instruction0 (incdec_instruction (op, e.ty));
@@ -1364,11 +1494,30 @@ class jaf_compiler ctx debug_info =
           | String, Delegate (Some (_, dg_i)) ->
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 SWAP;
-              self#write_instruction1 PUSH dg_i;
-              self#write_instruction0 DG_STR_TO_METHOD
+              if Ain.version ctx.ain > 8 then (
+                (* v11 [DG_STR_TO_METHOD] takes the delegate-type id as
+                   a direct operand and produces a method-pointer; wrap
+                   it via [DG_NEW_FROM_METHOD] so the surrounding assign
+                   can use [DG_ASSIGN] / [DG_PLUSA] (the full-delegate
+                   forms) instead of [DG_SET]. *)
+                self#write_instruction1 DG_STR_TO_METHOD dg_i;
+                self#write_instruction0 DG_NEW_FROM_METHOD)
+              else (
+                self#write_instruction1 PUSH dg_i;
+                self#write_instruction0 DG_STR_TO_METHOD)
           | TyFunction _, TyMethod _ ->
-              self#write_instruction1 PUSH (-1);
-              self#write_instruction0 SWAP
+              (* v11 [FuncAddr] already emits the 2-slot method-ref
+                 form ([PUSH -1; PUSH no]) directly — skip the
+                 page+swap dance that was needed pre-v11 (when
+                 [FuncAddr] pushed a single slot). Cast from any other
+                 expression shape still needs the explicit wrap. *)
+              if
+                Ain.version ctx.ain > 8
+                && (match e.node with FuncAddr _ -> true | _ -> false)
+              then ()
+              else (
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 SWAP)
           | _ ->
               compiler_bug
                 (Printf.sprintf "invalid cast from %s to %s"
@@ -1385,6 +1534,15 @@ class jaf_compiler ctx debug_info =
           self#write_instruction1 SH_STRUCTREF member_no
       | Member (e, _, ClassVariable member_no) ->
           self#compile_lvalue e;
+          (* v11 Wrap receiver: unwrap the fat-ref before indexing
+             into the wrapped struct. Without this at rvalue sites
+             [read x.wrap.m] reads the wrapper itself instead of the
+             wrapped value. *)
+          (match e.ty with
+          | Wrap _ when Ain.version ctx.ain > 8 ->
+              self#write_instruction0 REFREF;
+              self#write_instruction0 REF
+          | _ -> ());
           self#write_instruction1 PUSH member_no;
           self#compile_dereference (self#member_type expr)
       | Member (_, _, ClassConst _) ->
@@ -2052,7 +2210,15 @@ class jaf_compiler ctx debug_info =
              | PreInc | PostInc | ForeachInc -> SH_LOCALINC
              | _ -> SH_LOCALDEC)
             i
-      | Unary (((PreInc | PreDec | ForeachInc | ForeachDec) as op), e) ->
+      | Unary (((ForeachInc | ForeachDec) as op), e) ->
+          (* Statement-context foreach counter inc/dec: [INC]/[DEC]
+             consume the [page, index] pair left by [compile_lvalue]
+             in place. The pre-v11 [DUP2; INC; POP; POP] dance is
+             unnecessary — original and experimental compilers emit
+             just the two-op sequence. *)
+          self#compile_lvalue e;
+          self#write_instruction0 (incdec_instruction (op, e.ty))
+      | Unary (((PreInc | PreDec) as op), e) ->
           self#compile_lvalue e;
           self#write_instruction0 DUP2;
           self#write_instruction0 (incdec_instruction (op, e.ty));
@@ -2061,6 +2227,17 @@ class jaf_compiler ctx debug_info =
       | Seq (a, b) ->
           self#compile_expr_and_pop a;
           self#compile_expr_and_pop ~before_pop b
+      (* v11 [obj?.Method()] / [obj?.HllCall()] used as a statement: the
+         optional chain leaves a fat-null sentinel int on the stack
+         (0 for success, -1 for null) that must be discarded. The
+         expression's [ty] is [Void] (the called method returns void),
+         and the default [compile_pop Void] is a no-op — emit an
+         explicit [POP] so the stack stays balanced. *)
+      | Call ({ node = OptionalMember _; _ }, _, (MethodCall _ | HLLCall _))
+        when Ain.version ctx.ain > 8 && Poly.equal expr.ty Void ->
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP
       | DummyRef _ ->
           self#compile_lvalue expr;
           before_pop ();
