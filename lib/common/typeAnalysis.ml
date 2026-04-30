@@ -360,8 +360,8 @@ class type_analyze_visitor ctx =
             | FuncType _, (TyMethod _ | TyFunction _) -> true
             (* A [ref T] argument satisfies a plain [T] parameter; the
                reference is dereffed at call time. *)
-            | pt, Ref at when jaf_type_equal pt at -> true
-            | _ -> jaf_type_equal param.type_spec.ty arg_ty
+            | pt, Ref at when type_equal pt at -> true
+            | _ -> type_equal param.type_spec.ty arg_ty
           in
           let param_matches (fd : fundecl) =
             List.length fd.params = List.length arg_types
