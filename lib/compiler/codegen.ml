@@ -412,11 +412,26 @@ class jaf_compiler ctx debug_info =
     method member_type (expr : expression) =
       match expr.node with
       | Member
-          ( { ty = Struct (_, struct_no) | Ref (Struct (_, struct_no)); _ },
+          ( { ty =
+                Struct (_, struct_no)
+                | Ref (Struct (_, struct_no))
+                | Wrap (Struct (_, struct_no))
+                | Wrap (Ref (Struct (_, struct_no)));
+              _;
+            },
             _,
             ClassVariable member_no ) ->
           let struct_type = Ain.get_struct_by_index ctx.ain struct_no in
           (List.nth_exn struct_type.members member_no).value_type
+      | Member ({ ty = HLLParam | Ref HLLParam; _ }, _, _) ->
+          (* v11 [hll_param] member access: concrete struct type is
+             unknown at compile time (resolved by the HLL bridge at
+             runtime). Return [Int] as a placeholder. *)
+          Ain.Type.Int
+      | Member (_, _, UnresolvedMember) ->
+          (* typeAnalysis left this member unresolved (typically a
+             wildcard receiver). Fall through like above. *)
+          Ain.Type.Int
       | _ -> compiler_bug "member of non-struct" (Some (ASTExpression expr))
 
     method compile_lock_peek =
@@ -648,6 +663,14 @@ class jaf_compiler ctx debug_info =
          [OptionalMember] as an rvalue so the null-check AND the [.X]
          access happen — both are needed before [.Y] dereferences. *)
       | OptionalMember _ ->
+          self#compile_expression e
+      (* v11 HLL/method/func calls returning a [ref T] can be used as
+         an lvalue (e.g. [ref X y = call();] or [arr.EmplaceBack() =
+         value]). Compile the call and the returned reference sits on
+         the stack as the lvalue. typeAnalysis has already accepted
+         the call as a valid assignment target. *)
+      | Call (_, _, (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _))
+        ->
           self#compile_expression e
       | Member (obj, _, ClassMethod (name, no))
         when String.is_suffix name ~suffix:"::get"
@@ -989,9 +1012,43 @@ class jaf_compiler ctx debug_info =
           self#write_address_at true_addr current_address
       | Binary (op, a, b) -> (
           (match op with
+          (* v11 ref/wrap === / !== handling. See the operator case
+             below for the EQUALE-vs-R_EQUALE selection — together they
+             match alice.exe's emission. *)
           | RefEqual | RefNEqual ->
               self#compile_lvalue a;
-              self#compile_lvalue b
+              let lhs_is_call_or_dummy =
+                match a.node with
+                | Call _ | DummyRef _ -> true
+                | _ -> false
+              in
+              (match a.ty with
+              | Wrap (Struct _ | Array _ | HLLParam | Delegate _)
+                when Ain.version ctx.ain > 8 ->
+                  (* foreach loop var (typed [Wrap HLLParam] by the
+                     desugarer) over an array of struct/array/delegate
+                     refs: compile_lvalue_after's [Wrap _ -> ()] left
+                     raw page+slot on the stack — unwrap to the
+                     contained page-ref so EQUALE/NOTE compares
+                     identity at the right granularity. *)
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 REF
+              | Wrap (Int | Float | Bool | LongInt)
+                when Ain.version ctx.ain > 8 && lhs_is_call_or_dummy ->
+                  (* Wrap-of-scalar where the lhs is a ref-returning
+                     call (often via DummyRef): deref to the scalar so
+                     the rhs literal can be compared with EQUALE. *)
+                  self#write_instruction0 REF
+              | Ref t
+                when is_numeric t && Ain.version ctx.ain > 8
+                     && lhs_is_call_or_dummy ->
+                  self#write_instruction0 REF
+              | _ -> ());
+              (match b.ty with
+              | _ when (match b.node with This -> true | _ -> false) ->
+                  self#compile_lvalue b
+              | Ref _ -> self#compile_lvalue b
+              | _ -> self#compile_expression b)
           | _ ->
               self#compile_expression a;
               self#compile_expression b);
@@ -1059,11 +1116,29 @@ class jaf_compiler ctx debug_info =
               ( Minus | Times | Divide | BitOr | BitXor | BitAnd | LShift
               | RShift | LogOr | LogAnd ) ) ->
               compiler_bug "invalid string operator" (Some (ASTExpression expr))
-          | Ref t, RefEqual ->
-              self#write_instruction0
-                (if is_numeric t then R_EQUALE else EQUALE)
-          | Ref t, RefNEqual ->
-              self#write_instruction0 (if is_numeric t then R_NOTE else NOTE)
+          | (Ref t | Wrap t), RefEqual ->
+              (* For [ref_var === NULL]/[ref_var === other_ref], both
+                 sides are 2-slot fat-ref pairs and R_EQUALE compares
+                 ref identity. For [call_returning_ref() === literal]
+                 the case above dereffed the lhs to a scalar and we
+                 want the scalar EQUALE. *)
+              let lhs_is_call_or_dummy =
+                match a.node with
+                | Call _ | DummyRef _ -> true
+                | _ -> false
+              in
+              if is_numeric t && not lhs_is_call_or_dummy then
+                self#write_instruction0 R_EQUALE
+              else self#write_instruction0 EQUALE
+          | (Ref t | Wrap t), RefNEqual ->
+              let lhs_is_call_or_dummy =
+                match a.node with
+                | Call _ | DummyRef _ -> true
+                | _ -> false
+              in
+              if is_numeric t && not lhs_is_call_or_dummy then
+                self#write_instruction0 R_NOTE
+              else self#write_instruction0 NOTE
           | FuncType _, Equal -> self#write_instruction0 EQUALE
           | FuncType _, NEqual -> self#write_instruction0 NOTE
           | _ ->
@@ -1726,13 +1801,22 @@ class jaf_compiler ctx debug_info =
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression expr))
       | RvalueRef _ ->
           compiler_bug "RvalueRef in rvalue context" (Some (ASTExpression expr))
-      | DummyRef _ -> (
+      | DummyRef _ ->
           self#compile_lvalue expr;
-          match expr.ty with
-          | Ref (Struct (_, no)) -> self#write_instruction1 SR_REF2 no
-          | _ ->
-              compiler_bug "unexpected DummyRef type"
-                (Some (ASTExpression expr)))
+          (* In v11, [compile_lvalue]'s dummy-populate path already emits
+             the appropriate deref for struct/array dummies, so the stack
+             is already the shape [compile_expression] would have produced
+             via [SR_REF2]. Pre-v11 still needs [SR_REF2]. *)
+          if Ain.version ctx.ain > 8 then
+            (match expr.ty with
+            | Int | Float | Bool | LongInt | FuncType _ ->
+                self#write_instruction0 REF
+            | _ -> ())
+          else
+            (match expr.ty with
+            | Ref (Struct (_, no)) | Struct (_, no) ->
+                self#write_instruction1 SR_REF2 no
+            | _ -> ())
       | This -> (
           match expr.ty with
           | Struct (_, no) when Ain.version ctx.ain <= 8 ->
@@ -2642,10 +2726,20 @@ class jaf_compiler ctx debug_info =
                 compiler_bug "invalid delegate initval"
                   (Some (ASTVariable decl))
             | None -> self#write_instruction0 DG_CLEAR)
-        | Void | IMainSystem | HLLFunc2 | HLLParam | Wrap _ | Option _
+        (* v11 foreach desugar produces [Wrap T] loop-var slots and
+           sometimes [Void] placeholders; both are filled in by later
+           statements emitted by the desugarer, so the declaration
+           itself is a no-op. *)
+        | Wrap _ when Ain.version ctx.ain > 8 -> ()
+        | Void -> ()
+        | IMainSystem | HLLFunc2 | HLLParam | Wrap _ | Option _
         | Unknown87 _ | IFace _ | Enum2 _ | Enum _ | HLLFunc | Unknown98
         | IFaceWrap _ | Function | Method | NullType ->
-            compile_error "Unimplemented variable type" (ASTVariable decl)
+            compile_error
+              (Printf.sprintf "Unimplemented variable type: %s for `%s`"
+                 (jaf_type_to_string decl.type_spec.ty)
+                 decl.name)
+              (ASTVariable decl)
 
     (** Emit the code for a block of statements. *)
     method compile_block (stmts : statement list) =
