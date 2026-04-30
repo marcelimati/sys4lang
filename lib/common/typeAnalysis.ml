@@ -192,22 +192,40 @@ let type_check_numeric parent (actual : expression) =
       compiler_bug "tried to type check untyped expression" (Some parent)
   | _ -> type_error Int (Some actual) parent
 
-let type_check_member_lhs parent (actual : expression) =
+let type_check_member_lhs ?(v11 = false) parent (actual : expression) =
   match actual.ty with
   | Ref (Struct (name, _)) -> name
+  (* v11 [Wrap (Struct _)] / [Wrap (Ref Struct _)] are fat-ref encodings
+     that surface in HLL-returned struct expressions; member access on
+     them is legal. *)
+  | Wrap (Struct (name, _)) | Wrap (Ref (Struct (name, _))) when v11 -> name
   | Struct (name, _) -> (
+      let allowed_v11 = function
+        | Call _ | New _ | OptionalMember _ | NullCoalesce _ -> true
+        | _ -> false
+      in
       match actual.node with
       | Ident _ | Member _ | Subscript _ | This -> name
+      (* v11 permits chained member access on transient struct values
+         returned by calls / [new T()] / [obj?.X] / [a ?? b]. *)
+      | n when v11 && allowed_v11 n -> name
       | _ ->
           compile_error "Member access not allowed for temporary object" parent)
   | Untyped ->
       compiler_bug "tried to type check untyped expression" (Some parent)
   | _ -> type_error (Struct ("struct", 0)) (Some actual) parent
 
-let check_not_array e =
+let check_not_array (e : expression) =
   match e.ty with
-  | Array _ | Ref (Array _) ->
-      compile_error "array expression not allowed here" (ASTExpression e)
+  | Array _ | Ref (Array _) -> (
+      (* v11: an array-typed expression is allowed at statement
+         position when it carries an intentional side effect — a call
+         (chainable HLL methods like [arr.AscSort()]) or an assignment
+         (array copy-assign). Pre-v11 didn't have these patterns. *)
+      match e.node with
+      | Call _ | Assign _ -> ()
+      | _ ->
+          compile_error "array expression not allowed here" (ASTExpression e))
   | _ -> ()
 
 (* Substitute the polymorphic [HLLParam] wildcard with the concrete
@@ -591,7 +609,11 @@ class type_analyze_visitor ctx =
       let check = type_check (ASTExpression expr) in
       let check_numeric = type_check_numeric (ASTExpression expr) in
       let coerce_numerics = type_coerce_numerics (ASTExpression expr) in
-      let check_member_lhs = type_check_member_lhs (ASTExpression expr) in
+      let check_member_lhs =
+        type_check_member_lhs
+          ~v11:(Ain.version_gte ctx.ain (11, 0))
+          (ASTExpression expr)
+      in
       let check_expr (a : expression) b = check a.ty b in
       (* check function call arguments *)
       let check_call name params args =
