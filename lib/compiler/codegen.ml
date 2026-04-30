@@ -861,6 +861,11 @@ class jaf_compiler ctx debug_info =
       | Member (_, _, UnresolvedMember) ->
           compiler_bug "member expression has no member_type"
             (Some (ASTExpression expr))
+      | Member (_, _, ClassProperty _) ->
+          (* Type analysis rewrites reads/writes on property members
+             into explicit get/set method calls before codegen runs. *)
+          compiler_bug "property member expression not rewritten"
+            (Some (ASTExpression expr))
       (* regular function call *)
       | Call (_, args, FunctionCall function_no) ->
           let f = Ain.get_function_by_index ctx.ain function_no in
@@ -1458,6 +1463,14 @@ class jaf_compiler ctx debug_info =
               | MemberDecl _ -> () (* TODO: member initvals? *)
               | Constructor f | Destructor f | Method f ->
                   if Option.is_some f.body then self#compile_function f
+              | PropertyDecl _ ->
+                  (* [Declarations.expand_property_decl] rewrites
+                     [PropertyDecl] into a backing-field [MemberDecl]
+                     plus synthesized [Method] decls before codegen
+                     runs, so a [PropertyDecl] still here means the
+                     expansion was skipped. *)
+                  compiler_bug "PropertyDecl not expanded before codegen"
+                    None
             in
             List.iter d.decls ~f:compile_struct_decl
         | Enum e ->

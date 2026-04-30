@@ -58,11 +58,27 @@ let lambda_context lambdas =
     lambdas;
   }
 
+(* v11 property: methods named [Name::get] (returning T, no params) and/or
+   [Name::set] (taking a single T parameter), synthesized by the original
+   compiler from a [T Name { get; set; }] block. Either accessor may exist
+   alone for read-only / write-only forms. [prop_is_auto] is true when
+   both accessors' bodies are the trivial shape reading/writing the
+   compiler-generated [<Name>] backing field — those round-trip as the
+   declaration [T Name { get; set; }] with no implementation. *)
+type property_def = {
+  prop_name : string;
+  prop_type : Type.ain_type;
+  prop_get : function_t option;
+  prop_set : function_t option;
+  prop_is_auto : bool;
+}
+
 type struct_t = {
   struc : Ain.Struct.t;
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable properties : property_def list;
 }
 
 type enum_t = { name : string; mutable values : (string * int32) list }
@@ -764,6 +780,16 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       self#with_indent (fun () -> loop 0);
       self#println "};"
 
+    (* v11 auto-property prototype: round-trips as the C# auto-property
+       shape [T Name { get; set; }]. Read-only properties omit [set;];
+       write-only ones omit [get;]. *)
+    method private print_property_prototype (p : property_def) =
+      self#print_indent;
+      bprintf out "%a %s {" self#pr_type p.prop_type p.prop_name;
+      Option.iter p.prop_get ~f:(fun _ -> print_string out " get;");
+      Option.iter p.prop_set ~f:(fun _ -> print_string out " set;");
+      self#println " }"
+
     method private print_class_decl (struc : struct_t) =
       bprintf out "class %s" struc.struc.name;
       if not (Array.is_empty struc.struc.interfaces) then (
@@ -775,11 +801,23 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           (Array.to_list struc.struc.interfaces));
       self#println " {";
       self#println "public:";
+      (* Suppress backing fields named [<Name>] for auto-implemented
+         properties — those fields are an implementation detail of
+         [T Name { get; set; }] that the compiler re-synthesizes
+         on lowering, and the surface form would be unparseable. *)
+      let property_backing_field_names =
+        let s = Hash_set.create (module String) in
+        List.iter struc.properties ~f:(fun (p : property_def) ->
+            if p.prop_is_auto then
+              Hash_set.add s ("<" ^ p.prop_name ^ ">"));
+        s
+      in
       self#with_indent (fun () ->
           Stack.push current_function (lambda_context struc.initval_lambdas);
           List.iter struc.members ~f:(fun v ->
               match v.v.type_ with
               | Void -> ()
+              | _ when Hash_set.mem property_backing_field_names v.v.name -> ()
               | _ ->
                   self#print_indent;
                   self#pr_vardecl out v.v;
@@ -790,6 +828,13 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           Stack.pop_exn current_function |> ignore;
           if
             (not (Array.is_empty struc.struc.members))
+            && (not (List.is_empty struc.methods)
+               || not (List.is_empty struc.properties))
+          then self#print_newline;
+          List.iter struc.properties ~f:(fun p ->
+              self#print_property_prototype p);
+          if
+            (not (List.is_empty struc.properties))
             && not (List.is_empty struc.methods)
           then self#print_newline;
           List.iter struc.methods ~f:(fun func ->

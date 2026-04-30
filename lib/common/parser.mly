@@ -554,6 +554,14 @@ struct_declaration
   | declaration_specifiers separated_nonempty_list(COMMA, declarator(IDENTIFIER)) SEMICOLON
     { let vars = vardecls ClassVar false $1 $2 in
       MemberDecl { decl_loc=$sloc; typespec=$1; is_const_decls = false; vars } }
+  | declaration_specifiers IDENTIFIER LBRACE property_accessor_decl+ RBRACE
+    (* v11 property declaration: `T Name { get; set; }`, or subsets for
+       read-only / write-only. Accessor names are validated (only `get`
+       and `set` are legal) and expanded into a `<Name>` backing field
+       plus synthetic get/set methods by the declaration-analysis pass. *)
+    { PropertyDecl
+        { pd_loc = $sloc; pd_typespec = $1; pd_name = $2;
+          pd_accessors = $4 } }
   | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
     { Method (func $sloc $1 $2 $3 $4) }
   | IDENTIFIER LPAREN VOID? RPAREN opt_body
@@ -570,4 +578,8 @@ access_specifier
 opt_body
   : SEMICOLON { None }
   | block { Some $1 }
+  ;
+
+property_accessor_decl
+  : IDENTIFIER SEMICOLON { ($1, $loc($1)) }
   ;

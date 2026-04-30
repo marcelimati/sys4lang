@@ -21,6 +21,148 @@ open CompileError
 
 let lambda_index = ref 0
 
+(* Expand a v11 property declaration `T Name { get; set; }` into the
+   struct_declaration items the later passes expect: a `<Name>` backing
+   field plus synthetic `Name::get` / `Name::set` methods with trivial
+   bodies that read/write the backing field. Read-only / write-only
+   forms omit the missing accessor. *)
+let expand_property_decl (p : property_decl) : struct_declaration list =
+  let loc = p.pd_loc in
+  let ty = p.pd_typespec in
+  let mangled_name = "<" ^ p.pd_name ^ ">" in
+  let has_get = ref false in
+  let has_set = ref false in
+  List.iter p.pd_accessors ~f:(fun (name, _aloc) ->
+      match name with
+      | "get" ->
+          if !has_get then compile_error "duplicate `get` accessor" (ASTType ty);
+          has_get := true
+      | "set" ->
+          if !has_set then compile_error "duplicate `set` accessor" (ASTType ty);
+          has_set := true
+      | other ->
+          compile_error
+            (Printf.sprintf
+               "unknown property accessor `%s` (expected `get` or `set`)" other)
+            (ASTType ty));
+  let backing_field : variable =
+    {
+      name = mangled_name;
+      location = loc;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = ClassVar;
+      type_spec = ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let backing_decl : struct_declaration =
+    MemberDecl
+      {
+        decl_loc = loc;
+        is_const_decls = false;
+        typespec = ty;
+        vars = [ backing_field ];
+      }
+  in
+  let void_ts = { ty = Void; location = loc } in
+  let mangled_member () =
+    make_expr ~loc (Member (make_expr ~loc This, mangled_name, UnresolvedMember))
+  in
+  let get_body () =
+    Some [ { node = Return (Some (mangled_member ())); delete_vars = []; loc } ]
+  in
+  let set_body () =
+    let lhs = mangled_member () in
+    let rhs = make_expr ~loc (Ident ("value", UnresolvedIdent)) in
+    let assign = make_expr ~loc (Assign (EqAssign, lhs, rhs)) in
+    Some [ { node = Expression assign; delete_vars = []; loc } ]
+  in
+  let value_param : variable =
+    {
+      name = "value";
+      location = loc;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = Parameter;
+      type_spec = ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let get_decl =
+    if !has_get then
+      [
+        Method
+          {
+            name = p.pd_name ^ "::get";
+            loc;
+            return = ty;
+            params = [];
+            body = get_body ();
+            is_label = false;
+            is_lambda = false;
+            is_private = false;
+            index = None;
+            class_name = None;
+            class_index = None;
+          };
+      ]
+    else []
+  in
+  let set_decl =
+    if !has_set then
+      [
+        Method
+          {
+            name = p.pd_name ^ "::set";
+            loc;
+            return = void_ts;
+            params = [ value_param ];
+            body = set_body ();
+            is_label = false;
+            is_lambda = false;
+            is_private = false;
+            index = None;
+            class_name = None;
+            class_index = None;
+          };
+      ]
+    else []
+  in
+  [ backing_decl ] @ get_decl @ set_decl
+
+(* Expand v11 [PropertyDecl] entries in a struct's declaration list,
+   collecting [property_info] entries for the containing struct's
+   [properties] table. The expanded list keeps the original ordering;
+   [property_info] entries are returned in source order so type
+   analysis can preserve roundtrip stability. *)
+let expand_struct_decls (decls : struct_declaration list) :
+    struct_declaration list * (string * property_info) list =
+  let infos = ref [] in
+  let expanded =
+    List.concat_map decls ~f:(function
+      | PropertyDecl p ->
+          let decls = expand_property_decl p in
+          let find_method suffix =
+            List.find_map decls ~f:(function
+              | Method f when String.is_suffix f.name ~suffix -> Some f
+              | _ -> None)
+          in
+          let prop_getter = find_method "::get" in
+          let prop_setter = find_method "::set" in
+          let info =
+            { prop_typespec = p.pd_typespec; prop_getter; prop_setter }
+          in
+          infos := (p.pd_name, info) :: !infos;
+          decls
+      | other -> [ other ])
+  in
+  (expanded, List.rev !infos)
+
 (*
  * AST pass over top-level declarations register names in the .ain file.
  *)
@@ -151,7 +293,19 @@ class type_declare_visitor ctx =
                         compile_error "duplicate member variable declaration"
                           (ASTVariable v)
                     | `Ok -> ())
+            | PropertyDecl _ ->
+                (* [expand_struct_decls] has rewritten these into their
+                   [MemberDecl] + [Method] components before we iterate. *)
+                ()
           in
+          (* Lower v11 properties to their backing field + synthetic
+             accessor methods, and record property metadata on [jaf_s]
+             so type analysis can rewrite [obj.Name] / [obj.Name = v]
+             into accessor calls. *)
+          let expanded, prop_infos = expand_struct_decls s.decls in
+          s.decls <- expanded;
+          List.iter prop_infos ~f:(fun (name, info) ->
+              Hashtbl.set jaf_s.properties ~key:name ~data:info);
           List.iter s.decls ~f:visit_decl;
           match Hashtbl.add ctx.structs ~key:s.name ~data:jaf_s with
           | `Duplicate ->

@@ -32,11 +32,20 @@ type function_t = {
   lambdas : function_t list;
 }
 
+type property_def = {
+  prop_name : string;
+  prop_type : Type.ain_type;
+  prop_get : function_t option;
+  prop_set : function_t option;
+  prop_is_auto : bool;
+}
+
 type struct_t = {
   struc : Ain.Struct.t;
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable properties : property_def list;
 }
 
 type debug_info

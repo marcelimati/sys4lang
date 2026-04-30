@@ -106,6 +106,15 @@ let ft_compatible (args, ret) (args', ret') =
   && List.length args = List.length args'
   && List.for_all2_exn args args' ~f:jaf_type_equal
 
+(* Overload identity: two methods overload each other only if their
+   parameter types differ. Return type is not part of the signature
+   (C-like / Java-like rule). If parameters are identical, the two
+   decls are "the same method" — one is either a prototype, the body,
+   or an actual duplicate. *)
+let params_compatible a b =
+  List.length a = List.length b
+  && List.for_all2_exn a b ~f:jaf_type_equal
+
 let is_scalar = function
   | Int | Bool | Float | LongInt | FuncType _ -> true
   | _ -> false
@@ -142,6 +151,15 @@ type member_type =
   | ClassVariable of int
   | ClassConst of string
   | ClassMethod of string * int
+  (* v11 property access. Type analysis rewrites reads into a call
+     to the getter and assignments into a call to the setter, so
+     later passes never encounter this variant. *)
+  | ClassProperty of {
+      prop_class : string;
+      prop_name : string;
+      prop_getter_index : int option;
+      prop_setter_index : int option;
+    }
   | HLLFunction of string * string
   | SystemFunction of Bytecode.syscall
   | BuiltinMethod of Bytecode.builtin
@@ -290,18 +308,32 @@ let mangled_name fdecl =
 
 type access_specifier = Public | Private
 
+(* v11 property declaration inside a class body: `T Name { get; set; }`.
+   Expanded at declaration-analysis time into a mangled backing field
+   `<Name>` plus synthetic get/set methods, matching what the original
+   v11 compiler emits. [pd_accessors] lists the accessor names in
+   source order, validated at expansion time (only `get`/`set` are
+   legal). *)
+type property_decl = {
+  pd_loc : location;
+  pd_typespec : type_specifier;
+  pd_name : string;
+  pd_accessors : (string * location) list;
+}
+
 type struct_declaration =
   | AccessSpecifier of access_specifier
   | MemberDecl of vardecls
   | Constructor of fundecl
   | Destructor of fundecl
   | Method of fundecl
+  | PropertyDecl of property_decl
 
 type structdecl = {
   name : string;
   is_class : bool;
   loc : location;
-  decls : struct_declaration list;
+  mutable decls : struct_declaration list;
 }
 
 type enumdecl = {
@@ -348,18 +380,45 @@ let ast_node_pos = function
       | MemberDecl d -> d.decl_loc
       | Constructor f -> f.loc
       | Destructor f -> f.loc
-      | Method f -> f.loc)
+      | Method f -> f.loc
+      | PropertyDecl p -> p.pd_loc)
   | ASTType t -> t.location
+
+(* v11 property metadata recorded on a class during declaration
+   analysis: each property has a type, an optional getter method,
+   and an optional setter method (each declared as `Name::get` /
+   `Name::set` in the function table). Use sites `obj.Name`
+   dispatch through the methods. See [Declarations.expand_property_decl]
+   for the lowering from [PropertyDecl]. *)
+type property_info = {
+  (* Reference to the mutable [type_specifier] from the original
+     [PropertyDecl] so later type-resolution passes (which mutate
+     the type_specifier in place to turn [Unresolved] into [Struct _]
+     etc.) are reflected here too. *)
+  prop_typespec : type_specifier;
+  prop_getter : fundecl option;
+  prop_setter : fundecl option;
+}
+
+(* Helper for callers that just want the resolved type. *)
+let prop_info_ty (p : property_info) = p.prop_typespec.ty
 
 type jaf_struct = {
   name : string;
   loc : location;
   index : int;
   members : (string, variable) Hashtbl.t;
+  properties : (string, property_info) Hashtbl.t;
 }
 
 let new_jaf_struct name loc index =
-  { name; loc; index; members = Hashtbl.create (module String) }
+  {
+    name;
+    loc;
+    index;
+    members = Hashtbl.create (module String);
+    properties = Hashtbl.create (module String);
+  }
 
 type library = { hll_name : string; functions : (string, fundecl) Hashtbl.t }
 
@@ -608,6 +667,10 @@ class ivisitor ctx =
       | Constructor f -> self#visit_fundecl f
       | Destructor f -> self#visit_fundecl f
       | Method f -> self#visit_fundecl f
+      | PropertyDecl _ ->
+          (* Lowered to a backing field + synthetic methods at
+             declaration analysis time; nothing to visit here. *)
+          ()
 
     method visit_type_specifier (_t : type_specifier) = ()
     method visit_toplevel decls = List.iter decls ~f:self#visit_declaration
@@ -836,6 +899,14 @@ let sdecl_to_string = function
       let params = params_to_string d.params in
       let body = body_to_string d.body in
       sprintf "%s %s%s%s" return d.name params body
+  | PropertyDecl p ->
+      let accessors =
+        List.map p.pd_accessors ~f:(fun (a, _) -> a ^ ";")
+        |> String.concat ~sep:" "
+      in
+      sprintf "%s %s { %s }"
+        (jaf_type_to_string p.pd_typespec.ty)
+        p.pd_name accessors
 
 let decl_to_string d =
   match d with
@@ -1234,6 +1305,7 @@ let context_from_ain ?(constants : variable list = []) ain =
           loc = dummy_location;
           index = s.index;
           members = Hashtbl.create (module String);
+          properties = Hashtbl.create (module String);
         }
       in
       List.iter s.members ~f:(function

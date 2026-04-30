@@ -234,6 +234,101 @@ let process_generated_constructors (structs : CodeGen.struct_t array)
           (fname, funcs));
   }
 
+(* Detect v11 property method groups on a struct: methods named
+   [Name::get] (returning T) and/or [Name::set(T)]. Either may exist
+   alone (read-only / write-only). Classified as "auto-implemented"
+   when both accessor bodies are the trivial shape reading/writing a
+   [<Name>] backing field — those are emitted as [T Name { get; set; }]
+   with no implementation block. Returns
+   [(property_defs, remaining_methods)]. *)
+let extract_property_defs (methods : CodeGen.function_t list) :
+    CodeGen.property_def list * CodeGen.function_t list =
+  let split_accessor name =
+    match String.chop_suffix name ~suffix:"::get" with
+    | Some base -> Some (base, `Get)
+    | None -> (
+        match String.chop_suffix name ~suffix:"::set" with
+        | Some base -> Some (base, `Set)
+        | None -> None)
+  in
+  let gets = Hashtbl.create (module String) in
+  let sets = Hashtbl.create (module String) in
+  let others = ref [] in
+  (* Order-preserving set of property names: methods are scanned in
+     function-table order, so the first [Name::get] (or [Name::set]
+     when get is absent) seen determines the property's position in
+     the output. Hashtbl iteration would scramble ordering and shift
+     where backing fields land. *)
+  let ordered_names = ref [] in
+  let seen_names = Hash_set.create (module String) in
+  let record_name base =
+    if not (Hash_set.mem seen_names base) then (
+      Hash_set.add seen_names base;
+      ordered_names := base :: !ordered_names)
+  in
+  List.iter methods ~f:(fun (m : CodeGen.function_t) ->
+      match split_accessor m.name with
+      | Some (base, `Get) ->
+          Hashtbl.set gets ~key:base ~data:m;
+          record_name base
+      | Some (base, `Set) ->
+          Hashtbl.set sets ~key:base ~data:m;
+          record_name base
+      | None -> others := m :: !others);
+  let properties = ref [] in
+  List.iter (List.rev !ordered_names) ~f:(fun base ->
+      let get = Hashtbl.find gets base in
+      let set = Hashtbl.find sets base in
+      let prop_type =
+        match get with
+        | Some g -> g.func.return_type
+        | None -> (
+            match set with
+            | Some s -> (
+                match Ain.Function.args s.func with
+                | [ p ] -> p.type_
+                | _ -> Type.Void)
+            | None -> Type.Void)
+      in
+      let single_stmt body =
+        match body with
+        | Ast.Block [ s ] -> Some s.txt
+        | s -> Some s
+      in
+      let mangled_field = "<" ^ base ^ ">" in
+      let is_trivial_get (g : CodeGen.function_t) =
+        match single_stmt g.body.txt with
+        | Some (Ast.Return (Some (Ast.Deref (Ast.PageRef (Ast.StructPage, v)))))
+          ->
+            String.equal v.name mangled_field
+        | _ -> false
+      in
+      let is_trivial_set (s : CodeGen.function_t) =
+        match single_stmt s.body.txt with
+        | Some (Ast.Expression
+                  (Ast.AssignOp (_, Ast.PageRef (Ast.StructPage, v), _))) ->
+            String.equal v.name mangled_field
+        | _ -> false
+      in
+      let prop_is_auto =
+        match (get, set) with
+        | Some g, Some s -> is_trivial_get g && is_trivial_set s
+        | Some g, None -> is_trivial_get g
+        | None, Some s -> is_trivial_set s
+        | None, None -> false
+      in
+      properties :=
+        CodeGen.
+          {
+            prop_name = base;
+            prop_type;
+            prop_get = get;
+            prop_set = set;
+            prop_is_auto;
+          }
+        :: !properties);
+  (List.rev !properties, List.rev !others)
+
 let decompile ~move_to_original_file ~continue_on_error =
   let code = Instructions.decode Ain.ain.code in
   let code = CodeSection.preprocess_ain_v0 code in
@@ -246,6 +341,7 @@ let decompile ~move_to_original_file ~continue_on_error =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            properties = [];
           })
   in
   let global_lambdas = ref [] in
@@ -302,7 +398,29 @@ let decompile ~move_to_original_file ~continue_on_error =
         List.iter funcs ~f:process_func;
         (fname, List.rev !decompiled_funcs))
   in
-  Array.iter structs ~f:(fun s -> s.methods <- List.rev s.methods);
+  Array.iter structs ~f:(fun s ->
+      let methods_in_order = List.rev s.methods in
+      let properties, remaining = extract_property_defs methods_in_order in
+      s.methods <- remaining;
+      s.properties <- properties);
+  (* Auto-implemented properties round-trip purely via the
+     [T Name { get; set; }] declaration in classes.jaf. Drop both
+     accessor functions from [srcs] so the per-class .jaf doesn't
+     also emit their bodies. *)
+  let dropped_func_ids = Hash_set.create (module Int) in
+  Array.iter structs ~f:(fun s ->
+      List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
+          if p.prop_is_auto then (
+            Option.iter p.prop_get ~f:(fun g ->
+                Hash_set.add dropped_func_ids g.func.id);
+            Option.iter p.prop_set ~f:(fun set ->
+                Hash_set.add dropped_func_ids set.func.id))));
+  let srcs =
+    List.map srcs ~f:(fun (fname, funcs) ->
+        ( fname,
+          List.filter funcs ~f:(fun (f : CodeGen.function_t) ->
+              not (Hash_set.mem dropped_func_ids f.func.id)) ))
+  in
   let ain_minor_version = determine_ain_minor_version code in
   {
     srcs;
@@ -325,6 +443,7 @@ let inspect funcname ~print_addr =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            properties = [];
           })
   in
   let CodeSection.{ files; lambdas } =

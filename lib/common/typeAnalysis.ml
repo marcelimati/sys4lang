@@ -380,7 +380,7 @@ class type_analyze_visitor ctx =
           (List.init nr_params ~f:(fun i -> i))
           args params ~f:check_arg
       in
-      match expr.node with
+      (match expr.node with
       | ConstInt _ -> expr.ty <- Int
       | ConstFloat _ -> expr.ty <- Float
       | ConstChar _ -> expr.ty <- Int
@@ -523,6 +523,78 @@ class type_analyze_visitor ctx =
                   | Ref t -> ref_type_check (ASTExpression expr) t b
                   | _ -> not_an_lvalue_error a (ASTExpression expr)));
               expr.ty <- Int)
+      (* v11 property write — write-only path. The LHS is still a
+         [Member ClassProperty] because the getter rewrite at the end
+         of [visit_expression] only fires when a getter exists. *)
+      | Assign (_, ({ node = Member (obj, _, ClassProperty prop); _ }), rhs) ->
+          (match prop.prop_setter_index with
+          | Some setter_idx ->
+              let class_idx =
+                match obj.ty with
+                | Struct (_, i) | Ref (Struct (_, i)) -> i
+                | _ -> -1
+              in
+              let setter_name =
+                prop.prop_class ^ "@" ^ prop.prop_name ^ "::set"
+              in
+              let setter_expr =
+                make_expr ~ty:Void ~loc:expr.loc
+                  (Member
+                     ( obj,
+                       prop.prop_name ^ "::set",
+                       ClassMethod (setter_name, setter_idx) ))
+              in
+              expr.node <-
+                Call
+                  (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
+              expr.ty <- Void
+          | None ->
+              compile_error
+                (sprintf "property `%s.%s` has no accessors" prop.prop_class
+                   prop.prop_name)
+                (ASTExpression expr))
+      (* v11 property write — read-already-rewritten path. The child-first
+         traversal has already turned [obj.Name] into [obj.Name::get()],
+         so the LHS is a [Call (Member ClassMethod _::get, [], _)]. The
+         paired setter has the same prefix with [::set]. *)
+      | Assign
+          ( _,
+            ({
+               node =
+                 Call
+                   ( { node = Member (obj, _, ClassMethod (getter_name, _)); _ },
+                     _,
+                     _ );
+               _;
+             } as lhs),
+            rhs )
+        when String.is_suffix getter_name ~suffix:"::get" ->
+          let prefix = String.drop_suffix getter_name 5 in
+          let setter_name = prefix ^ "::set" in
+          (match Hashtbl.find ctx.functions setter_name with
+          | Some f ->
+              let class_idx = Option.value_exn f.class_index in
+              let setter_idx = Option.value_exn f.index in
+              let surface_name =
+                String.rsplit2 setter_name ~on:'@'
+                |> Option.value_map ~default:setter_name ~f:snd
+              in
+              let setter_expr =
+                make_expr ~ty:Void ~loc:lhs.loc
+                  (Member (obj, surface_name, ClassMethod (setter_name, setter_idx)))
+              in
+              expr.node <-
+                Call
+                  (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
+              expr.ty <- Void
+          | None ->
+              let prop_name =
+                String.rsplit2 prefix ~on:'@'
+                |> Option.value_map ~default:prefix ~f:snd
+              in
+              compile_error
+                (sprintf "property `%s` is read-only" prop_name)
+                (ASTExpression expr))
       | Assign (op, lhs, rhs) -> (
           self#check_lvalue lhs (ASTExpression expr);
           maybe_deref lhs;
@@ -623,32 +695,58 @@ class type_analyze_visitor ctx =
                   (sprintf "%s::%s is not public" struc.name member_name)
                   (ASTExpression expr)
           in
-          match Hashtbl.find struc.members member_name with
-          | Some member ->
-              if member.is_private then access_check ();
+          (* v11 property resolution: a property registered on the class
+             takes precedence over a member of the same name. The Member
+             node is tagged with [ClassProperty]; reads are rewritten
+             into getter calls at the end of [visit_expression], writes
+             are intercepted in the [Assign] arm. *)
+          match Hashtbl.find struc.properties member_name with
+          | Some (info : property_info) ->
+              let getter_index =
+                Option.bind info.prop_getter ~f:(fun f -> f.index)
+              in
+              let setter_index =
+                Option.bind info.prop_setter ~f:(fun f -> f.index)
+              in
               expr.node <-
                 Member
                   ( obj,
                     member_name,
-                    if member.is_const then ClassConst struc.name
-                    else ClassVariable (Option.value_exn member.index) );
-              expr.ty <- member.type_spec.ty
+                    ClassProperty
+                      {
+                        prop_class = struc.name;
+                        prop_name = member_name;
+                        prop_getter_index = getter_index;
+                        prop_setter_index = setter_index;
+                      } );
+              expr.ty <- prop_info_ty info
           | None -> (
-              let fun_name = struc.name ^ "@" ^ member_name in
-              match Hashtbl.find ctx.functions fun_name with
-              | Some f ->
-                  if f.is_private then access_check ();
+              match Hashtbl.find struc.members member_name with
+              | Some member ->
+                  if member.is_private then access_check ();
                   expr.node <-
                     Member
                       ( obj,
                         member_name,
-                        ClassMethod (fun_name, Option.value_exn f.index) );
-                  expr.ty <- TyMethod (ft_of_fundecl f)
-              | None ->
-                  (* TODO: separate error type for this? *)
-                  undefined_variable_error
-                    (struc.name ^ "." ^ member_name)
-                    (ASTExpression expr)))
+                        if member.is_const then ClassConst struc.name
+                        else ClassVariable (Option.value_exn member.index) );
+                  expr.ty <- member.type_spec.ty
+              | None -> (
+                  let fun_name = struc.name ^ "@" ^ member_name in
+                  match Hashtbl.find ctx.functions fun_name with
+                  | Some f ->
+                      if f.is_private then access_check ();
+                      expr.node <-
+                        Member
+                          ( obj,
+                            member_name,
+                            ClassMethod (fun_name, Option.value_exn f.index) );
+                      expr.ty <- TyMethod (ft_of_fundecl f)
+                  | None ->
+                      (* TODO: separate error type for this? *)
+                      undefined_variable_error
+                        (struc.name ^ "." ^ member_name)
+                        (ASTExpression expr))))
       (* regular function call *)
       | Call (({ node = Ident (_, FunctionName name); _ } as e), args, _) ->
           let f = Hashtbl.find_exn ctx.functions name in
@@ -784,7 +882,36 @@ class type_analyze_visitor ctx =
               let inner = clone_expr b in
               b.node <- RvalueRef inner
           | _ -> ());
-          expr.ty <- (match a.ty with Ref t -> t | t -> t)
+          expr.ty <- (match a.ty with Ref t -> t | t -> t));
+      (* v11 property read: any [Member] still tagged with [ClassProperty]
+         after the main resolution pass is being used as an rvalue
+         (assignment LHS handling above rewrites the whole [Assign]).
+         Rewrite to a getter call. Write-only properties (no getter)
+         leave the [Member ClassProperty] in place; the surrounding
+         [Assign] picks it up via the [Member ClassProperty] arm. *)
+      (match expr.node with
+      | Member (obj, _, ClassProperty prop) -> (
+          match prop.prop_getter_index with
+          | Some getter_idx ->
+              let class_idx =
+                match obj.ty with
+                | Struct (_, i) | Ref (Struct (_, i)) -> i
+                | _ -> -1
+              in
+              let getter_name =
+                prop.prop_class ^ "@" ^ prop.prop_name ^ "::get"
+              in
+              let getter_expr =
+                make_expr ~ty:expr.ty ~loc:expr.loc
+                  (Member
+                     ( obj,
+                       prop.prop_name ^ "::get",
+                       ClassMethod (getter_name, getter_idx) ))
+              in
+              expr.node <-
+                Call (getter_expr, [], MethodCall (class_idx, getter_idx))
+          | None -> ())
+      | _ -> ())
 
     method! visit_statement stmt =
       self#catch_errors (fun () ->
