@@ -562,6 +562,13 @@ struct_declaration
     { PropertyDecl
         { pd_loc = $sloc; pd_typespec = $1; pd_name = $2;
           pd_accessors = $4 } }
+  | EVENT declaration_specifiers IDENTIFIER SEMICOLON
+    (* v11 event declaration. Lowers to a delegate-typed [<Name>]
+       backing member plus prototype-only [Name::add(T value)] /
+       [Name::remove(T value)] methods. Use sites [obj.Name += h] /
+       [obj.Name -= h] dispatch through delegate-add/remove on the
+       backing field. *)
+    { EventDecl { ed_loc = $sloc; ed_typespec = $2; ed_name = $3 } }
   | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
     { Method (func $sloc $1 $2 $3 $4) }
   | IDENTIFIER LPAREN VOID? RPAREN opt_body

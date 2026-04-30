@@ -32,6 +32,13 @@ type function_t = {
   lambdas : function_t list;
 }
 
+type event_pair = {
+  ev_name : string;
+  ev_type : Type.ain_type;
+  ev_add : function_t;
+  ev_remove : function_t;
+}
+
 type property_def = {
   prop_name : string;
   prop_type : Type.ain_type;
@@ -45,6 +52,7 @@ type struct_t = {
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable events : event_pair list;
   mutable properties : property_def list;
 }
 

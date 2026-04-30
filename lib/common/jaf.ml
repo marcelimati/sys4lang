@@ -321,6 +321,19 @@ type property_decl = {
   pd_accessors : (string * location) list;
 }
 
+(* v11 event declaration inside a class body: `event T Name;`. Expanded
+   at declaration-analysis time into a delegate-typed mangled backing
+   field `<Name>` plus prototype-only [Name::add(T value)] and
+   [Name::remove(T value)] methods (kept body-less; the original compiler
+   emits matching function-table entries that the runtime never invokes
+   for auto-events — [+= h] / [-= h] dispatch lowers to direct delegate
+   ops on the [<Name>] field). *)
+type event_decl = {
+  ed_loc : location;
+  ed_typespec : type_specifier;
+  ed_name : string;
+}
+
 type struct_declaration =
   | AccessSpecifier of access_specifier
   | MemberDecl of vardecls
@@ -328,6 +341,7 @@ type struct_declaration =
   | Destructor of fundecl
   | Method of fundecl
   | PropertyDecl of property_decl
+  | EventDecl of event_decl
 
 type structdecl = {
   name : string;
@@ -381,7 +395,8 @@ let ast_node_pos = function
       | Constructor f -> f.loc
       | Destructor f -> f.loc
       | Method f -> f.loc
-      | PropertyDecl p -> p.pd_loc)
+      | PropertyDecl p -> p.pd_loc
+      | EventDecl e -> e.ed_loc)
   | ASTType t -> t.location
 
 (* v11 property metadata recorded on a class during declaration
@@ -667,7 +682,7 @@ class ivisitor ctx =
       | Constructor f -> self#visit_fundecl f
       | Destructor f -> self#visit_fundecl f
       | Method f -> self#visit_fundecl f
-      | PropertyDecl _ ->
+      | PropertyDecl _ | EventDecl _ ->
           (* Lowered to a backing field + synthetic methods at
              declaration analysis time; nothing to visit here. *)
           ()
@@ -907,6 +922,10 @@ let sdecl_to_string = function
       sprintf "%s %s { %s }"
         (jaf_type_to_string p.pd_typespec.ty)
         p.pd_name accessors
+  | EventDecl e ->
+      sprintf "event %s %s"
+        (jaf_type_to_string e.ed_typespec.ty)
+        e.ed_name
 
 let decl_to_string d =
   match d with

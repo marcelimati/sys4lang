@@ -695,6 +695,23 @@ class type_analyze_visitor ctx =
                   (sprintf "%s::%s is not public" struc.name member_name)
                   (ASTExpression expr)
           in
+          (* v11 auto-event lookup: [obj.Name] for a class-declared
+             [event T Name;] hits the mangled [<Name>] backing field
+             when no plain member matches. Restricted to delegate-typed
+             fields so other [<…>]-named lowered constructs (e.g.
+             property backing slots) aren't misidentified as events. *)
+          let lookup_member name =
+            match Hashtbl.find struc.members name with
+            | Some _ as v -> v
+            | None -> (
+                match Hashtbl.find struc.members ("<" ^ name ^ ">") with
+                | Some m
+                  when (match m.type_spec.ty with
+                        | Delegate _ -> true
+                        | _ -> false) ->
+                    Some m
+                | _ -> None)
+          in
           (* v11 property resolution: a property registered on the class
              takes precedence over a member of the same name. The Member
              node is tagged with [ClassProperty]; reads are rewritten
@@ -721,13 +738,13 @@ class type_analyze_visitor ctx =
                       } );
               expr.ty <- prop_info_ty info
           | None -> (
-              match Hashtbl.find struc.members member_name with
+              match lookup_member member_name with
               | Some member ->
                   if member.is_private then access_check ();
                   expr.node <-
                     Member
                       ( obj,
-                        member_name,
+                        member.name,
                         if member.is_const then ClassConst struc.name
                         else ClassVariable (Option.value_exn member.index) );
                   expr.ty <- member.type_spec.ty

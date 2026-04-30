@@ -234,6 +234,62 @@ let process_generated_constructors (structs : CodeGen.struct_t array)
           (fname, funcs));
   }
 
+(* Detect v11 event method pairs on a struct: methods named
+   [Name::add(T)] and [Name::remove(T)] with matching single-parameter
+   signatures. Returns [(event_pairs, remaining_methods)]. *)
+let extract_event_pairs (methods : CodeGen.function_t list) :
+    CodeGen.event_pair list * CodeGen.function_t list =
+  let split_accessor name =
+    match String.chop_suffix name ~suffix:"::add" with
+    | Some base -> Some (base, `Add)
+    | None -> (
+        match String.chop_suffix name ~suffix:"::remove" with
+        | Some base -> Some (base, `Remove)
+        | None -> None)
+  in
+  let adds = Hashtbl.create (module String) in
+  let removes = Hashtbl.create (module String) in
+  let others = ref [] in
+  let ordered_names = ref [] in
+  let seen_names = Hash_set.create (module String) in
+  let record_name base =
+    if not (Hash_set.mem seen_names base) then (
+      Hash_set.add seen_names base;
+      ordered_names := base :: !ordered_names)
+  in
+  List.iter methods ~f:(fun (m : CodeGen.function_t) ->
+      match split_accessor m.name with
+      | Some (base, `Add) ->
+          Hashtbl.set adds ~key:base ~data:m;
+          record_name base
+      | Some (base, `Remove) ->
+          Hashtbl.set removes ~key:base ~data:m;
+          record_name base
+      | None -> others := m :: !others);
+  let events = ref [] in
+  let unpaired = ref [] in
+  List.iter (List.rev !ordered_names) ~f:(fun base ->
+      match (Hashtbl.find adds base, Hashtbl.find removes base) with
+      | Some add, Some remove -> (
+          match
+            (Ain.Function.args add.func, Ain.Function.args remove.func)
+          with
+          | [ a ], [ r ] when Poly.equal a.type_ r.type_ ->
+              events :=
+                CodeGen.
+                  {
+                    ev_name = base;
+                    ev_type = a.type_;
+                    ev_add = add;
+                    ev_remove = remove;
+                  }
+                :: !events
+          | _ -> unpaired := add :: remove :: !unpaired)
+      | Some add, None -> unpaired := add :: !unpaired
+      | None, Some remove -> unpaired := remove :: !unpaired
+      | None, None -> ());
+  (!events, List.rev !others @ !unpaired)
+
 (* Detect v11 property method groups on a struct: methods named
    [Name::get] (returning T) and/or [Name::set(T)]. Either may exist
    alone (read-only / write-only). Classified as "auto-implemented"
@@ -341,6 +397,7 @@ let decompile ~move_to_original_file ~continue_on_error =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            events = [];
             properties = [];
           })
   in
@@ -400,15 +457,20 @@ let decompile ~move_to_original_file ~continue_on_error =
   in
   Array.iter structs ~f:(fun s ->
       let methods_in_order = List.rev s.methods in
-      let properties, remaining = extract_property_defs methods_in_order in
+      let events, after_events = extract_event_pairs methods_in_order in
+      let properties, remaining = extract_property_defs after_events in
       s.methods <- remaining;
+      s.events <- events;
       s.properties <- properties);
-  (* Auto-implemented properties round-trip purely via the
-     [T Name { get; set; }] declaration in classes.jaf. Drop both
-     accessor functions from [srcs] so the per-class .jaf doesn't
-     also emit their bodies. *)
+  (* Drop accessor function bodies from [srcs] when their declaration
+     is reconstructed in the class body: auto-properties round-trip
+     purely via [T Name { get; set; }], and v11 event accessor pairs
+     ([Name::add] / [Name::remove]) round-trip via [event T Name;]. *)
   let dropped_func_ids = Hash_set.create (module Int) in
   Array.iter structs ~f:(fun s ->
+      List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
+          Hash_set.add dropped_func_ids e.ev_add.func.id;
+          Hash_set.add dropped_func_ids e.ev_remove.func.id);
       List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
           if p.prop_is_auto then (
             Option.iter p.prop_get ~f:(fun g ->
@@ -443,6 +505,7 @@ let inspect funcname ~print_addr =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            events = [];
             properties = [];
           })
   in

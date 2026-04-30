@@ -135,11 +135,76 @@ let expand_property_decl (p : property_decl) : struct_declaration list =
   in
   [ backing_decl ] @ get_decl @ set_decl
 
-(* Expand v11 [PropertyDecl] entries in a struct's declaration list,
-   collecting [property_info] entries for the containing struct's
-   [properties] table. The expanded list keeps the original ordering;
-   [property_info] entries are returned in source order so type
-   analysis can preserve roundtrip stability. *)
+(* Expand a v11 event declaration `event T Name;` into a delegate-typed
+   [<Name>] backing field plus prototype-only [Name::add] / [Name::remove]
+   methods. The accessors carry no body — the original v11 compiler
+   emits matching function-table slots that are never invoked at runtime
+   for auto-events ([+= h] / [-= h] dispatch lowers to direct delegate
+   ops on the backing field). The "no body" exception for these stubs
+   is enforced in [type_define_visitor]'s [StructDef] check below. *)
+let expand_event_decl (e : event_decl) : struct_declaration list =
+  let loc = e.ed_loc in
+  let ty = e.ed_typespec in
+  let mangled_name = "<" ^ e.ed_name ^ ">" in
+  let backing_field : variable =
+    {
+      name = mangled_name;
+      location = loc;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = ClassVar;
+      type_spec = ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let backing_decl : struct_declaration =
+    MemberDecl
+      {
+        decl_loc = loc;
+        is_const_decls = false;
+        typespec = ty;
+        vars = [ backing_field ];
+      }
+  in
+  let void_ts = { ty = Void; location = loc } in
+  let value_param : variable =
+    {
+      name = "value";
+      location = loc;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = Parameter;
+      type_spec = ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let accessor kind =
+    Method
+      {
+        name = e.ed_name ^ "::" ^ kind;
+        loc;
+        return = void_ts;
+        params = [ value_param ];
+        body = None;
+        is_label = false;
+        is_lambda = false;
+        is_private = false;
+        index = None;
+        class_name = None;
+        class_index = None;
+      }
+  in
+  [ backing_decl; accessor "add"; accessor "remove" ]
+
+(* Expand v11 [PropertyDecl] / [EventDecl] entries in a struct's
+   declaration list, collecting [property_info] entries for the
+   containing struct's [properties] table. The expanded list keeps
+   the original ordering; [property_info] entries are returned in
+   source order so type analysis can preserve roundtrip stability. *)
 let expand_struct_decls (decls : struct_declaration list) :
     struct_declaration list * (string * property_info) list =
   let infos = ref [] in
@@ -159,6 +224,7 @@ let expand_struct_decls (decls : struct_declaration list) :
           in
           infos := (p.pd_name, info) :: !infos;
           decls
+      | EventDecl e -> expand_event_decl e
       | other -> [ other ])
   in
   (expanded, List.rev !infos)
@@ -293,7 +359,7 @@ class type_declare_visitor ctx =
                         compile_error "duplicate member variable declaration"
                           (ASTVariable v)
                     | `Ok -> ())
-            | PropertyDecl _ ->
+            | PropertyDecl _ | EventDecl _ ->
                 (* [expand_struct_decls] has rewritten these into their
                    [MemberDecl] + [Method] components before we iterate. *)
                 ()
@@ -430,10 +496,22 @@ class type_define_visitor ctx =
       | FuncTypeDef f -> jaf_to_ain_functype f |> Ain.write_functype ctx.ain
       | DelegateDef f -> jaf_to_ain_functype f |> Ain.write_delegate ctx.ain
       | StructDef s -> (
-          (* check for undefined methods *)
+          (* check for undefined methods. Auto-event accessors
+             ([Name::add] / [Name::remove] synthesized by
+             [expand_event_decl]) keep [body = None] and never get a
+             top-level implementation — at runtime, [+= h] / [-= h]
+             dispatches via delegate-add/remove on the [<Name>] backing
+             field rather than calling these methods. Skip the check
+             for those accessors. *)
+          let is_event_accessor_stub (f : fundecl) =
+            Option.is_none f.body
+            && (String.is_suffix f.name ~suffix:"::add"
+               || String.is_suffix f.name ~suffix:"::remove")
+          in
           List.iter s.decls ~f:(function
             | Method f | Constructor f | Destructor f ->
-                if Option.is_none f.index then
+                if Option.is_none f.index && not (is_event_accessor_stub f)
+                then
                   compile_error
                     (Printf.sprintf "No definition of %s::%s found" s.name
                        f.name)

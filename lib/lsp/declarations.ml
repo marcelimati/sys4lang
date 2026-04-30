@@ -148,7 +148,7 @@ class type_declare_visitor ctx =
                         compile_error "duplicate member variable declaration"
                           (ASTVariable v)
                     | `Ok -> ())
-            | PropertyDecl _ ->
+            | PropertyDecl _ | EventDecl _ ->
                 (* The compiler's [expand_struct_decls] lowers these
                    into [MemberDecl] + [Method]; the LSP doesn't need
                    the lowering for navigation, so a no-op is enough. *)

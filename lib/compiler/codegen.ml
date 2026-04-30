@@ -1463,14 +1463,13 @@ class jaf_compiler ctx debug_info =
               | MemberDecl _ -> () (* TODO: member initvals? *)
               | Constructor f | Destructor f | Method f ->
                   if Option.is_some f.body then self#compile_function f
-              | PropertyDecl _ ->
-                  (* [Declarations.expand_property_decl] rewrites
-                     [PropertyDecl] into a backing-field [MemberDecl]
-                     plus synthesized [Method] decls before codegen
-                     runs, so a [PropertyDecl] still here means the
+              | PropertyDecl _ | EventDecl _ ->
+                  (* [Declarations.expand_struct_decls] rewrites these
+                     into [MemberDecl] + [Method] components before
+                     codegen runs, so reaching this arm means the
                      expansion was skipped. *)
-                  compiler_bug "PropertyDecl not expanded before codegen"
-                    None
+                  compiler_bug
+                    "PropertyDecl/EventDecl not expanded before codegen" None
             in
             List.iter d.decls ~f:compile_struct_decl
         | Enum e ->

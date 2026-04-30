@@ -27,6 +27,25 @@ type variable = {
   initval : Ast.expr option;
 }
 
+(* v11 auto-event members are lowered by the original compiler to
+   delegate-typed fields whose names are wrapped in angle brackets,
+   e.g. [<MouseEnterEvent>]. Such names aren't valid identifiers in
+   source — emit them as [event T Name;] declarations and strip the
+   brackets at use sites. Restricted to delegate-typed members so
+   other [<…>]-named lowered constructs (e.g. property backing slots)
+   aren't misidentified as events. *)
+let event_name_of_delegate_member (v : Ain.Variable.t) =
+  let n = String.length v.name in
+  let is_angle_mangled =
+    n >= 3 && Char.equal v.name.[0] '<' && Char.equal v.name.[n - 1] '>'
+  in
+  let is_delegate =
+    match v.type_ with Type.Delegate _ -> true | _ -> false
+  in
+  if is_angle_mangled && is_delegate then
+    Some (String.sub v.name ~pos:1 ~len:(n - 2))
+  else None
+
 let from_ain_variable (v : Ain.Variable.t) =
   let initval =
     Option.map v.init_val ~f:(function
@@ -58,6 +77,20 @@ let lambda_context lambdas =
     lambdas;
   }
 
+(* v11 event pair: two struct methods whose names end in [::add(T)]
+   and [::remove(T)] with matching single-parameter signatures. The
+   original compiler emits these as prototype-only function-table
+   entries for every [event T Name;] declaration in a class. The
+   decompiler groups them so the class body emits a bare
+   [event T Name;] prototype and the accessor functions are dropped
+   from per-class output. *)
+type event_pair = {
+  ev_name : string;
+  ev_type : Type.ain_type;
+  ev_add : function_t;
+  ev_remove : function_t;
+}
+
 (* v11 property: methods named [Name::get] (returning T, no params) and/or
    [Name::set] (taking a single T parameter), synthesized by the original
    compiler from a [T Name { get; set; }] block. Either accessor may exist
@@ -78,6 +111,7 @@ type struct_t = {
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable events : event_pair list;
   mutable properties : property_def list;
 }
 
@@ -311,7 +345,13 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
     method private pr_lvalue prec out lval =
       match lval with
       | NullRef -> print_string out "NULL"
-      | PageRef (StructPage, var) -> bprintf out "this.%s" var.name
+      | PageRef (StructPage, var) ->
+          let name =
+            Option.value
+              (event_name_of_delegate_member var)
+              ~default:var.name
+          in
+          bprintf out "this.%s" name
       | PageRef (_, var) -> print_string out var.name
       | RefRef lval -> self#pr_lvalue prec out lval
       | ArrayRef (array, index) ->
@@ -319,7 +359,12 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
             (self#pr_expr (prec_value PREC_DOT))
             array (self#pr_expr 0) index
       | MemberRef (obj, memb) ->
-          bprintf out "%a.%s" (self#pr_expr (prec_value PREC_DOT)) obj memb.name
+          let name =
+            Option.value
+              (event_name_of_delegate_member memb)
+              ~default:memb.name
+          in
+          bprintf out "%a.%s" (self#pr_expr (prec_value PREC_DOT)) obj name
       | RefValue e -> self#pr_expr (prec_value PREC_DOT) out e
       | ObjRef _ as lval ->
           failwith ("pr_lvalue: unresolved ObjRef " ^ show_lvalue lval)
@@ -780,6 +825,16 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       self#with_indent (fun () -> loop 0);
       self#println "};"
 
+    (* v11 event prototype: round-trips as [event T Name;] in the
+       class body. The original [Name::add] / [Name::remove] accessor
+       functions (when present in the function table) are filtered
+       out of the per-class .jaf — their bodies are vestigial for
+       auto-events. *)
+    method private print_event_prototype (ev : event_pair) =
+      self#print_indent;
+      bprintf out "event %a %s" self#pr_type ev.ev_type ev.ev_name;
+      self#println ";"
+
     (* v11 auto-property prototype: round-trips as the C# auto-property
        shape [T Name { get; set; }]. Read-only properties omit [set;];
        write-only ones omit [get;]. *)
@@ -820,21 +875,28 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
               | _ when Hash_set.mem property_backing_field_names v.v.name -> ()
               | _ ->
                   self#print_indent;
-                  self#pr_vardecl out v.v;
-                  pr_array_dims out v.dims;
-                  Option.iter v.initval ~f:(fun e ->
-                      bprintf out " = %a" (self#pr_expr 0) e);
+                  (match event_name_of_delegate_member v.v with
+                  | Some name ->
+                      bprintf out "event %a %s" self#pr_type v.v.type_ name
+                  | None ->
+                      self#pr_vardecl out v.v;
+                      pr_array_dims out v.dims;
+                      Option.iter v.initval ~f:(fun e ->
+                          bprintf out " = %a" (self#pr_expr 0) e));
                   self#println ";");
           Stack.pop_exn current_function |> ignore;
           if
             (not (Array.is_empty struc.struc.members))
             && (not (List.is_empty struc.methods)
+               || not (List.is_empty struc.events)
                || not (List.is_empty struc.properties))
           then self#print_newline;
+          List.iter struc.events ~f:(fun ev ->
+              self#print_event_prototype ev);
           List.iter struc.properties ~f:(fun p ->
               self#print_property_prototype p);
           if
-            (not (List.is_empty struc.properties))
+            (not (List.is_empty struc.events && List.is_empty struc.properties))
             && not (List.is_empty struc.methods)
           then self#print_newline;
           List.iter struc.methods ~f:(fun func ->
