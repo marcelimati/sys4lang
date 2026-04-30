@@ -818,10 +818,18 @@ class type_analyze_visitor ctx =
                   self#check_ref_assign (ASTExpression expr) a b
               | This -> not_an_lvalue_error a (ASTExpression expr)
               | _ -> (
-                  self#check_referenceable b (ASTExpression expr);
                   match a.ty with
-                  | Ref t -> ref_type_check (ASTExpression expr) t b
-                  | _ -> not_an_lvalue_error a (ASTExpression expr)));
+                  (* v11: [ref_scalar === literal] compares the
+                     dereferenced value, not addresses. Pre-v11 this
+                     would fail [check_referenceable] on the literal. *)
+                  | Ref t when is_scalar t && not (is_referenceable b) ->
+                      check t b
+                  | Ref t ->
+                      self#check_referenceable b (ASTExpression expr);
+                      ref_type_check (ASTExpression expr) t b
+                  | _ ->
+                      self#check_referenceable b (ASTExpression expr);
+                      not_an_lvalue_error a (ASTExpression expr)));
               expr.ty <- Int)
       (* v11 user-bodied event: [obj.E += h] / [obj.E -= h] where the
          [<E>] backing field has been elided (because the user supplied
@@ -968,10 +976,26 @@ class type_analyze_visitor ctx =
           expr.ty <- e2.ty
       | Ternary (test, con, alt) ->
           check Int test;
+          (* When the two branches differ in ref-ness, v11 materialises
+             the non-ref branch as an rvalue-ref so the ternary's
+             result is always a reference. Only needed for non-scalars
+             — [Int]/[Float]/[Bool] get dereffed directly and don't
+             need a slot. Pre-v11 just dereffed the ref branch. *)
+          let needs_rval_wrap (t : jaf_type) =
+            match t with Int | Float | Bool | LongInt -> false | _ -> true
+          in
           (match (con.ty, alt.ty) with
           | Ref _, Ref _ -> ()
-          | Ref _, _ -> maybe_deref con
-          | _, Ref _ -> maybe_deref alt
+          | Ref t, _ ->
+              if Ain.version_gte ctx.ain (11, 0) && needs_rval_wrap t then (
+                let inner = clone_expr alt in
+                alt.node <- RvalueRef inner);
+              maybe_deref con
+          | _, Ref t ->
+              if Ain.version_gte ctx.ain (11, 0) && needs_rval_wrap t then (
+                let inner = clone_expr con in
+                con.node <- RvalueRef inner);
+              maybe_deref alt
           | _, _ -> ());
           check_expr con alt;
           expr.ty <- con.ty
