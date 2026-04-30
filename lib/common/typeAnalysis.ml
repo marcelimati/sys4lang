@@ -210,6 +210,27 @@ let check_not_array e =
       compile_error "array expression not allowed here" (ASTExpression e)
   | _ -> ()
 
+(* Substitute the polymorphic [HLLParam] wildcard with the concrete
+   element type of the receiver. v11 HLL Array methods like
+   [EmplaceBack] declare their result as [ref hll_param]; on a typed
+   [array<T>] receiver this should be [ref T] so further member access
+   on the returned value (e.g. calling a method on a returned struct)
+   typechecks. *)
+let specialize_hll_param elem_ty t =
+  match elem_ty with
+  | None -> t
+  | Some et ->
+      let rec sub = function
+        | HLLParam -> et
+        (* [Ref HLLParam] specialised with an element type that's
+           itself [Ref T] would yield [Ref (Ref T)] — an ill-formed
+           double ref. Collapse into a single [Ref T]. *)
+        | Ref HLLParam -> ( match et with Ref _ -> et | _ -> Ref et)
+        | Ref t -> Ref (sub t)
+        | t -> t
+      in
+      sub t
+
 let is_builtin = function
   | Int | Float | String | Array _ | Delegate _ -> true
   | Ref (Int | Float | String | Array _ | Delegate _) -> true
@@ -1175,14 +1196,48 @@ class type_analyze_visitor ctx =
             _ ) ->
           let lib = Hashtbl.find_exn ctx.libraries lib_name in
           let f = self#resolve_hll_overload lib fun_name ~skip_self:true args in
-          let args = check_call f.name (List.tl_exn f.params) args in
+          (* Substitute the [hll_param] wildcard in param/return types
+             with the receiver's concrete array element type. *)
+          let elem_ty =
+            match obj.ty with
+            | Array t | Ref (Array t) -> Some t
+            | _ -> None
+          in
+          let specialize = specialize_hll_param elem_ty in
+          let params =
+            List.map (List.tl_exn f.params) ~f:(fun p ->
+                {
+                  p with
+                  type_spec =
+                    { p.type_spec with ty = specialize p.type_spec.ty };
+                })
+          in
+          (* v11 [Array.Alloc] takes 4 int dimensions; unused trailing
+             ones are [-1]. Pad short user calls like [arr.Alloc(n)]
+             so the arg list matches the callee. Other HLL methods
+             are left alone. *)
+          let args =
+            if
+              Ain.version_gte ctx.ain (11, 0)
+              && String.equal lib_name "Array"
+              && String.equal f.name "Alloc"
+            then
+              let extra =
+                List.init
+                  (List.length params - List.length args)
+                  ~f:(fun _ -> Some (make_expr ~ty:Int (ConstInt (-1))))
+              in
+              args @ extra
+            else args
+          in
+          let args = check_call f.name params args in
           let lib_no =
             Option.value_exn (Ain.get_library_index ctx.ain lib.hll_name)
           in
           let fun_no = self#resolve_hll_ain_index lib_no f in
           insert_rvalue_ref obj;
           expr.node <- Call (e, Some obj :: args, HLLCall (lib_no, fun_no));
-          expr.ty <- f.return.ty
+          expr.ty <- specialize f.return.ty
       (* functype/delegate call *)
       | Call (e, args, _) -> (
           match e.ty with
