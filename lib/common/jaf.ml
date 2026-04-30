@@ -549,7 +549,15 @@ class environment ctx current_function =
                 | None -> UnresolvedName))
       in
       match name with
-      | "system" -> ResolvedSystem
+      | "system" ->
+          (* v11 ships a [system] HLL library that overlaps with the
+             classic [system.*] syscall receiver. If the library is
+             registered, prefer it — otherwise the [Output] et al.
+             HLL entries get shadowed and calls emit [CALLSYS] instead
+             of [CALLHLL], which the v11 VM rejects. *)
+          (match Hashtbl.find ctx.libraries name with
+          | Some l -> ResolvedLibrary l
+          | None -> ResolvedSystem)
       | "assert" ->
           ResolvedBuiltin
             (Option.value_exn (Bytecode.builtin_function_of_string "assert"))

@@ -338,11 +338,47 @@ class type_declare_visitor ctx =
         params_compatible decl_param_types
           (List.map other.params ~f:(fun p -> p.type_spec.ty))
       in
-      if Option.is_some decl.body then
+      if Option.is_some decl.body then (
+        (* v11 ghost lambda: pre-allocate an undefined function slot
+           for each lambda BEFORE the real one. The subsequent
+           [add_function ~nr_args] reuses that slot via stub-matching
+           (matching name + arity + [address = -1]) rather than
+           appending another entry. The ghost gives the slot its
+           final [is_lambda] / [nr_args] / [return_type] metadata
+           before any other pass observes the function table — which
+           matters for v11 delegate-callback pair lookups that key
+           off arity at registration time. *)
+        (if decl.is_lambda && Ain.version ctx.ain > 8 then
+           let ghost =
+             let open Ain.Function in
+             {
+               (create name) with
+               nr_args = List.length decl.params;
+               return_type = jaf_to_ain_type decl.return.ty;
+               is_lambda = true;
+             }
+           in
+           ignore (Ain.write_new_function ctx.ain ghost));
+        (* Pre-register the [Class@2] array-initializer slot
+           immediately before allocating the constructor's slot. The
+           original v11 compiler interleaves them so [Class@2] sits
+           one index below [Class@0] in the function table — the
+           array-initializer pass in [arrayInit.ml] later emits the
+           [@2] body and reuses this pre-allocated index via
+           [Ain.get_function]. Without the interleave, [@2] lands far
+           away in the table after every constructor is allocated,
+           shifting downstream indices and producing [REF Page=N
+           Index=M] faults at v11 VM boot when struct-ctor auto-
+           invoked initializers dispatch by index. *)
+        (if is_constructor decl then
+           let init_name = Option.value_exn decl.class_name ^ "@2" in
+           match Ain.get_function ctx.ain init_name with
+           | Some _ -> ()
+           | None -> ignore (Ain.add_function ctx.ain init_name));
         decl.index <-
           Some
             (Ain.add_function ~nr_args:(List.length decl.params) ctx.ain name)
-              .index;
+              .index);
       (* Merge a body or prototype into an existing same-overload entry.
          [prev_decl] has identical parameter types to [decl]; only the
          return type or body presence may differ. *)
