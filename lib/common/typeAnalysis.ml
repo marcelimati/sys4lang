@@ -28,6 +28,20 @@ let sprintf = Printf.sprintf
 let is_lvalue = function
   | { ty = TyFunction _; _ } -> false
   | { node = Ident _ | Member _ | Subscript _ | New _; _ } -> true
+  (* v11 [hll_param] is the polymorphic wildcard — HLL-side parameter
+     storage that the language doesn't introspect — so any expression
+     typed [HLLParam] is treated as an addressable slot. *)
+  | { ty = HLLParam; _ } -> true
+  (* A call returning a reference (e.g. HLL [Array.EmplaceBack] /
+     [Array.Last]) yields an lvalue: the returned reference denotes
+     the underlying storage. *)
+  | {
+      node =
+        Call (_, _, (HLLCall _ | BuiltinCall _ | MethodCall _ | FunctionCall _));
+      ty = Ref _;
+      _;
+    } ->
+      true
   | _ -> false
 
 (* A value from which a reference can be made. NULL, reference, this, and
@@ -35,16 +49,43 @@ let is_lvalue = function
 let is_referenceable = function
   | { ty = NullType | Ref _; _ } -> true
   | { node = This; _ } -> true
+  | {
+      node =
+        Call (_, _, (MethodCall _ | BuiltinCall _ | HLLCall _ | FunctionCall _));
+      _;
+    } ->
+      true
+  | { node = RvalueRef _; _ } -> true
   | e -> is_lvalue e
 
 (* Implicit dereference of variables and members. *)
 let maybe_deref (e : expression) =
   match e with
-  | { ty = Ref t; node = Ident _ | Member _; _ } -> e.ty <- t
+  | {
+      ty = Ref t;
+      node = Ident _ | Member _ | Call (_, _, HLLCall _) | Subscript _;
+      _;
+    } ->
+      e.ty <- t
+  (* v11 [Wrap T] is a fat-ref representation used for ref-returning
+     HLL calls and foreach-desugared containers; surface code observes
+     the inner type. *)
+  | { ty = Wrap t; _ } -> e.ty <- t
   | _ -> ()
 
 let insert_rvalue_ref e =
-  if not (is_referenceable e) then (
+  let needs_wrap =
+    (not (is_referenceable e))
+    ||
+    match e.node with
+    (* A call whose ain-level return is a ref still needs a dummy slot
+       when the language-level type isn't [Ref _], so the rvalue has a
+       stable address for downstream consumers (e.g. method receivers). *)
+    | Call (_, _, (BuiltinCall _ | HLLCall _ | MethodCall _)) -> (
+        match e.ty with Ref _ -> false | _ -> true)
+    | _ -> false
+  in
+  if needs_wrap then (
     e.node <- RvalueRef (clone_expr e);
     e.ty <- Ref e.ty)
 
@@ -52,6 +93,10 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
   match (expected, actual) with
   | TypeUnion (a, b), t -> type_equal a t || type_equal b t
   | Ref a, Ref b -> type_equal a b
+  (* v11: a bare [T] satisfies a [Ref T] expectation when their inner
+     types match — the RvalueRef wrapping is inserted later in
+     [insert_rvalue_ref]. *)
+  | Ref a, b when type_equal a b -> true
   | Void, Void -> true
   | Int, (Int | Bool | LongInt) -> true
   | Bool, (Int | Bool | LongInt) -> true
@@ -67,15 +112,25 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
   | MemberPtr (s1, t1), MemberPtr (s2, t2) ->
       String.equal s1 s2 && type_equal t1 t2
   | NullType, (FuncType _ | Delegate _ | IMainSystem | NullType) -> true
-  | HLLParam, HLLParam -> true
-  | Array a, Array b -> type_equal a b
-  | Wrap a, Wrap b -> type_equal a b
-  | HLLFunc, HLLFunc -> true
+  (* v11 [hll_param] is the polymorphic wildcard — HLL-side storage
+     the language doesn't introspect. Compatible with any type from
+     either direction, also through a [Ref _] wrapper. *)
+  | HLLParam, _ -> true
+  | _, HLLParam -> true
+  | Ref HLLParam, _ -> true
+  | _, Ref HLLParam -> true
   (* v11 [hll_func2] is the polymorphic-callable wildcard used by HLL
-     bridges. Treat it as compatible with anything so HLL function
-     pointers and delegates flow through without coercion. *)
+     bridges; same wildcard semantics as [hll_param]. *)
   | HLLFunc2, _ -> true
   | _, HLLFunc2 -> true
+  (* v11 [Wrap T] is a fat-ref representation; strip it on either
+     side, including the [Wrap T] vs [Ref T] case where the wrap is
+     just an alternate encoding of the same reference. *)
+  | Wrap a, Ref b | Ref a, Wrap b -> type_equal a b
+  | Wrap a, b | b, Wrap a -> type_equal a b
+  | Array a, Array b -> type_equal a b
+  | HLLFunc, _ -> true
+  | _, HLLFunc -> true
   | Void, _
   | Ref _, _
   | Int, _
@@ -87,10 +142,7 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
   | IMainSystem, _
   | FuncType _, _
   | Delegate _, _
-  | HLLParam, _
   | Array _, _
-  | Wrap _, _
-  | HLLFunc, _
   | TyFunction _, _
   | TyMethod _, _
   | NullType, _
@@ -487,6 +539,40 @@ class type_analyze_visitor ctx =
           | Some a, _ ->
               (match v.type_spec.ty with
               | Ref ty ->
+                  (* v11: a non-referenceable arg passed to a [ref T]
+                     parameter needs an explicit [RvalueRef] wrap so
+                     [variableAlloc] can back it with a DummyRef slot.
+                     Skip for [Lambda] / [FuncAddr] (already
+                     addressable) and for calls whose ain-level return
+                     is already [Ref _] ([variableAlloc]'s Call handler
+                     wraps those instead). *)
+                  let is_lambda_or_funcaddr =
+                    match (a : expression).node with
+                    | Lambda _ | FuncAddr _ -> true
+                    | _ -> false
+                  in
+                  let is_ain_ref_call =
+                    match (a : expression).node with
+                    | Call (_, _, (FunctionCall fno | MethodCall (_, fno))) -> (
+                        match
+                          (Ain.get_function_by_index ctx.ain fno).return_type
+                        with
+                        | Ain.Type.Ref _ -> true
+                        | _ -> false)
+                    | Call (_, _, HLLCall (lib_no, fun_no)) -> (
+                        let lib = Ain.get_library_by_index ctx.ain lib_no in
+                        match
+                          (List.nth_exn lib.functions fun_no).return_type
+                        with
+                        | Ain.Type.Ref _ -> true
+                        | _ -> false)
+                    | _ -> false
+                  in
+                  if
+                    Ain.version_gte ctx.ain (11, 0)
+                    && (not is_lambda_or_funcaddr)
+                    && not is_ain_ref_call
+                  then insert_rvalue_ref a;
                   self#check_referenceable a (ASTExpression a);
                   ref_type_check (ASTExpression a) ty a
               | _ ->
@@ -1066,8 +1152,14 @@ class type_analyze_visitor ctx =
           | _ -> type_error (Struct ("", -1)) None (ASTExpression expr))
       | DummyRef _ ->
           compiler_bug "DummyRef in type checker" (Some (ASTExpression expr))
-      | RvalueRef _ ->
-          compiler_bug "RvalueRef in type checker" (Some (ASTExpression expr))
+      | RvalueRef inner ->
+          (* [insert_rvalue_ref] wraps non-referenceable args at [ref T]
+             call sites; the wrap can be re-visited when type-checking
+             reuses an already-resolved subtree (e.g. recursing through
+             [OptionalMember]'s temporary Member rewrite). Just propagate
+             the inner type. *)
+          self#visit_expression inner;
+          expr.ty <- inner.ty
       | This -> (
           match self#env#current_class with
           | Some ty -> expr.ty <- ty
