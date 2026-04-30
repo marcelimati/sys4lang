@@ -21,7 +21,24 @@ open Bytecode
 open CompileError
 
 type cflow_type = CFlowLoop of int | CFlowSwitch of Ain.Switch.t
-type cflow_stmt = { kind : cflow_type; mutable break_addrs : int list }
+
+type cflow_stmt = {
+  kind : cflow_type;
+  mutable break_addrs : int list;
+  (* v11: [Stack.length scopes] at loop/switch entry — used by
+     [emit_loop_exit_cleanup] to know which scopes are inner to the
+     loop and need their dummy slots released before a break /
+     continue. *)
+  scopes_at_start : int;
+  (* v11: DummyRef slot indexes that [cleanup_condition_dummyrefs]
+     released inline during this loop / switch body. The original
+     compiler re-emits [SH_LOCALDELETE] for them at every break /
+     continue path and at the switch fall-through merge point, even
+     though the slots are already empty (the VM tolerates idempotent
+     releases). The "cumulative SH_LOCALDELETE" block visible in
+     switch fall-through code comes from this list. *)
+  mutable inline_deleted_dummies : int list;
+}
 type scope = { mutable vars : Ain.Variable.t list }
 
 type label_data = {
@@ -56,6 +73,14 @@ class jaf_compiler ctx debug_info =
 
     (* The currently active control flow constructs. *)
     val mutable cflow_stmts = Stack.create ()
+
+    (* v11: indexes of DummyRef slots that
+       [cleanup_condition_dummyrefs] has already emitted
+       [SH_LOCALDELETE] for inline (typically immediately after a
+       loop / [if] condition's dummies become dead). Consulted by
+       [compile_statement] so a goto / break / return's [delete_vars]
+       list doesn't double-emit [SH_LOCALDELETE] for them. *)
+    val mutable inline_deleted_dummies : int list = []
 
     (* The currentl active scopes. *)
     val scopes = Stack.create ()
@@ -113,9 +138,56 @@ class jaf_compiler ctx debug_info =
                 (ASTStatement (snd (List.last_exn gotos))));
       Hashtbl.clear labels
 
+    (** v11: release every DummyRef slot allocated since [vars_before]
+        in the topmost scope, in LIFO (newest-first) order. Records
+        each released index in [inline_deleted_dummies] (so a goto /
+        return doesn't double-release them) and on the enclosing
+        loop / switch's tracker (so break / continue / fall-through
+        replay [SH_LOCALDELETE] for them). The VM's [SH_LOCALDELETE]
+        is idempotent on already-empty slots, which matches alice's
+        observed behaviour of redundantly re-emitting at every exit
+        path. *)
+    method cleanup_condition_dummyrefs vars_before =
+      if Ain.version ctx.ain > 8 then
+        match Stack.top scopes with
+        | None -> ()
+        | Some scope ->
+            let n_new = List.length scope.vars - vars_before in
+            if n_new > 0 then (
+              let new_vars = List.take scope.vars n_new in
+              List.iter new_vars ~f:self#compile_delete_var;
+              List.iter new_vars ~f:(fun v ->
+                  inline_deleted_dummies <-
+                    v.index :: inline_deleted_dummies);
+              match Stack.top cflow_stmts with
+              | None -> ()
+              | Some s ->
+                  List.iter new_vars ~f:(fun v ->
+                      s.inline_deleted_dummies <-
+                        v.index :: s.inline_deleted_dummies))
+
+    (** v11: replay [SH_LOCALDELETE] for every dummy slot that
+        [cleanup_condition_dummyrefs] has released in the current
+        loop / switch body. Called immediately before a break /
+        continue's [JUMP] so the cumulative cleanup matches alice's
+        bytecode shape. *)
+    method emit_loop_exit_cleanup =
+      if Ain.version ctx.ain > 8 then
+        match Stack.top cflow_stmts with
+        | None -> ()
+        | Some s ->
+            List.iter s.inline_deleted_dummies ~f:(fun idx ->
+                self#write_instruction1 SH_LOCALDELETE idx)
+
     (** Begin a loop. *)
     method start_loop addr =
-      Stack.push cflow_stmts { kind = CFlowLoop addr; break_addrs = [] }
+      Stack.push cflow_stmts
+        {
+          kind = CFlowLoop addr;
+          break_addrs = [];
+          scopes_at_start = Stack.length scopes;
+          inline_deleted_dummies = [];
+        }
 
     (** Begin a switch statement. *)
     method start_switch ty node =
@@ -126,12 +198,23 @@ class jaf_compiler ctx debug_info =
         | _ -> compiler_bug "invalid switch type" (Some node)
       in
       let switch = Ain.add_switch ctx.ain case_type in
-      Stack.push cflow_stmts { kind = CFlowSwitch switch; break_addrs = [] };
+      Stack.push cflow_stmts
+        {
+          kind = CFlowSwitch switch;
+          break_addrs = [];
+          scopes_at_start = Stack.length scopes;
+          inline_deleted_dummies = [];
+        };
       self#write_instruction1 op switch.index
 
-    (** End the current control flow construct. Updates 'break' addresses. *)
+    (** End the current control flow construct. Updates 'break' addresses.
+        v11 [inline_deleted_dummies] is intentionally NOT propagated to
+        the enclosing loop / switch — alice's outer break does not
+        replay [SH_LOCALDELETE] for slots already released inside a
+        nested switch. *)
     method end_cflow_stmt =
       let stmt = Stack.pop_exn cflow_stmts in
+      let _ = stmt.inline_deleted_dummies in
       List.iter stmt.break_addrs ~f:(fun addr ->
           self#write_address_at addr current_address)
 
@@ -142,11 +225,25 @@ class jaf_compiler ctx debug_info =
       | _ -> compiler_bug "Mismatched start/end of control flow construct" None);
       self#end_cflow_stmt
 
-    (** End the current switch statement. Updates 'break' addresses. *)
+    (** End the current switch statement. Updates 'break' addresses.
+        v11 fall-through path cleanup: alice emits a cumulative
+        [SH_LOCALDELETE] block for every DummyRef slot released
+        inside any switch case, immediately before the post-switch
+        code. Each [break] already runs [emit_loop_exit_cleanup] and
+        targets the address AFTER this fall-through block, so the
+        block is only reached when no case matched (or the matched
+        case fell through without a break). The redundant releases
+        are harmless because [SH_LOCALDELETE] is idempotent. *)
     method end_switch =
       (match Stack.top cflow_stmts with
       | Some { kind = CFlowSwitch switch; _ } -> Ain.write_switch ctx.ain switch
       | _ -> compiler_bug "Mismatched start/end of control flow construct" None);
+      (if Ain.version ctx.ain > 8 then
+         match Stack.top cflow_stmts with
+         | None -> ()
+         | Some s ->
+             List.iter s.inline_deleted_dummies ~f:(fun idx ->
+                 self#write_instruction1 SH_LOCALDELETE idx));
       self#end_cflow_stmt
 
     method add_switch_case expr node =
@@ -1073,7 +1170,8 @@ class jaf_compiler ctx debug_info =
           self#compile_expression b;
           self#write_address_at ifz_addr current_address
 
-    method compile_expr_and_pop (expr : expression) =
+    method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
+        =
       match expr.node with
       | Assign
           ( EqAssign,
@@ -1102,12 +1200,14 @@ class jaf_compiler ctx debug_info =
           self#write_instruction0 POP
       | Seq (a, b) ->
           self#compile_expr_and_pop a;
-          self#compile_expr_and_pop b
+          self#compile_expr_and_pop ~before_pop b
       | DummyRef _ ->
           self#compile_lvalue expr;
+          before_pop ();
           self#compile_pop expr.ty (ASTExpression expr)
       | _ ->
           self#compile_expression expr;
+          before_pop ();
           self#compile_pop expr.ty (ASTExpression expr)
 
     (** Emit the code for a statement. Statements are stack-neutral, i.e. the
@@ -1121,11 +1221,50 @@ class jaf_compiler ctx debug_info =
       | EmptyStatement -> ()
       | Declarations decls ->
           List.iter decls.vars ~f:self#compile_variable_declaration
-      | Expression e -> self#compile_expr_and_pop e
+      | Expression e ->
+          let vars_before_expr =
+            match Stack.top scopes with
+            | Some scope -> List.length scope.vars
+            | None -> 0
+          in
+          (* v11 cleanup ordering for the dummy slots produced by this
+             expression statement:
+             - For [String]/[Delegate]/[HLLParam]/[Array] (reference-
+               shaped values), [compile_pop] emits a [DELETE]-style
+               release that needs to fire BEFORE the slot's
+               [SH_LOCALDELETE], otherwise the strong ref leaks.
+             - For everything else, [compile_pop] emits a plain [POP]
+               which doesn't touch refcounts; alice releases the slot
+               BEFORE the [POP] so the dummy is gone while the value
+               is still on the stack. *)
+          let cleanup_after_pop =
+            Ain.version ctx.ain > 8
+            &&
+            match e.ty with
+            | String | Delegate _ | HLLParam | Array _ -> true
+            | _ -> false
+          in
+          if cleanup_after_pop then (
+            self#compile_expr_and_pop e;
+            self#cleanup_condition_dummyrefs vars_before_expr)
+          else if Ain.version ctx.ain > 8 then
+            self#compile_expr_and_pop
+              ~before_pop:(fun () ->
+                self#cleanup_condition_dummyrefs vars_before_expr)
+              e
+          else self#compile_expr_and_pop e
       | Compound stmts -> self#compile_block stmts
       | Label name -> self#add_label name stmt
       | If (test, con, alt) ->
+          let vars_before =
+            match Stack.top scopes with
+            | Some scope -> List.length scope.vars
+            | None -> 0
+          in
           self#compile_expression test;
+          (* v11: release condition-local dummies before the IFZ so
+             both the taken and not-taken branch see them cleaned up. *)
+          self#cleanup_condition_dummyrefs vars_before;
           let ifz_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           self#compile_statement con;
@@ -1138,7 +1277,16 @@ class jaf_compiler ctx debug_info =
           (* loop test *)
           let loop_addr = current_address in
           self#start_loop loop_addr;
+          let vars_before =
+            match Stack.top scopes with
+            | Some scope -> List.length scope.vars
+            | None -> 0
+          in
           self#compile_expression test;
+          (* v11: release condition-local dummies before the IFZ so
+             both the continue and the exit branch see them cleaned
+             up, not just the body-executes path. *)
+          self#cleanup_condition_dummyrefs vars_before;
           let break_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           (* loop body *)
@@ -1154,7 +1302,13 @@ class jaf_compiler ctx debug_info =
           (* loop test *)
           let loop_addr = current_address in
           self#start_loop loop_addr;
+          let vars_before =
+            match Stack.top scopes with
+            | Some scope -> List.length scope.vars
+            | None -> 0
+          in
           self#compile_expression test;
+          self#cleanup_condition_dummyrefs vars_before;
           let break_addr = current_address + 2 in
           self#write_instruction1 IFZ 0;
           (* loop body *)
@@ -1211,9 +1365,11 @@ class jaf_compiler ctx debug_info =
           self#add_goto name (current_address + 2) stmt;
           self#write_instruction1 JUMP 0
       | Continue ->
+          self#emit_loop_exit_cleanup;
           self#write_instruction1 JUMP
             (self#get_continue_addr (ASTStatement stmt))
       | Break ->
+          self#emit_loop_exit_cleanup;
           self#push_break_addr (current_address + 2) (ASTStatement stmt);
           self#write_instruction1 JUMP 0
       | Switch (expr, stmts) ->
