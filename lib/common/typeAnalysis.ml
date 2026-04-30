@@ -574,6 +574,19 @@ class type_analyze_visitor ctx =
 
     method! visit_expression expr =
       super#visit_expression expr;
+      (* [obj?.Method(args)] parses as [Call (OptionalMember ...)] which
+         otherwise wouldn't match the Call/Member/ClassMethod resolution
+         paths below. Temporarily retype the callee as a plain [Member]
+         so the existing handlers resolve it; restore the
+         [OptionalMember] wrapping at the end so codegen still sees the
+         null-check. *)
+      let optional_call_info =
+        match expr.node with
+        | Call (({ node = OptionalMember (obj, name, mt); _ } as e), _, _) ->
+            e.node <- Member (obj, name, mt);
+            Some (e, obj, name)
+        | _ -> None
+      in
       (* convenience functions which always pass parent expression *)
       let check = type_check (ASTExpression expr) in
       let check_numeric = type_check_numeric (ASTExpression expr) in
@@ -1129,6 +1142,22 @@ class type_analyze_visitor ctx =
                           undefined_variable_error
                             (struc.name ^ "." ^ member_name)
                             (ASTExpression expr)))))
+      (* Already-resolved AND type-checked Call — re-entered through
+         the [OptionalMember] handler's recursive [self#visit_expression]
+         (which re-walks the OM's child obj). Skip: re-running
+         resolution on resolved args would double-wrap [RvalueRef]s in
+         [check_call] and double-prepend [obj] for HLL methods,
+         breaking overload arity. The [Untyped] guard keeps
+         [BuiltinCall]/etc. tags from synthetic call sites (e.g.
+         [arrayInit]'s array-alloc statement) flowing through their
+         first-pass resolution. *)
+      | Call
+          ( _,
+            _,
+            ( FunctionCall _ | MethodCall _ | HLLCall _ | SystemCall _
+            | BuiltinCall _ | FuncTypeCall _ | DelegateCall _ ) )
+        when match expr.ty with Untyped -> false | _ -> true ->
+          ()
       (* regular function call *)
       | Call (({ node = Ident (_, FunctionName name); _ } as e), args, _) ->
           let f = self#resolve_overload name args in
@@ -1327,7 +1356,17 @@ class type_analyze_visitor ctx =
               expr.node <-
                 Call (getter_expr, [], MethodCall (class_idx, getter_idx))
           | None -> ())
-      | _ -> ())
+      | _ -> ());
+      (* Restore the [OptionalMember] wrapping on [Call (Member ...)]
+         that was temporarily unwrapped at the top of visit_expression
+         so the downstream Call/ClassMethod resolution could match. *)
+      (match optional_call_info with
+      | Some (e, obj, name) -> (
+          match e.node with
+          | Member (_, _, resolved_mt) ->
+              e.node <- OptionalMember (obj, name, resolved_mt)
+          | _ -> ())
+      | None -> ())
 
     method! visit_statement stmt =
       self#catch_errors (fun () ->
