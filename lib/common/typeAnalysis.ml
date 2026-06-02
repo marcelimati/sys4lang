@@ -448,17 +448,17 @@ class type_analyze_visitor ctx =
         List.length lf.arguments = expected_arity
       in
       let by_full_match =
-        List.find lib.functions ~f:(fun lf ->
+        Array.find lib.functions ~f:(fun lf ->
             String.equal lf.name f.name && param_types_match lf)
       in
       match by_full_match with
       | Some lf ->
           fst
             (Option.value_exn
-               (List.findi lib.functions ~f:(fun _ x -> phys_equal x lf)))
+               (Array.findi lib.functions ~f:(fun _ x -> phys_equal x lf)))
       | None -> (
           let by_arity =
-            List.findi lib.functions ~f:(fun _ lf ->
+            Array.findi lib.functions ~f:(fun _ lf ->
                 String.equal lf.name f.name && arity_matches lf)
           in
           match by_arity with
@@ -673,9 +673,7 @@ class type_analyze_visitor ctx =
                         | _ -> false)
                     | Call (_, _, HLLCall (lib_no, fun_no)) -> (
                         let lib = Ain.get_library_by_index ctx.ain lib_no in
-                        match
-                          (List.nth_exn lib.functions fun_no).return_type
-                        with
+                        match lib.functions.(fun_no).return_type with
                         | Ain.Type.Ref _ -> true
                         | _ -> false)
                     | _ -> false

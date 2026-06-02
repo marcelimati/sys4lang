@@ -664,8 +664,9 @@ class ivisitor ctx =
           self#visit_statement body;
           self#visit_expression test
       | For (init, test, inc, body) ->
-          self#env#push;
+          (* The for-init declaration is in the enclosing scope. *)
           self#visit_statement init;
+          self#env#push;
           Option.iter test ~f:self#visit_expression;
           Option.iter inc ~f:self#visit_expression;
           self#visit_statement body;
@@ -1427,7 +1428,7 @@ let context_from_ain ?(constants : variable list = []) ain =
   Ain.library_iter ain ~f:(fun (l : Ain.Library.t) ->
       let functions = Hashtbl.create (module String) in
       let lib_overloads = Hashtbl.create (module String) in
-      List.iter l.functions ~f:(fun (f : Ain.Library.Function.t) ->
+      Array.iter l.functions ~f:(fun (f : Ain.Library.Function.t) ->
           let func =
             {
               name = f.name;

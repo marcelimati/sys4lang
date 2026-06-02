@@ -185,7 +185,7 @@ class jaf_compiler ctx debug_info =
           Some (Ain.get_function_by_index ctx.ain fno).return_type
       | Call (_, _, HLLCall (lib_no, fun_no)) ->
           let lib = Ain.get_library_by_index ctx.ain lib_no in
-          Some (List.nth_exn lib.functions fun_no).return_type
+          Some lib.functions.(fun_no).return_type
       | _ -> None
 
     (** v11: release every DummyRef slot allocated since [vars_before]
@@ -578,7 +578,8 @@ class jaf_compiler ctx debug_info =
             self#write_instruction0 REFREF;
             self#write_instruction0 REF
         | Ref (Int | Float | Bool | LongInt) -> self#write_instruction0 REFREF
-        | Ref (String | Array _ | Struct _) -> self#write_instruction0 REF
+        | Ref (String | Array _ | Struct _ | Delegate _) ->
+            self#write_instruction0 REF
         | String | Array _ | Struct _ | Delegate _ ->
             self#write_instruction0 REF
         | _ -> ()
@@ -588,7 +589,8 @@ class jaf_compiler ctx debug_info =
           match self#get_local i with
           | {
            value_type =
-             String | Array _ | Struct _ | Ref (String | Array _ | Struct _);
+             ( String | Array _ | Struct _
+             | Ref (String | Array _ | Struct _ | Delegate _) );
            _;
           }
             when ctx.version < 630 ->
@@ -612,7 +614,8 @@ class jaf_compiler ctx debug_info =
           match Ain.get_global_by_index ctx.ain i with
           | {
            value_type =
-             String | Array _ | Struct _ | Ref (String | Array _ | Struct _);
+             ( String | Array _ | Struct _
+             | Ref (String | Array _ | Struct _ | Delegate _) );
            _;
           }
             when ctx.version < 630 ->
@@ -623,7 +626,7 @@ class jaf_compiler ctx debug_info =
       | Member (obj, _, ClassVariable member_no) -> (
           match (obj.node, e.ty) with
           | ( This,
-              ( Ref (String | Array _ | Struct _)
+              ( Ref (String | Array _ | Struct _ | Delegate _)
               | String | Array _ | Struct _ | Delegate _ ) )
             when ctx.version < 630 ->
               self#write_instruction1 SH_STRUCTREF member_no
@@ -2320,6 +2323,54 @@ class jaf_compiler ctx debug_info =
           before_pop ();
           self#compile_pop expr.ty (ASTExpression expr)
 
+    method private compile_ref_assign ~is_init ~parent lhs (rhs : expression) =
+      self#compile_lock_peek;
+      self#compile_variable_ref lhs;
+      self#compile_delete_ref lhs.ty;
+      (match (is_init, rhs.node) with
+      | _, Null -> ()
+      | true, _ -> self#write_instruction0 DUP2
+      | false, _ -> ());
+      self#compile_lvalue rhs;
+      (match lhs.ty with
+      | _ when is_ref_scalar lhs.ty -> (
+          match rhs.node with
+          | Null ->
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP
+          | _ when is_init ->
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction0 REF;
+              self#write_instruction0 SP_INC
+          | _ ->
+              self#write_instruction0 DUP_U2;
+              self#write_instruction0 SP_INC;
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP)
+      | Ref (String | Struct _ | Array _) -> (
+          match rhs.node with
+          | Null ->
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 POP
+          | _ when is_init ->
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction0 REF;
+              self#write_instruction0 SP_INC;
+              self#write_instruction0 POP
+          | _ ->
+              self#write_instruction0 DUP;
+              self#write_instruction0 SP_INC;
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 POP)
+      | _ -> compiler_bug "Invalid LHS in reference assignment" (Some parent));
+      self#compile_unlock_peek
+
     (** Emit the code for a statement. Statements are stack-neutral, i.e. the
         state of the stack is unchanged after executing a statement. *)
     method compile_statement (stmt : statement) =
@@ -2922,12 +2973,8 @@ class jaf_compiler ctx debug_info =
               | Some e -> e
               | None -> make_expr ~ty:decl.type_spec.ty Null
             in
-            self#compile_statement
-              {
-                node = RefAssign (lhs, rhs);
-                delete_vars = [];
-                loc = decl.location;
-              }
+            self#compile_ref_assign ~is_init:true ~parent:(ASTVariable decl) lhs
+              rhs
         | Int | Bool | LongInt | Float | FuncType _ | String ->
             let lhs =
               {

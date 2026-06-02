@@ -820,7 +820,7 @@ let define_library ctx decls hll_name import_name =
   Ain.write_library ctx.ain
     {
       (Ain.add_library ctx.ain hll_name) with
-      functions = List.map ~f:jaf_to_ain_hll_function functions;
+      functions = Array.of_list_map functions ~f:jaf_to_ain_hll_function;
     };
   (* v11 HLL libraries may declare multiple functions with the same
      name but different parameter signatures. The first-seen entry

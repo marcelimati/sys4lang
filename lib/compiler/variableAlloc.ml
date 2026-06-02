@@ -237,7 +237,7 @@ class variable_alloc_visitor ctx =
             | _ -> ())
         | Call (_, _, HLLCall (lib_no, fun_no)) -> (
             let lib = Ain.get_library_by_index ctx.ain lib_no in
-            let f = List.nth_exn lib.functions fun_no in
+            let f = lib.functions.(fun_no) in
             match f.return_type with
             | Ain.Type.Struct _ ->
                 let dummy_ty = Ref e.ty in
@@ -294,9 +294,7 @@ class variable_alloc_visitor ctx =
                   | _ -> false)
               | HLLCall (lib_no, fun_no) -> (
                   let lib = Ain.get_library_by_index ctx.ain lib_no in
-                  match
-                    (List.nth_exn lib.functions fun_no).return_type
-                  with
+                  match lib.functions.(fun_no).return_type with
                   | Ain.Type.Ref _ -> true
                   | _ -> false)
               | _ -> false
@@ -311,7 +309,7 @@ class variable_alloc_visitor ctx =
                   (Ain.get_function_by_index ctx.ain fno).name
               | HLLCall (lib_no, fun_no) ->
                   let lib = Ain.get_library_by_index ctx.ain lib_no in
-                  (List.nth_exn lib.functions fun_no).name
+                  lib.functions.(fun_no).name
               | DelegateCall _ -> "<delegate>"
               | FuncTypeCall _ -> "<functype>"
               | _ ->
