@@ -89,16 +89,47 @@ let () =
       | None -> [ name ]
       | Some l -> if List.length l < 5 then name :: l else l)
   in
+  (* With a third argument "dump", also print one line per divergent
+     function: CLASS <tab> name <tab> orig_ops <tab> ours_ops <tab>
+     first-divergence "origOP/oursOP" (opcode names; <end> when one
+     side ran out). For histogramming systematic patterns. *)
+  let dump = Array.length Stdlib.Sys.argv > 3 in
+  let opname op =
+    match try Some (Bytecode.opcode_of_int op) with _ -> None with
+    | Some o -> Bytecode.string_of_opcode o
+    | None -> Printf.sprintf "op%x" op
+  in
+  let first_divergence a b =
+    let rec aux i a b =
+      match (a, b) with
+      | [], [] -> "same/same"
+      | (o, _) :: _, [] -> Printf.sprintf "@%d %s/<end>" i (opname o)
+      | [], (o, _) :: _ -> Printf.sprintf "@%d <end>/%s" i (opname o)
+      | (o1, _) :: r1, (o2, _) :: r2 ->
+        if o1 = o2 then aux (i + 1) r1 r2
+        else Printf.sprintf "@%d %s/%s" i (opname o1) (opname o2)
+    in
+    aux 0 a b
+  in
+  let dump_line cls nm a b =
+    if dump then
+      Stdio.printf "%s\t%s\t%d\t%d\t%s\n" cls nm (List.length a)
+        (List.length b) (first_divergence a b)
+  in
   List.iter common ~f:(fun nm ->
       let os, oe = Hashtbl.find_exn or_ nm in
       let us, ue = Hashtbl.find_exn ur_ nm in
       match (walk oc os oe, walk uc us ue) with
       | None, _ | _, None -> bump "PARSE" nm
       | Some a, Some b ->
-        if List.length a <> List.length b then bump "LENGTH" nm
+        if List.length a <> List.length b then (
+          bump "LENGTH" nm;
+          dump_line "LENGTH" nm a b)
         else if
           not (List.for_all2_exn a b ~f:(fun (o1, _) (o2, _) -> o1 = o2))
-        then bump "OPCODE" nm
+        then (
+          bump "OPCODE" nm;
+          dump_line "OPCODE" nm a b)
         else if
           List.for_all2_exn a b ~f:(fun (_, a1) (_, a2) ->
               (* arg lists have equal length because opcodes are equal *)

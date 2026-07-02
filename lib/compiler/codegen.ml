@@ -6350,14 +6350,25 @@ class jaf_compiler ctx debug_info =
           else (
           let _ = empty_statement in
           let _ = branch_exit_statement in
-          (* v12 peephole: [LogNot e] in test position becomes [e] with
-             IFZ↔IFNZ swapped, eliminating a [NOT] before the branch.
-             Matches original Rance10 [NOT;IFZ] → [IFNZ] / [NOT;IFNZ] →
-             [IFZ] shape. *)
+          (* The original v12 compiler peels [LogNot] from a branch
+             condition ONLY when the negated operand is a bool-returning
+             METHOD call: [if (!obj.Fn())] emits CALLMETHOD followed by
+             the inverted branch, no NOT. Negated variables, members and
+             notably HLL calls keep the NOT even when declared bool
+             (canonical shape: cond; NOT; IFNZ then; JUMP else).
+             Evidence (first-divergence histograms, 2026-07-02):
+             peel-always diverged in 475+ Rance10 functions, peel-never
+             in 339+, peel-any-bool-call in 408. Exemplars: kept-NOT for
+             [!g_bRestrainScreensaverWhileAutoMode] (bool global) and
+             [!system.IsDebugMode()] (bool CALLHLL, DebugLogTextToClipboard);
+             peeled for [!this.IsEnd()] (bool CALLMETHOD, CASTask@IsEndTask). *)
           let test, peeled_lognot =
             if Ain.version_gte ctx.ain (12, 0) then
               match test.node with
-              | Unary (LogNot, inner) -> (inner, true)
+              | Unary (LogNot, inner) -> (
+                  match (inner.node, inner.ty) with
+                  | Call (_, _, MethodCall _), Bool -> (inner, true)
+                  | _ -> (test, false))
               | _ -> (test, false)
             else (test, false)
           in
