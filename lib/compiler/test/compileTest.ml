@@ -622,36 +622,37 @@ let%expect_test "local ref int reassign" =
     |};
   [%expect
     {|
-      000: FUNC f
-      006: CALLSYS LockPeek
-      012: POP
-      014: PUSHLOCALPAGE
-      016: PUSH 0
-      022: DUP2
-      024: REFREF
-      026: POP
-      028: DELETE
-      030: PUSHLOCALPAGE
-      032: PUSH 2
-      038: REFREF
-      040: DUP_U2
-      042: SP_INC
-      044: R_ASSIGN
-      046: POP
-      048: POP
-      050: CALLSYS UnlockPeek
-      056: POP
-      058: PUSHLOCALPAGE
-      060: PUSH 0
-      066: REFREF
-      068: REF
-      070: RETURN
-      072: PUSH 0
-      078: RETURN
-      080: ENDFUNC f
-      086: EOF test.jaf
-      092: FUNC NULL
-      098: EOF
+    000: FUNC f
+    006: CALLSYS LockPeek
+    012: POP
+    014: PUSHLOCALPAGE
+    016: PUSH 0
+    022: DUP2
+    024: REFREF
+    026: POP
+    028: DELETE
+    030: DUP2
+    032: PUSHLOCALPAGE
+    034: PUSH 2
+    040: REFREF
+    042: R_ASSIGN
+    044: POP
+    046: POP
+    048: REF
+    050: SP_INC
+    052: CALLSYS UnlockPeek
+    058: POP
+    060: PUSHLOCALPAGE
+    062: PUSH 0
+    068: REFREF
+    070: REF
+    072: RETURN
+    074: PUSH 0
+    080: RETURN
+    082: ENDFUNC f
+    088: EOF test.jaf
+    094: FUNC NULL
+    100: EOF
     |}]
 
 let%expect_test "ref struct reassign" =
@@ -672,18 +673,21 @@ let%expect_test "ref struct reassign" =
     022: DUP2
     024: REF
     026: DELETE
-    028: SH_LOCALREF b
-    034: DUP
-    036: SP_INC
-    038: ASSIGN
+    028: DUP2
+    030: SH_LOCALREF b
+    036: ASSIGN
+    038: DUP_X2
     040: POP
-    042: CALLSYS UnlockPeek
-    048: POP
-    050: RETURN
-    052: ENDFUNC f
-    058: EOF test.jaf
-    064: FUNC NULL
-    070: EOF
+    042: REF
+    044: SP_INC
+    046: POP
+    048: CALLSYS UnlockPeek
+    054: POP
+    056: RETURN
+    058: ENDFUNC f
+    064: EOF test.jaf
+    070: FUNC NULL
+    076: EOF
     |}]
 
 let%expect_test "struct ref int assign" =
@@ -1410,21 +1414,210 @@ let%expect_test "comma operator in reference context" =
     122: REFREF
     124: POP
     126: DELETE
-    128: SH_LOCALREF i
-    134: POP
-    136: PUSHLOCALPAGE
-    138: PUSH 1
-    144: REFREF
-    146: DUP_U2
-    148: SP_INC
-    150: R_ASSIGN
+    128: DUP2
+    130: SH_LOCALREF i
+    136: POP
+    138: PUSHLOCALPAGE
+    140: PUSH 1
+    146: REFREF
+    148: R_ASSIGN
+    150: POP
     152: POP
-    154: POP
-    156: CALLSYS UnlockPeek
-    162: POP
-    164: RETURN
-    166: ENDFUNC f
-    172: EOF test.jaf
-    178: FUNC NULL
-    184: EOF
+    154: REF
+    156: SP_INC
+    158: CALLSYS UnlockPeek
+    164: POP
+    166: RETURN
+    168: ENDFUNC f
+    174: EOF test.jaf
+    180: FUNC NULL
+    186: EOF
     |}]
+
+(* v11 omits the trailing JUMP-over-alt when there's no else branch.
+   Pre-v11 always emits one (legacy layout). *)
+let%expect_test "v11 if without else skips trailing JUMP" =
+  compile_test ~ain_version:11
+    {|
+      void f() {
+        int i = 1;
+        if (i) {
+          i = 2;
+        }
+      }
+  |};
+  [%expect {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: PUSH 1
+    020: ASSIGN
+    022: POP
+    024: PUSHLOCALPAGE
+    026: PUSH 0
+    032: REF
+    034: ITOB
+    036: IFZ 60
+    042: PUSHLOCALPAGE
+    044: PUSH 0
+    050: PUSH 2
+    056: ASSIGN
+    058: POP
+    060: RETURN
+    062: ENDFUNC f
+    068: EOF test.jaf
+    074: FUNC NULL
+    080: EOF
+    |}]
+
+(* v11 ref-decl: 'ref array@T List = globalArray;' uses the original
+   compiler's DUP2+REF+DELETE declaration pattern instead of the older
+   generic RefAssign lowering. *)
+let%expect_test "v11 ref array decl from global" =
+  compile_test ~ain_version:11 {|
+    array@int g_List;
+    void f() {
+      ref array@int List = g_List;
+    }
+  |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: DUP2
+    016: REF
+    018: DELETE
+    020: PUSHGLOBALPAGE
+    022: PUSH 0
+    028: REF
+    030: ASSIGN
+    032: SP_INC
+    034: RETURN
+    036: ENDFUNC f
+    042: EOF test.jaf
+    048: FUNC NULL
+    054: EOF
+    |}]
+
+(* v11 emits NOT, then normalizes through ITOB before assignment. *)
+let%expect_test "v11 NOT assign emits ITOB" =
+  compile_test ~ain_version:11
+    {|
+      class C {
+        int m_flag;
+        void Toggle() {
+          this.m_flag = !this.m_flag;
+        }
+      };
+    |};
+  [%expect
+    {|
+    000: FUNC C@Toggle
+    006: PUSHSTRUCTPAGE
+    008: PUSH 0
+    014: PUSHSTRUCTPAGE
+    016: PUSH 0
+    022: REF
+    024: NOT
+    026: ITOB
+    028: ASSIGN
+    030: POP
+    032: RETURN
+    034: EOF test.jaf
+    040: FUNC NULL
+    046: EOF
+    |}]
+
+(* v11 SR_ASSIGN drops its struct-type-id operand. Pre-v11 needs
+   PUSH sno; SR_ASSIGN — leaving the PUSH in v11 leaves a stale int on
+   the stack and shifts every following instruction. *)
+let%expect_test "v11 struct copy-assign omits SR_ASSIGN's type operand" =
+  compile_test ~ain_version:11
+    {|
+      class S { int x; };
+      void f(S a, S b) {
+        a = b;
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: REF
+    016: PUSHLOCALPAGE
+    018: PUSH 1
+    024: REF
+    026: A_REF
+    028: SR_ASSIGN
+    030: DELETE
+    032: RETURN
+    034: ENDFUNC f
+    040: EOF test.jaf
+    046: FUNC NULL
+    052: EOF
+    |}]
+
+(* v11 OBJSWAP carries its type-id as a direct operand instead of
+   reading it off the stack. Pre-v11 was [PUSH type; OBJSWAP]; v11 is
+   [OBJSWAP type]. Without this, two opcode worth of bytes downstream
+   get swallowed as the operand and the disassembler misaligns. *)
+let%expect_test "v11 OBJSWAP encodes type as direct operand" =
+  compile_test ~ain_version:11
+    {|
+      void f(string a, string b) {
+        a <=> b;
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: PUSHLOCALPAGE
+    016: PUSH 1
+    022: OBJSWAP 12
+    028: RETURN
+    030: ENDFUNC f
+    036: EOF test.jaf
+    042: FUNC NULL
+    048: EOF
+    |}]
+
+(* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
+   pre-v11 form doesn't incref and the VM panics freeing the returned
+   string. *)
+let%expect_test "v11 string local deref uses REF + A_REF" =
+  compile_test ~ain_version:11
+    {|
+      void f() {
+        string s;
+        string t = s;
+      }
+    |};
+  [%expect
+    {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: REF
+    016: S_PUSH ""
+    022: S_ASSIGN
+    024: DELETE
+    026: PUSHLOCALPAGE
+    028: PUSH 1
+    034: REF
+    036: PUSHLOCALPAGE
+    038: PUSH 0
+    044: REF
+    046: A_REF
+    048: S_ASSIGN
+    050: DELETE
+    052: RETURN
+    054: ENDFUNC f
+    060: EOF test.jaf
+    066: FUNC NULL
+    072: EOF
+    |}]
+

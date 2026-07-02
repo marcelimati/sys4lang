@@ -63,7 +63,16 @@ class visitor ctx =
         (* generate array initializer for the class *)
         let name = if !has_ctor then "2" else "0" in
         let full_name = s.name ^ "@" ^ name in
-        let f_index = (Ain.add_function ctx.ain full_name).index in
+        (* v11 [declarations.ml] pre-registers [Class@2] before
+           allocating the matching [Class@0] constructor slot, so it
+           interleaves with the constructor in the function table.
+           Reuse that pre-registered slot if present; fall back to
+           appending a new entry otherwise (pre-v11 / no constructor). *)
+        let f_index =
+          match Ain.get_function ctx.ain full_name with
+          | Some f -> f.index
+          | None -> (Ain.add_function ctx.ain full_name).index
+        in
         let fdecl =
           {
             name;

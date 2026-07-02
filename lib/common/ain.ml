@@ -1010,14 +1010,30 @@ let write_msg1_string buf s =
   BinBuffer.add_bytes buf tmp
 
 let rec write_variable_type ?(var = true) buf ain (t : Type.t) =
+  (* v11 fallback: [hll_param] has no dedicated type code as a variable
+     slot. Foreach vars whose element type couldn't be narrowed end up
+     here - encode them as [int] so the file is at least loadable. *)
+  let t =
+    if version_gte ain (11, 0) then
+      match t with
+      | Type.HLLParam -> Type.Int
+      | Type.Ref Type.HLLParam -> Type.Ref Type.Int
+      | _ -> t
+    else t
+  in
   BinBuffer.add_int buf (Type.int_of_data_type ain.major_version t);
   BinBuffer.add_int buf (Type.int_of_struct_type ain.major_version t ~var);
-  BinBuffer.add_int buf (Type.int_of_rank ain.major_version t);
   if version_gte ain (11, 0) then
+    (* v11 format: no rank field; instead a presence-bool for the
+       recursive subtype. Ref-wrapped composites unwrap to their inner
+       for subtype encoding. *)
     match t with
-    | Array t | Wrap t | Option t | Unknown87 t ->
+    | Array t | Wrap t | Option t | Unknown87 t
+    | Ref (Array t | Wrap t | Option t | Unknown87 t) ->
+        BinBuffer.add_bool buf true;
         write_variable_type ~var buf ain t
-    | _ -> ()
+    | _ -> BinBuffer.add_bool buf false
+  else BinBuffer.add_int buf (Type.int_of_rank ain.major_version t)
 
 let write_return_type buf ain (t : Type.t) =
   if version_gte ain (11, 0) then write_variable_type ~var:false buf ain t
@@ -1029,6 +1045,20 @@ let write_string_option buf opt = Option.iter opt ~f:(BinBuffer.add_cstring buf)
 
 let write_variable buf ain (v : Variable.t) =
   let module BB = BinBuffer in
+  (* v11: [HLLParam] has no dedicated variable-slot type code, so
+     [write_variable_type] coerces it to [Int]. The matching initval
+     byte must also be [Int 0] - [Void] would leave the initval-bool
+     set but skip the 4-byte int payload, corrupting every subsequent
+     variable's encoding. *)
+  let initval =
+    if version_gte ain (11, 0) then
+      match (v.value_type, v.initval) with
+      | Type.HLLParam, Some Variable.Void
+      | Type.Ref Type.HLLParam, Some Variable.Void ->
+          Some (Variable.Int 0l)
+      | _ -> v.initval
+    else v.initval
+  in
   let write_variable_initval (opt : Variable.initval option) =
     BB.add_bool buf (Option.is_some opt);
     match opt with
@@ -1041,7 +1071,7 @@ let write_variable buf ain (v : Variable.t) =
   BB.add_cstring buf v.name;
   if_version_gte ain (12, 0) (write_string_option buf) () v.name2;
   write_variable_type buf ain v.value_type;
-  if_version_gte ain (8, 0) write_variable_initval () v.initval
+  if_version_gte ain (8, 0) write_variable_initval () initval
 
 let write_function buf ain (f : Function.t) =
   let module BB = BinBuffer in
@@ -1322,12 +1352,24 @@ let write_new_global ain (v : Variable.t) =
   index
 
 let add_global ain name group_index =
-  let index = Dynarray.length ain.globals in
-  let variable = Variable.make ~index name Void in
-  let g = Global.create variable group_index in
-  Dynarray.add_last ain.globals g;
-  try_add_name_index ain.global_by_name name index;
-  index
+  (* v11 dedup by name: overlapping type-declare passes can register
+     the same global twice — return the existing index to avoid
+     duplicate entries. Pre-v11 keeps the historical append-only
+     behavior; the duplicate check happens at the [declarations.ml]
+     callsite via [Hashtbl.add ctx.globals]. *)
+  let existing =
+    if version_gte ain (11, 0) then Hashtbl.find ain.global_by_name name
+    else None
+  in
+  match existing with
+  | Some i -> i
+  | None ->
+      let index = Dynarray.length ain.globals in
+      let variable = Variable.make ~index name Void in
+      let g = Global.create variable group_index in
+      Dynarray.add_last ain.globals g;
+      try_add_name_index ain.global_by_name name index;
+      index
 
 let add_global_group ain name =
   let exception Found of int in
@@ -1358,9 +1400,38 @@ let write_new_function ain (f : Function.t) =
   try_add_name_index ain.function_by_name f.name index;
   index
 
-let add_function ain name =
-  let no = Function.create name |> write_new_function ain in
-  Dynarray.get ain.functions no
+(* v11 stub-aware [add_function]: if an unclaimed stub (address = -1)
+   with matching name (and matching arity when [~nr_args] is passed)
+   already exists, reuse its slot and mark it claimed (address = -2)
+   instead of appending a new entry. This lets ghost-lambda
+   pre-registration and the later real-lambda [add_function] call
+   share the same function-table slot, matching the original
+   compiler's behavior. Without this, ghost + real allocate two
+   entries with the same name, breaking lookups and dispatch. *)
+let add_function ?(nr_args = -1) ain name =
+  let matching_stub =
+    if version_gte ain (11, 0) then (
+      let len = Dynarray.length ain.functions in
+      let rec find i =
+        if i >= len then None
+        else
+          let f = Dynarray.get ain.functions i in
+          if
+            String.equal f.name name && f.address = -1
+            && (nr_args < 0 || f.nr_args = nr_args)
+          then Some f
+          else find (i + 1)
+      in
+      find 0)
+    else None
+  in
+  match matching_stub with
+  | Some f ->
+      Dynarray.set ain.functions f.index { f with address = -2 };
+      Dynarray.get ain.functions f.index
+  | None ->
+      let no = Function.create name |> write_new_function ain in
+      Dynarray.get ain.functions no
 
 (* scenario labels (ain v1 only) *)
 
@@ -1385,8 +1456,17 @@ let write_new_struct ain (s : Struct.t) =
   index
 
 let add_struct ain name =
-  let no = Struct.create name |> write_new_struct ain in
-  Dynarray.get ain.structures no
+  (* v11 dedup by name: overlapping type-declare passes can register
+     the same struct twice — return the existing entry. Pre-v11 keeps
+     the historical append-only behavior. *)
+  let existing =
+    if version_gte ain (11, 0) then get_struct ain name else None
+  in
+  match existing with
+  | Some s -> s
+  | None ->
+      let no = Struct.create name |> write_new_struct ain in
+      Dynarray.get ain.structures no
 
 (* switches *)
 
@@ -1432,9 +1512,12 @@ let write_new_library ain (lib : Library.t) =
   index
 
 let add_library ain name =
-  let lib : Library.t = { index = -1; name; functions = [||] } in
-  let no = write_new_library ain lib in
-  Dynarray.get ain.libraries no
+  match get_library_index ain name with
+  | Some i -> Dynarray.get ain.libraries i
+  | None ->
+      let lib : Library.t = { index = -1; name; functions = [||] } in
+      let no = write_new_library ain lib in
+      Dynarray.get ain.libraries no
 
 let function_of_hll_function_index ain lib_no fun_no : Function.t =
   let lib_fun = (Dynarray.get ain.libraries lib_no).functions.(fun_no) in
@@ -1481,8 +1564,11 @@ let write_new_functype ain (ft : FunctionType.t) =
   index
 
 let add_functype ain name =
-  let no = FunctionType.create name |> write_new_functype ain in
-  Dynarray.get ain.function_types no
+  match get_functype ain name with
+  | Some ft -> ft
+  | None ->
+      let no = FunctionType.create name |> write_new_functype ain in
+      Dynarray.get ain.function_types no
 
 (* TODO: should be FunctionType.to_function *)
 let function_of_functype (ft : FunctionType.t) no : Function.t =
@@ -1523,8 +1609,11 @@ let write_new_delegate ain (dg : FunctionType.t) =
   index
 
 let add_delegate ain name =
-  let no = FunctionType.create name |> write_new_delegate ain in
-  Dynarray.get ain.delegates no
+  match get_delegate ain name with
+  | Some d -> d
+  | None ->
+      let no = FunctionType.create name |> write_new_delegate ain in
+      Dynarray.get ain.delegates no
 
 let function_of_delegate_index ain no =
   function_of_functype (Dynarray.get ain.delegates no) no

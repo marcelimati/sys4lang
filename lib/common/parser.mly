@@ -109,13 +109,13 @@ let rec multidim_array dims t =
 %token SWAP
 /* delimiters */
 %token LPAREN RPAREN RBRACKET LBRACKET LBRACE RBRACE
-%token QUESTION COLON COCO SEMICOLON AT COMMA DOT HASH FATARROW
+%token QUESTION QUESTION_DOT QUESTION_QUESTION COLON COCO SEMICOLON AT COMMA DOT HASH FATARROW
 /* types */
-%token VOID CHAR INT LINT FLOAT BOOL STRING HLL_PARAM HLL_FUNC HLL_DELEGATE
+%token VOID CHAR INT LINT FLOAT BOOL STRING HLL_PARAM HLL_FUNC HLL_FUNC2 HLL_DELEGATE
 /* keywords */
-%token IF ELSE WHILE DO FOR SWITCH CASE DEFAULT NULL THIS NEW
+%token IF ELSE WHILE DO FOR FOREACH FOREACH_R SWITCH CASE DEFAULT NULL THIS NEW
 %token GOTO CONTINUE BREAK RETURN JUMP JUMPS ASSERT
-%token CONST REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM
+%token CONST REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM EVENT
 %token FILE_MACRO LINE_MACRO DATE_MACRO TIME_MACRO GLOBALGROUP UNKNOWN_FUNCTYPE
 %token UNKNOWN_DELEGATE
 
@@ -136,7 +136,7 @@ let rec multidim_array dims t =
 %%
 
 jaf
-  : external_declaration* EOF { $1 }
+  : external_declaration* EOF { List.concat $1 }
   ;
 
 hll
@@ -206,7 +206,9 @@ postfix_expression
   | primitive_type_specifier LPAREN expression RPAREN { make_expr ~loc:$sloc (Cast ($1, $3)) }
   | postfix_expression arglist { make_expr ~loc:$sloc (Call ($1, $2, UnresolvedCall)) }
   | NEW qualified_name { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
+  | NEW qualified_name LPAREN RPAREN { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
   | postfix_expression DOT IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
+  | postfix_expression QUESTION_DOT IDENTIFIER { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
   | postfix_expression INC { make_expr ~loc:$sloc (Unary (PostInc, $1)) }
   | postfix_expression DEC { make_expr ~loc:$sloc (Unary (PostDec, $1)) }
   ;
@@ -289,9 +291,15 @@ logor_expression
   | logor_expression OR logand_expression { make_expr ~loc:$sloc (Binary (LogOr, $1, $3)) }
   ;
 
-cond_expression
+null_coalesce_expression
   : logor_expression { $1 }
-  | logor_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
+  | null_coalesce_expression QUESTION_QUESTION logor_expression
+    { make_expr ~loc:$sloc (NullCoalesce ($1, $3)) }
+  ;
+
+cond_expression
+  : null_coalesce_expression { $1 }
+  | null_coalesce_expression QUESTION expression COLON cond_expression { make_expr ~loc:$sloc (Ternary ($1, $3, $5)) }
   ;
 
 assign_expression
@@ -333,6 +341,7 @@ primitive_type_specifier
   | STRUCT       { Struct("struct", -1) }
   | HLL_PARAM    { HLLParam }
   | HLL_FUNC     { HLLFunc }
+  | HLL_FUNC2    { HLLFunc2 }
   | HLL_DELEGATE { Delegate (Some ("hll_delegate", -1)) }
   | UNKNOWN_FUNCTYPE { FuncType None }
   | UNKNOWN_DELEGATE { Delegate None }
@@ -347,7 +356,29 @@ type_specifier
   (* FIXME: this disallows arrays/wraps of ref-qualified types *)
   | ARRAY AT atomic_type_specifier AT I_CONSTANT { multidim_array $5 $3 }
   | ARRAY AT atomic_type_specifier { Array $3 }
+  | ARRAY AT REF atomic_type_specifier { Array (Ref $4) }
   | WRAP AT type_specifier { Wrap $3 }
+
+(* HLL declarations allow a bare `array` (meaning array of untyped
+   hll_param). Only reachable from hll_declaration / its parameter list. *)
+hll_type_specifier
+  : type_specifier { $1 }
+  | ARRAY { Array HLLParam }
+
+hll_declaration_specifiers
+  : REF hll_type_specifier { { location = $sloc; ty = Ref $2 } }
+  | hll_type_specifier { { location = $sloc; ty = $1 } }
+  ;
+
+hll_parameter_declaration
+  : hll_declaration_specifiers declarator(IDENTIFIER)
+    { vardecl Parameter false $1 { $2 with loc=$sloc } }
+  ;
+
+hll_parameter_list
+  : LPAREN separated_list(COMMA, hll_parameter_declaration) RPAREN { $2 }
+  | LPAREN VOID RPAREN { [] }
+  ;
 
 statement
   : declaration_statement { stmt $sloc $1 }
@@ -414,7 +445,15 @@ iteration_statement
            $6,
            $8)
     }
-  ; 
+  | FOREACH LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, None, $5, $7) }
+  | FOREACH LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, $3, Some $5, $7, $9) }
+  | FOREACH_R LPAREN IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, None, $5, $7) }
+  | FOREACH_R LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, $3, Some $5, $7, $9) }
+  ;
 
 jump_statement
   : GOTO IDENTIFIER SEMICOLON { Goto ($2) }
@@ -469,31 +508,94 @@ array_allocation(X)
 
 external_declaration
   : declaration(qualified_name)
-    { Global { $1 with vars = (List.map (fun d -> { d with kind = GlobalVar }) $1.vars) } }
+    { [ Global { $1 with vars = (List.map (fun d -> { d with kind = GlobalVar }) $1.vars) } ] }
   | ioption(declaration_specifiers) qualified_funcname parameter_list(init_declarator(IDENTIFIER)) block
-    { Function (func $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $4)) }
+    { [ Function (func $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $4)) ] }
   | HASH qualified_name LPAREN VOID? RPAREN block
-    { Function { (func $sloc (implicit_void $symbolstartpos) $2 [] (Some $6)) with is_label=true } }
+    { [ Function { (func $sloc (implicit_void $symbolstartpos) $2 [] (Some $6)) with is_label=true } ] }
   | FUNCTYPE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
-    { FuncTypeDef (func $sloc $2 $3 $4 None) }
+    { [ FuncTypeDef (func $sloc $2 $3 $4 None) ] }
   | DELEGATE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
-    { DelegateDef (func $sloc $2 $3 $4 None) }
+    { [ DelegateDef (func $sloc $2 $3 $4 None) ] }
   | struct_or_class qualified_name LBRACE struct_declaration* RBRACE SEMICOLON
-    { StructDef ({ loc = $sloc; is_class = $1; name = $2; decls = $4 }) }
+    { [ StructDef ({ loc = $sloc; is_class = $1; name = $2; decls = $4 }) ] }
   | ENUM enumerator_list SEMICOLON
-    { Enum ({ loc=$sloc; name=None; values=$2 }) }
+    { [ Enum ({ loc=$sloc; name=None; values=$2 }) ] }
   | ENUM IDENTIFIER enumerator_list SEMICOLON
-    { Enum ({ loc=$sloc; name=Some $2; values=$3 }) }
+    { [ Enum ({ loc=$sloc; name=Some $2; values=$3 }) ] }
   | GLOBALGROUP IDENTIFIER SEMICOLON
-    { GlobalGroup { name = $2; loc = $loc; vardecls = [] } }
+    { [ GlobalGroup { name = $2; loc = $loc; vardecls = [] } ] }
   | GLOBALGROUP IDENTIFIER LBRACE declaration(qualified_name)* RBRACE
     {
       let update_decls ds = { ds with vars = (List.map (fun d -> { d with kind = GlobalVar }) ds.vars) } in
-      GlobalGroup { name = $2; loc = $loc; vardecls = List.map update_decls $4 }
+      [ GlobalGroup { name = $2; loc = $loc; vardecls = List.map update_decls $4 } ]
+    }
+  | declaration_specifiers qualified_funcname LBRACE bodied_accessor+ RBRACE
+    (* v11 property implementation at top level:
+       [T Class::Name { get { body } set { body } }]. Either [get] or
+       [set] may be omitted for read-only / write-only properties.
+       Lowers to up to two method definitions [Class@Name::get] and
+       [Class@Name::set(T value)] which override the auto-stub bodies
+       synthesized for the matching [T Name { get; set; }] declaration
+       in the class body. *)
+    {
+      let find_accessor name = List.assoc_opt name $4 in
+      let get_body = find_accessor "get" in
+      let set_body = find_accessor "set" in
+      (match get_body, set_body with
+       | None, None -> raise Parsing.Parse_error
+       | _ -> ());
+      let value_param =
+        { name = "value"; loc = $loc($1); dims = []; initval = None }
+      in
+      let getter =
+        Option.map (fun body ->
+          Function (func $sloc $1 ($2 ^ "::get") [] (Some body))) get_body
+      in
+      let setter =
+        Option.map (fun body ->
+          Function (func $sloc
+            { location = $loc($1); ty = Void }
+            ($2 ^ "::set")
+            [ vardecl Parameter false $1 value_param ]
+            (Some body))) set_body
+      in
+      List.filter_map (fun x -> x) [ getter; setter ]
+    }
+  | EVENT declaration_specifiers qualified_funcname LBRACE bodied_accessor bodied_accessor RBRACE
+    (* v11 manual-event implementation at top level:
+       [event T Class::Name { add { body } remove { body } }]. Lowers
+       to two method definitions [Class@Name::add(T value)] and
+       [Class@Name::remove(T value)] with the supplied bodies. The
+       matching [event T Name;] prototype must appear separately in
+       the class declaration. *)
+    {
+      let value_param =
+        { name = "value"; loc = $loc($2); dims = []; initval = None }
+      in
+      let accessor_fun kind body =
+        func $sloc
+          { location = $loc($2); ty = Void }
+          ($3 ^ "::" ^ kind)
+          [ vardecl Parameter false $2 value_param ]
+          (Some body)
+      in
+      let (add_body, remove_body) =
+        match $5, $6 with
+        | ("add", b1), ("remove", b2) -> (b1, b2)
+        | ("remove", b2), ("add", b1) -> (b1, b2)
+        | _ -> raise Parsing.Parse_error
+      in
+      [ Function (accessor_fun "add" add_body);
+        Function (accessor_fun "remove" remove_body) ]
     }
 
+bodied_accessor
+  : IDENTIFIER block { ($1, $2) }
+  ;
+
 hll_declaration
-  : declaration_specifiers IDENTIFIER parameter_list(declarator(IDENTIFIER)) SEMICOLON
+  : hll_declaration_specifiers IDENTIFIER hll_parameter_list SEMICOLON
     { Function (func $sloc $1 $2 $3 None) }
 
 %inline struct_or_class
@@ -537,6 +639,21 @@ struct_declaration
   | declaration_specifiers separated_nonempty_list(COMMA, declarator(IDENTIFIER)) SEMICOLON
     { let vars = vardecls ClassVar false $1 $2 in
       MemberDecl { decl_loc=$sloc; typespec=$1; is_const_decls = false; vars } }
+  | declaration_specifiers IDENTIFIER LBRACE property_accessor_decl+ RBRACE
+    (* v11 property declaration: `T Name { get; set; }`, or subsets for
+       read-only / write-only. Accessor names are validated (only `get`
+       and `set` are legal) and expanded into a `<Name>` backing field
+       plus synthetic get/set methods by the declaration-analysis pass. *)
+    { PropertyDecl
+        { pd_loc = $sloc; pd_typespec = $1; pd_name = $2;
+          pd_accessors = $4 } }
+  | EVENT declaration_specifiers IDENTIFIER SEMICOLON
+    (* v11 event declaration. Lowers to a delegate-typed [<Name>]
+       backing member plus prototype-only [Name::add(T value)] /
+       [Name::remove(T value)] methods. Use sites [obj.Name += h] /
+       [obj.Name -= h] dispatch through delegate-add/remove on the
+       backing field. *)
+    { EventDecl { ed_loc = $sloc; ed_typespec = $2; ed_name = $3 } }
   | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
     { Method (func $sloc $1 $2 $3 $4) }
   | IDENTIFIER LPAREN VOID? RPAREN opt_body
@@ -553,4 +670,8 @@ access_specifier
 opt_body
   : SEMICOLON { None }
   | block { Some $1 }
+  ;
+
+property_accessor_decl
+  : IDENTIFIER SEMICOLON { ($1, $loc($1)) }
   ;

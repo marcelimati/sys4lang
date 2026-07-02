@@ -30,6 +30,10 @@ type unary_op =
   | PreDec
   | PostInc
   | PostDec
+  (* v11 foreach increment/decrement on the loop counter — emitted by
+     foreach desugaring. Behaves like PreInc/PreDec for codegen. *)
+  | ForeachInc
+  | ForeachDec
 
 type binary_op =
   | Plus
@@ -83,6 +87,7 @@ type jaf_type =
   | Wrap of jaf_type
   | HLLParam
   | HLLFunc
+  | HLLFunc2
   | Delegate of (string * int) option
   | FuncType of (string * int) option
   | IMainSystem
@@ -100,6 +105,15 @@ let ft_compatible (args, ret) (args', ret') =
   jaf_type_equal ret ret'
   && List.length args = List.length args'
   && List.for_all2_exn args args' ~f:jaf_type_equal
+
+(* Overload identity: two methods overload each other only if their
+   parameter types differ. Return type is not part of the signature
+   (C-like / Java-like rule). If parameters are identical, the two
+   decls are "the same method" — one is either a prototype, the body,
+   or an actual duplicate. *)
+let params_compatible a b =
+  List.length a = List.length b
+  && List.for_all2_exn a b ~f:jaf_type_equal
 
 let is_scalar = function
   | Int | Bool | Float | LongInt | FuncType _ -> true
@@ -122,6 +136,9 @@ type type_specifier = { mutable ty : jaf_type; location : location }
 type ident_type =
   | UnresolvedIdent
   | LocalVariable of int * location
+  (* v11 lambda capture: [index] in the enclosing scope's local frame,
+     [level] hops upward (1 = direct parent, 2 = grandparent, …). *)
+  | CapturedVariable of int * int
   | GlobalVariable of int
   | GlobalConstant
   | FunctionName of string
@@ -134,6 +151,28 @@ type member_type =
   | ClassVariable of int
   | ClassConst of string
   | ClassMethod of string * int
+  (* v11 property access. Type analysis rewrites reads into a call
+     to the getter and assignments into a call to the setter, so
+     later passes never encounter this variant. *)
+  | ClassProperty of {
+      prop_class : string;
+      prop_name : string;
+      prop_getter_index : int option;
+      prop_setter_index : int option;
+    }
+  (* v11 user-bodied event access. When a class declares
+     [event T Name;] but its [<Name>] backing field has been elided
+     because the user supplied [Name::add] / [Name::remove] bodies at
+     top level, [obj.Name += h] / [obj.Name -= h] no longer routes
+     through a delegate-typed member — type analysis rewrites the
+     [Assign] into a call through the user's [Name::add] /
+     [Name::remove] method instead. *)
+  | ClassEvent of {
+      event_class : string;
+      event_name : string;
+      event_add_index : int option;
+      event_remove_index : int option;
+    }
   | HLLFunction of string * string
   | SystemFunction of Bytecode.syscall
   | BuiltinMethod of Bytecode.builtin
@@ -170,6 +209,14 @@ and ast_expression =
   | Assign of assign_op * expression * expression
   | Seq of expression * expression
   | Ternary of expression * expression * expression
+  (* v11 optional member access [a?.b]: evaluate [a]; if non-NULL
+     produce its [.b] member, else short-circuit to NULL. Resolved
+     in type analysis much like [Member]. *)
+  | OptionalMember of expression * string * member_type
+  (* v11 null-coalesce [a ?? b]: evaluate [a]; if NULL evaluate [b]
+     and return that, else return [a]. Both sides must produce a
+     compatible type. *)
+  | NullCoalesce of expression * expression
   | Cast of jaf_type * expression
   | Subscript of expression * expression
   | Member of expression * string * member_type
@@ -197,6 +244,11 @@ and ast_statement =
   | While of expression * statement
   | DoWhile of expression * statement
   | For of statement * expression option * expression option * statement
+  (* v11 foreach: [foreach (var : array)] or [foreach_r] for reverse,
+     with optional explicit index variable name as the third field.
+     Lowered into a while loop by [desugar_foreach] before type
+     analysis runs, so codegen never sees this variant directly. *)
+  | ForEach of bool * string * string option * expression * statement
   | Goto of string
   | Continue
   | Break
@@ -269,18 +321,46 @@ let mangled_name fdecl =
 
 type access_specifier = Public | Private
 
+(* v11 property declaration inside a class body: `T Name { get; set; }`.
+   Expanded at declaration-analysis time into a mangled backing field
+   `<Name>` plus synthetic get/set methods, matching what the original
+   v11 compiler emits. [pd_accessors] lists the accessor names in
+   source order, validated at expansion time (only `get`/`set` are
+   legal). *)
+type property_decl = {
+  pd_loc : location;
+  pd_typespec : type_specifier;
+  pd_name : string;
+  pd_accessors : (string * location) list;
+}
+
+(* v11 event declaration inside a class body: `event T Name;`. Expanded
+   at declaration-analysis time into a delegate-typed mangled backing
+   field `<Name>` plus prototype-only [Name::add(T value)] and
+   [Name::remove(T value)] methods (kept body-less; the original compiler
+   emits matching function-table entries that the runtime never invokes
+   for auto-events — [+= h] / [-= h] dispatch lowers to direct delegate
+   ops on the [<Name>] field). *)
+type event_decl = {
+  ed_loc : location;
+  ed_typespec : type_specifier;
+  ed_name : string;
+}
+
 type struct_declaration =
   | AccessSpecifier of access_specifier
   | MemberDecl of vardecls
   | Constructor of fundecl
   | Destructor of fundecl
   | Method of fundecl
+  | PropertyDecl of property_decl
+  | EventDecl of event_decl
 
 type structdecl = {
   name : string;
   is_class : bool;
   loc : location;
-  decls : struct_declaration list;
+  mutable decls : struct_declaration list;
 }
 
 type enumdecl = {
@@ -327,20 +407,58 @@ let ast_node_pos = function
       | MemberDecl d -> d.decl_loc
       | Constructor f -> f.loc
       | Destructor f -> f.loc
-      | Method f -> f.loc)
+      | Method f -> f.loc
+      | PropertyDecl p -> p.pd_loc
+      | EventDecl e -> e.ed_loc)
   | ASTType t -> t.location
+
+(* v11 property metadata recorded on a class during declaration
+   analysis: each property has a type, an optional getter method,
+   and an optional setter method (each declared as `Name::get` /
+   `Name::set` in the function table). Use sites `obj.Name`
+   dispatch through the methods. See [Declarations.expand_property_decl]
+   for the lowering from [PropertyDecl]. *)
+type property_info = {
+  (* Reference to the mutable [type_specifier] from the original
+     [PropertyDecl] so later type-resolution passes (which mutate
+     the type_specifier in place to turn [Unresolved] into [Struct _]
+     etc.) are reflected here too. *)
+  prop_typespec : type_specifier;
+  prop_getter : fundecl option;
+  prop_setter : fundecl option;
+}
+
+(* Helper for callers that just want the resolved type. *)
+let prop_info_ty (p : property_info) = p.prop_typespec.ty
 
 type jaf_struct = {
   name : string;
   loc : location;
   index : int;
   members : (string, variable) Hashtbl.t;
+  properties : (string, property_info) Hashtbl.t;
 }
 
 let new_jaf_struct name loc index =
-  { name; loc; index; members = Hashtbl.create (module String) }
+  {
+    name;
+    loc;
+    index;
+    members = Hashtbl.create (module String);
+    properties = Hashtbl.create (module String);
+  }
 
-type library = { hll_name : string; functions : (string, fundecl) Hashtbl.t }
+(* HLL libraries can declare multiple functions with the same name but
+   different parameter signatures (v11). The first-seen declaration is
+   stored in [functions] under its plain name; any same-name declaration
+   with distinct parameter types appends to [overloads] so call-site
+   resolution can pick by argument types. Empty [overloads] for non-v11
+   libraries. *)
+type library = {
+  hll_name : string;
+  functions : (string, fundecl) Hashtbl.t;
+  overloads : (string, fundecl list) Hashtbl.t;
+}
 
 type context = {
   ain : Ain.t;
@@ -348,9 +466,26 @@ type context = {
   globals : (string, variable) Hashtbl.t;
   structs : (string, jaf_struct) Hashtbl.t;
   functions : (string, fundecl) Hashtbl.t;
+  (* v11 overloaded methods / functions, keyed by [mangled_name]
+     ([Class@Name] for methods, plain function name otherwise). The
+     entry in [functions] holds the first-seen declaration; any
+     overload with distinct parameter types is appended here. Resolved
+     at call sites by matching against the actual argument types. Empty
+     for pre-v11 programs. *)
+  overloads : (string, fundecl list) Hashtbl.t;
   functypes : (string, fundecl) Hashtbl.t;
   delegates : (string, fundecl) Hashtbl.t;
   libraries : (string, library) Hashtbl.t;
+  (* v11 property / event accessor names whose body the user supplies
+     at top level (as [T Class::Name { get { body } set { body } }] or
+     [event T Class::Name { add { body } remove { body } }]).
+     Populated by a pre-scan over all parsed jaf files. Keys take the
+     [Class@Name::accessor] mangled shape. Used by [expand_property_decl]
+     to elide auto-stub bodies / backing fields when the user owns
+     accessor dispatch, and by the StructDef define check to skip the
+     "no definition found" diagnostic for the prototype emitted by the
+     auto-expansion. *)
+  user_bodied_accessors : (string, unit) Hashtbl.t;
 }
 
 let find_hll_function ctx lib func =
@@ -414,7 +549,15 @@ class environment ctx current_function =
                 | None -> UnresolvedName))
       in
       match name with
-      | "system" -> ResolvedSystem
+      | "system" ->
+          (* v11 ships a [system] HLL library that overlaps with the
+             classic [system.*] syscall receiver. If the library is
+             registered, prefer it — otherwise the [Output] et al.
+             HLL entries get shadowed and calls emit [CALLSYS] instead
+             of [CALLHLL], which the v11 VM rejects. *)
+          (match Hashtbl.find ctx.libraries name with
+          | Some l -> ResolvedLibrary l
+          | None -> ResolvedSystem)
       | "assert" ->
           ResolvedBuiltin
             (Option.value_exn (Bytecode.builtin_function_of_string "assert"))
@@ -449,6 +592,7 @@ class ivisitor ctx =
     val env_stack = Stack.singleton (new environment ctx None)
     val mutable current_struct_name : string option = None
     method env = Stack.top_exn env_stack
+    method env_stack = env_stack
     method current_struct_name = current_struct_name
 
     method visit_expression (e : expression) =
@@ -474,6 +618,10 @@ class ivisitor ctx =
           self#visit_expression a;
           self#visit_expression b;
           self#visit_expression c
+      | OptionalMember (obj, _, _) -> self#visit_expression obj
+      | NullCoalesce (a, b) ->
+          self#visit_expression a;
+          self#visit_expression b
       | Cast (_, obj) -> self#visit_expression obj
       | Subscript (arr, i) ->
           self#visit_expression arr;
@@ -521,6 +669,11 @@ class ivisitor ctx =
           self#env#push;
           Option.iter test ~f:self#visit_expression;
           Option.iter inc ~f:self#visit_expression;
+          self#visit_statement body;
+          self#env#pop
+      | ForEach (_, _, _, arr_expr, body) ->
+          self#env#push;
+          self#visit_expression arr_expr;
           self#visit_statement body;
           self#env#pop
       | Goto _ -> ()
@@ -578,6 +731,10 @@ class ivisitor ctx =
       | Constructor f -> self#visit_fundecl f
       | Destructor f -> self#visit_fundecl f
       | Method f -> self#visit_fundecl f
+      | PropertyDecl _ | EventDecl _ ->
+          (* Lowered to a backing field + synthetic methods at
+             declaration analysis time; nothing to visit here. *)
+          ()
 
     method visit_type_specifier (_t : type_specifier) = ()
     method visit_toplevel decls = List.iter decls ~f:self#visit_declaration
@@ -593,6 +750,8 @@ let unary_op_to_string op =
   | PreDec -> "--"
   | PostInc -> "++"
   | PostDec -> "--"
+  | ForeachInc -> "++"
+  | ForeachDec -> "--"
 
 let binary_op_to_string op =
   match op with
@@ -653,6 +812,7 @@ let rec jaf_type_to_string = function
   | Wrap t -> "wrap<" ^ jaf_type_to_string t ^ ">"
   | HLLParam -> "hll_param"
   | HLLFunc -> "hll_func"
+  | HLLFunc2 -> "hll_func2"
   | IMainSystem -> "IMainSystem"
   | NullType -> "null"
   | TyFunction (args, ret) | TyMethod (args, ret) ->
@@ -689,6 +849,9 @@ let rec expr_to_string (e : expression) =
   | Ternary (a, b, c) ->
       sprintf "%s ? %s : %s" (expr_to_string a) (expr_to_string b)
         (expr_to_string c)
+  | OptionalMember (obj, name, _) -> sprintf "%s?.%s" (expr_to_string obj) name
+  | NullCoalesce (a, b) ->
+      sprintf "%s ?? %s" (expr_to_string a) (expr_to_string b)
   | Cast (t, e) -> sprintf "(%s)%s" (jaf_type_to_string t) (expr_to_string e)
   | Subscript (e, i) -> sprintf "%s[%s]" (expr_to_string e) (expr_to_string i)
   | Member (e, s, _) -> sprintf "%s.%s" (expr_to_string e) s
@@ -725,6 +888,11 @@ let rec stmt_to_string (stmt : statement) =
       let s_body = stmt_to_string body in
       let s_inc = expr_opt_to_string inc in
       sprintf "for (%s %s %s) %s" s_init s_test s_inc s_body
+  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+      let kw = if rev then "foreach_r" else "foreach" in
+      let i = match ivar_name with Some n -> ", " ^ n | None -> "" in
+      sprintf "%s (%s%s : %s) %s" kw var_name i
+        (expr_to_string arr_expr) (stmt_to_string body)
   | Goto label -> sprintf "goto %s;" label
   | Continue -> "continue;"
   | Break -> "break;"
@@ -795,6 +963,18 @@ let sdecl_to_string = function
       let params = params_to_string d.params in
       let body = body_to_string d.body in
       sprintf "%s %s%s%s" return d.name params body
+  | PropertyDecl p ->
+      let accessors =
+        List.map p.pd_accessors ~f:(fun (a, _) -> a ^ ";")
+        |> String.concat ~sep:" "
+      in
+      sprintf "%s %s { %s }"
+        (jaf_type_to_string p.pd_typespec.ty)
+        p.pd_name accessors
+  | EventDecl e ->
+      sprintf "event %s %s"
+        (jaf_type_to_string e.ed_typespec.ty)
+        e.ed_name
 
 let decl_to_string d =
   match d with
@@ -862,6 +1042,7 @@ let rec jaf_to_ain_type = function
   | Wrap t -> Ain.Type.Wrap (jaf_to_ain_type t)
   | HLLParam -> Ain.Type.HLLParam
   | HLLFunc -> Ain.Type.HLLFunc
+  | HLLFunc2 -> Ain.Type.HLLFunc2
   | Delegate (Some (_, i)) -> Ain.Type.Delegate i
   | Delegate None -> Ain.Type.Delegate (-1)
   | FuncType (Some (_, i)) -> Ain.Type.FuncType i
@@ -887,6 +1068,7 @@ let rec ain_to_jaf_type ain = function
   | Wrap t -> Wrap (ain_to_jaf_type ain t)
   | HLLParam -> HLLParam
   | HLLFunc -> HLLFunc
+  | HLLFunc2 -> HLLFunc2
   | Delegate -1 -> Delegate None
   | Delegate i -> Delegate (Some ((Ain.get_delegate_by_index ain i).name, i))
   | FuncType -1 -> FuncType None
@@ -982,6 +1164,179 @@ let ain_to_jaf_variable ain kind (v : Ain.Variable.t) =
     index = Some v.index;
   }
 
+(* v11 foreach desugar machinery. [foreach (var : array)] is rewritten
+   into a [while] loop with a synthetic counter and a synthetic alias
+   to the container so the surrounding type-resolution / codegen
+   passes don't need to know about [ForEach] directly. The counter
+   uses [ForeachInc]/[ForeachDec] in the loop test so codegen can
+   detect "this is the foreach pre-test increment" and emit the
+   matching original compiler bytecode. *)
+let foreach_counter = ref 0
+
+let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
+    (body : statement) =
+  let id =
+    foreach_counter := !foreach_counter + 1;
+    !foreach_counter
+  in
+  let counter_name =
+    match ivar_name with
+    | Some name -> name
+    | None -> Printf.sprintf "<foreach_i_%d>" id
+  in
+  let container_name = Printf.sprintf "<foreach_container_%d>" id in
+  let dl = dummy_location in
+  let mk_expr node = { ty = Untyped; node; loc = dl } in
+  let mk_stmt node = { node; delete_vars = []; loc } in
+  let mk_ts ty = { ty; location = dl } in
+  let counter_id = mk_expr (Ident (counter_name, UnresolvedIdent)) in
+  let container_id = mk_expr (Ident (container_name, UnresolvedIdent)) in
+  let numof_call =
+    mk_expr
+      (Call
+         ( mk_expr (Member (container_id, "Numof", UnresolvedMember)),
+           [],
+           UnresolvedCall ))
+  in
+  let counter_init_val =
+    if rev then numof_call else mk_expr (ConstInt (-1))
+  in
+  let mk_var name ty =
+    {
+      name;
+      location = dl;
+      array_dim = [];
+      is_const = false;
+      is_private = false;
+      kind = LocalVar;
+      type_spec = mk_ts ty;
+      initval = None;
+      index = None;
+    }
+  in
+  let counter_alloc =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts Int;
+           vars = [ { (mk_var counter_name Int) with is_private = true } ];
+         })
+  in
+  let container_expr =
+    match arr_expr.node with
+    | Call _ -> { arr_expr with node = RvalueRef arr_expr }
+    | _ -> arr_expr
+  in
+  let container_init =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts (Ref (Array HLLParam));
+           vars =
+             [
+               {
+                 (mk_var container_name (Ref (Array HLLParam))) with
+                 is_private = true;
+                 initval = Some container_expr;
+               };
+             ];
+         })
+  in
+  let counter_init =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts Int;
+           vars =
+             [
+               {
+                 (mk_var counter_name Int) with
+                 is_private = true;
+                 initval = Some counter_init_val;
+               };
+             ];
+         })
+  in
+  let while_cond =
+    if rev then
+      mk_expr
+        (Binary
+           ( GTE,
+             mk_expr (Unary (ForeachDec, counter_id)),
+             mk_expr (ConstInt 0) ))
+    else
+      mk_expr (Binary (LT, mk_expr (Unary (ForeachInc, counter_id)), numof_call))
+  in
+  let var_decl =
+    mk_stmt
+      (Declarations
+         {
+           decl_loc = dl;
+           is_const_decls = false;
+           typespec = mk_ts (Wrap HLLParam);
+           vars = [ mk_var var_name (Wrap HLLParam) ];
+         })
+  in
+  let var_ref_assign =
+    mk_stmt
+      (RefAssign
+         ( mk_expr (Ident (var_name, UnresolvedIdent)),
+           mk_expr (Subscript (container_id, counter_id)) ))
+  in
+  let body_stmts =
+    match body.node with Compound stmts -> stmts | _ -> [ body ]
+  in
+  let while_body = mk_stmt (Compound (var_ref_assign :: body_stmts)) in
+  let while_stmt = mk_stmt (While (while_cond, while_body)) in
+  mk_stmt
+    (Compound [ counter_alloc; var_decl; container_init; counter_init; while_stmt ])
+
+let rec desugar_foreach_in_stmt (stmt : statement) =
+  match stmt.node with
+  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+      desugar_foreach_in_stmt
+        (desugar_foreach_stmt stmt.loc rev var_name ivar_name arr_expr body)
+  | Compound stmts ->
+      { stmt with node = Compound (List.map stmts ~f:desugar_foreach_in_stmt) }
+  | If (test, then_, else_) ->
+      {
+        stmt with
+        node =
+          If (test, desugar_foreach_in_stmt then_, desugar_foreach_in_stmt else_);
+      }
+  | While (test, body) ->
+      { stmt with node = While (test, desugar_foreach_in_stmt body) }
+  | DoWhile (test, body) ->
+      { stmt with node = DoWhile (test, desugar_foreach_in_stmt body) }
+  | For (init, test, inc, body) ->
+      { stmt with node = For (init, test, inc, desugar_foreach_in_stmt body) }
+  | Switch (expr, stmts) ->
+      {
+        stmt with
+        node = Switch (expr, List.map stmts ~f:desugar_foreach_in_stmt);
+      }
+  | _ -> stmt
+
+let desugar_foreach_in_fundecl (f : fundecl) =
+  f.body <- Option.map f.body ~f:(List.map ~f:desugar_foreach_in_stmt)
+
+let desugar_foreach decls =
+  List.iter decls ~f:(function
+    | Function f | FuncTypeDef f | DelegateDef f ->
+        desugar_foreach_in_fundecl f
+    | StructDef s ->
+        List.iter s.decls ~f:(function
+          | Method f | Constructor f | Destructor f ->
+              desugar_foreach_in_fundecl f
+          | _ -> ())
+    | _ -> ())
+
 let context_from_ain ?(constants : variable list = []) ain =
   let ain_to_jaf_functype (f : Ain.FunctionType.t) =
     {
@@ -1004,9 +1359,11 @@ let context_from_ain ?(constants : variable list = []) ain =
   let globals = Hashtbl.create (module String) in
   let structs = Hashtbl.create (module String) in
   let functions = Hashtbl.create (module String) in
+  let overloads = Hashtbl.create (module String) in
   let functypes = Hashtbl.create (module String) in
   let delegates = Hashtbl.create (module String) in
   let libraries = Hashtbl.create (module String) in
+  let user_bodied_accessors = Hashtbl.create (module String) in
   List.iter constants ~f:(fun v -> Hashtbl.add_exn globals ~key:v.name ~data:v);
   Ain.global_iter ain ~f:(fun g ->
       Hashtbl.add_exn globals ~key:g.variable.name
@@ -1018,6 +1375,7 @@ let context_from_ain ?(constants : variable list = []) ain =
           loc = dummy_location;
           index = s.index;
           members = Hashtbl.create (module String);
+          properties = Hashtbl.create (module String);
         }
       in
       List.iter s.members ~f:(function
@@ -1053,13 +1411,23 @@ let context_from_ain ?(constants : variable list = []) ain =
           class_index;
         }
       in
-      Hashtbl.set functions ~key:f.name ~data:func);
+      (* v11 may have multiple ain entries sharing a mangled name
+         (overloaded methods / functions). The first goes into
+         [functions]; subsequent same-name entries land in [overloads]
+         so call-site resolution can pick by parameter types. *)
+      match Hashtbl.find functions f.name with
+      | None -> Hashtbl.set functions ~key:f.name ~data:func
+      | Some _ ->
+          Hashtbl.update overloads f.name ~f:(function
+            | None -> [ func ]
+            | Some xs -> func :: xs));
   Ain.functype_iter ain ~f:(fun (f : Ain.FunctionType.t) ->
       Hashtbl.add_exn functypes ~key:f.name ~data:(ain_to_jaf_functype f));
   Ain.delegate_iter ain ~f:(fun (f : Ain.FunctionType.t) ->
       Hashtbl.add_exn delegates ~key:f.name ~data:(ain_to_jaf_functype f));
   Ain.library_iter ain ~f:(fun (l : Ain.Library.t) ->
       let functions = Hashtbl.create (module String) in
+      let lib_overloads = Hashtbl.create (module String) in
       Array.iter l.functions ~f:(fun (f : Ain.Library.Function.t) ->
           let func =
             {
@@ -1096,8 +1464,27 @@ let context_from_ain ?(constants : variable list = []) ain =
               class_index = None;
             }
           in
-          Hashtbl.set functions ~key:f.name ~data:func);
+          (* v11 HLL libraries may have multiple entries with the same
+             name. The first goes in [functions]; later same-name entries
+             append to [overloads]. *)
+          match Hashtbl.find functions f.name with
+          | None -> Hashtbl.set functions ~key:f.name ~data:func
+          | Some _ ->
+              Hashtbl.update lib_overloads f.name ~f:(function
+                | None -> [ func ]
+                | Some xs -> func :: xs));
       Hashtbl.add_exn libraries ~key:l.name
-        ~data:{ hll_name = l.name; functions });
+        ~data:{ hll_name = l.name; functions; overloads = lib_overloads });
   let version = (Ain.version ain * 100) + Ain.minor_version ain in
-  { ain; version; globals; structs; functions; functypes; delegates; libraries }
+  {
+    ain;
+    version;
+    globals;
+    structs;
+    functions;
+    overloads;
+    functypes;
+    delegates;
+    libraries;
+    user_bodied_accessors;
+  }

@@ -159,12 +159,32 @@ let fundecl_of_builtin ctx builtin receiver_ty node_opt =
   | StringLengthByte -> make Int "LengthByte" []
   | StringEmpty -> make Int "Empty" []
   | StringFind -> make Int "Find" [ ("szKey", String) ]
-  | StringGetPart -> make String "GetPart" [ ("nIndex", Int); ("nLength", Int) ]
+  | StringGetPart ->
+      (* v11 lets [GetPart] omit the length argument — the runtime
+         interprets [INT_MAX] as "read to the end of the string".
+         Pre-v11 keeps the strict 2-argument form. *)
+      let defaults =
+        if Ain.version_gte ctx.ain (11, 0) then
+          [ None; Some (make_expr ~ty:Int (ConstInt 2147483647)) ]
+        else []
+      in
+      make String "GetPart" [ ("nIndex", Int); ("nLength", Int) ] ~defaults
   | StringPushBack -> make Void "PushBack" [ ("nChara", Int) ]
   | StringPopBack -> make Void "PopBack" []
   | StringErase -> make Void "Erase" [ ("nIndex", Int) ]
   | ArrayAlloc ->
-      make Void "Alloc" (List.init rank ~f:(fun _ -> ("nElements", Int)))
+      (* v11 [Alloc] always takes 4 int dimensions, with unused dims
+         defaulted to -1. Pre-v11 used one int per array rank. *)
+      if Ain.version_gte ctx.ain (11, 0) then
+        let neg_one () = Some (make_expr ~ty:Int (ConstInt (-1))) in
+        let defaults =
+          List.init 4 ~f:(fun i -> if i < rank then None else neg_one ())
+        in
+        make Void "Alloc"
+          (List.init 4 ~f:(fun _ -> ("nElements", Int)))
+          ~defaults
+      else
+        make Void "Alloc" (List.init rank ~f:(fun _ -> ("nElements", Int)))
   | ArrayRealloc -> make Void "Realloc" [ ("nElements", Int) ]
   | ArrayFree -> make Void "Free" []
   | ArrayNumof ->

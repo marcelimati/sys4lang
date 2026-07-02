@@ -155,7 +155,7 @@ val get_function : t -> string -> Function.t option
 val get_function_by_index : t -> int -> Function.t
 val write_function : t -> Function.t -> unit
 val write_new_function : t -> Function.t -> int
-val add_function : t -> string -> Function.t
+val add_function : ?nr_args:int -> t -> string -> Function.t
 val add_scenario_label : t -> string -> int -> unit
 val get_struct : t -> string -> Struct.t option
 val get_struct_index : t -> string -> int option

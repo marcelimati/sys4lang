@@ -27,6 +27,25 @@ type variable = {
   initval : Ast.expr option;
 }
 
+(* v11 auto-event members are lowered by the original compiler to
+   delegate-typed fields whose names are wrapped in angle brackets,
+   e.g. [<MouseEnterEvent>]. Such names aren't valid identifiers in
+   source — emit them as [event T Name;] declarations and strip the
+   brackets at use sites. Restricted to delegate-typed members so
+   other [<…>]-named lowered constructs (e.g. property backing slots)
+   aren't misidentified as events. *)
+let event_name_of_delegate_member (v : Ain.Variable.t) =
+  let n = String.length v.name in
+  let is_angle_mangled =
+    n >= 3 && Char.equal v.name.[0] '<' && Char.equal v.name.[n - 1] '>'
+  in
+  let is_delegate =
+    match v.type_ with Type.Delegate _ -> true | _ -> false
+  in
+  if is_angle_mangled && is_delegate then
+    Some (String.sub v.name ~pos:1 ~len:(n - 2))
+  else None
+
 let from_ain_variable (v : Ain.Variable.t) =
   let initval =
     Option.map v.init_val ~f:(function
@@ -57,11 +76,42 @@ let lambda_context lambdas =
     lambdas;
   }
 
+(* v11 event pair: two struct methods whose names end in [::add(T)]
+   and [::remove(T)] with matching single-parameter signatures. The
+   original compiler emits these as prototype-only function-table
+   entries for every [event T Name;] declaration in a class. The
+   decompiler groups them so the class body emits a bare
+   [event T Name;] prototype and the accessor functions are dropped
+   from per-class output. *)
+type event_pair = {
+  ev_name : string;
+  ev_type : Type.ain_type;
+  ev_add : function_t;
+  ev_remove : function_t;
+}
+
+(* v11 property: methods named [Name::get] (returning T, no params) and/or
+   [Name::set] (taking a single T parameter), synthesized by the original
+   compiler from a [T Name { get; set; }] block. Either accessor may exist
+   alone for read-only / write-only forms. [prop_is_auto] is true when
+   both accessors' bodies are the trivial shape reading/writing the
+   compiler-generated [<Name>] backing field — those round-trip as the
+   declaration [T Name { get; set; }] with no implementation. *)
+type property_def = {
+  prop_name : string;
+  prop_type : Type.ain_type;
+  prop_get : function_t option;
+  prop_set : function_t option;
+  prop_is_auto : bool;
+}
+
 type struct_t = {
   struc : Ain.Struct.t;
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable events : event_pair list;
+  mutable properties : property_def list;
 }
 
 type enum_t = { name : string; mutable values : (string * int32) list }
@@ -294,14 +344,25 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
     method private pr_lvalue prec out lval =
       match lval with
       | NullPlace -> print_string out "NULL"
-      | Var (StructPage, var) -> bprintf out "this.%s" var.name
+      | Var (StructPage, var) ->
+          let name =
+            Option.value
+              (event_name_of_delegate_member var)
+              ~default:var.name
+          in
+          bprintf out "this.%s" name
       | Var (_, var) -> print_string out var.name
       | Elem (array, index) ->
           bprintf out "%a[%a]"
             (self#pr_expr (prec_value PREC_DOT))
             array (self#pr_expr 0) index
       | Member (obj, memb) ->
-          bprintf out "%a.%s" (self#pr_expr (prec_value PREC_DOT)) obj memb.name
+          let name =
+            Option.value
+              (event_name_of_delegate_member memb)
+              ~default:memb.name
+          in
+          bprintf out "%a.%s" (self#pr_expr (prec_value PREC_DOT)) obj name
       | Pointee e -> self#pr_expr (prec_value PREC_DOT) out e
       | Slot _ as lval ->
           failwith ("pr_lvalue: unresolved Slot " ^ show_lvalue lval)
@@ -412,10 +473,47 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           bprintf out "%a.%s"
             (self#pr_expr (prec_value PREC_DOT))
             expr (strip_class_name name)
+      (* v11 manual-event use sites: [obj.Name::add(x)] / [::remove(x)]
+         were synthesized from [obj.Name += x] / [-= x]. Rewrite back. *)
+      | Call (Method (obj, func), [ arg ])
+        when String.is_suffix func.name ~suffix:"::add"
+             || String.is_suffix func.name ~suffix:"::remove" ->
+          let method_name = strip_class_name func.name in
+          let base, op =
+            if String.is_suffix method_name ~suffix:"::add" then
+              (String.drop_suffix method_name 5, "+=")
+            else (String.drop_suffix method_name 8, "-=")
+          in
+          bprintf out "%a.%s %s %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            obj base op (self#pr_expr 0) arg
+      (* v11 property use sites: [obj.Name::get()] came from a
+         property read [obj.Name]; [obj.Name::set(v)] from a write
+         [obj.Name = v]. The Getter arm above already covers
+         [::get]; here we add [::set] (the master Setter arm only
+         fires for assignment LHS, not standalone Call rewrites). *)
+      | Call (Method (obj, func), [ arg ])
+        when String.is_suffix func.name ~suffix:"::set" ->
+          let method_name = strip_class_name func.name in
+          let base = String.drop_suffix method_name 5 in
+          bprintf out "%a.%s = %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            obj base (self#pr_expr 0) arg
       | Call (HllFunc (hll, f), obj :: args) when is_builtin_hll hll ->
           bprintf out "%a.%s(%a)"
             (self#pr_expr (prec_value PREC_DOT))
             obj f.name self#pr_arg_list args
+      (* v11 [X_SET] is the array copy-assign opcode: at the bytecode
+         level [dst.Set(src)] is the lowered form of [dst = src] when
+         both sides are arrays. Emit it as a normal assignment so it
+         round-trips. *)
+      | Call (Builtin2 (X_SET, dst), [ src ]) ->
+          let op_prec = prec_value PREC_ASSIGN in
+          open_paren prec op_prec out;
+          bprintf out "%a = %a"
+            (self#pr_expr (prec_value PREC_DOT))
+            dst (self#pr_expr op_prec) src;
+          close_paren prec op_prec out
       | Call (f, args) ->
           bprintf out "%a(%a)" self#pr_callable f self#pr_arg_list args
       | C_Ref (str, i) ->
@@ -459,6 +557,13 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | Delegate (_, e) -> self#pr_expr (prec_value PREC_DOT) out e
       | SysCall n -> print_string out syscalls.(n).name
       | HllFunc (lib, func) -> bprintf out "%s.%s" lib func.name
+      (* [(new T()).method(...)] decompiles to a [Method (New {...},
+         func)] callable. Surface it as [new T.method(...)] so the
+         output is parseable — the parenthesized [(new T()).method]
+         form would otherwise produce a syntax error in the recompile. *)
+      | Method (New { struc; args = []; _ }, func) ->
+          bprintf out "new %s.%s" Ain.ain.strt.(struc).name
+            (strip_class_name func.name)
       | Method (expr, func) ->
           bprintf out "%a.%s"
             (self#pr_expr (prec_value PREC_DOT))
@@ -533,7 +638,8 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
     method private pr_vardecl out (arg : Ain.Variable.t) =
       bprintf out "%a %s" self#pr_type arg.type_ arg.name
 
-    method print_function ?(as_lambda = false) (func : function_t) =
+    method print_function ?(as_lambda = false) ?(skip_signature = false)
+        (func : function_t) =
       let pr_label = function
         | Address label -> self#println "label%d:" label
         | CaseInt (_, k) -> self#println "case %ld:" k
@@ -715,7 +821,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
         if as_lambda then bprintf out " => %a " self#pr_type return_type
         else self#print_newline
       in
-      print_func_signature func;
+      if not skip_signature then print_func_signature func;
       let body =
         match func.body.txt with
         | Block _ -> func.body
@@ -773,6 +879,81 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       self#with_indent (fun () -> loop 0);
       self#println "};"
 
+    (* v11 event prototype: round-trips as [event T Name;] in the
+       class body. The original [Name::add] / [Name::remove] accessor
+       functions (when present in the function table) are filtered
+       out of the per-class .jaf — for auto-events their bodies are
+       vestigial; for manual events the bodies are emitted as a
+       top-level [event T Class::Name { add { body } remove { body } }]
+       block via [print_event_def]. *)
+    method print_event_prototype (ev : event_pair) =
+      self#print_indent;
+      bprintf out "event %a %s" self#pr_type ev.ev_type ev.ev_name;
+      self#println ";"
+
+    (* Top-level implementation of a manual event, emitted in the same
+       per-class .jaf where the original add/remove definitions lived.
+       Surface form: [event T Class::Name { add { body } remove { body } }].
+       The [event] keyword anchors the parser so [Class::Name] is read
+       as a qualified event reference rather than a regular function. *)
+    method print_event_def (ev : event_pair) =
+      let class_name =
+        match ev.ev_add.struc with Some s -> s.name | None -> ""
+      in
+      bprintf out "event %a %s::%s" self#pr_type ev.ev_type class_name
+        ev.ev_name;
+      self#print_newline;
+      self#println "{";
+      self#with_indent (fun () ->
+          self#print_indent;
+          print_string out "add";
+          self#print_function ~skip_signature:true ev.ev_add;
+          self#print_indent;
+          print_string out "remove";
+          self#print_function ~skip_signature:true ev.ev_remove);
+      self#println "}"
+
+    (* v11 property prototype: round-trips as the C# auto-property
+       shape [T Name { get; set; }]. Read-only properties omit [set;];
+       write-only ones omit [get;]. For non-auto properties the bodies
+       are emitted as a top-level [T Class::Name { get { body } set { body } }]
+       block via [print_property_def]. *)
+    method print_property_prototype (p : property_def) =
+      self#print_indent;
+      bprintf out "%a %s {" self#pr_type p.prop_type p.prop_name;
+      Option.iter p.prop_get ~f:(fun _ -> print_string out " get;");
+      Option.iter p.prop_set ~f:(fun _ -> print_string out " set;");
+      self#println " }"
+
+    (* Top-level implementation of a non-auto property, emitted in the
+       per-class .jaf where the [::get] / [::set] definitions lived.
+       Surface form: [T Class::Name { get { body } set { body } }].
+       Auto-implemented properties skip this — their declaration in
+       classes.jaf is the complete source form. *)
+    method print_property_def (p : property_def) =
+      let class_name =
+        match
+          Option.first_some
+            (Option.bind p.prop_get ~f:(fun f -> f.struc))
+            (Option.bind p.prop_set ~f:(fun f -> f.struc))
+        with
+        | Some s -> s.name
+        | None -> ""
+      in
+      bprintf out "%a %s::%s" self#pr_type p.prop_type class_name p.prop_name;
+      self#print_newline;
+      self#println "{";
+      self#with_indent (fun () ->
+          Option.iter p.prop_get ~f:(fun g ->
+              self#print_indent;
+              print_string out "get";
+              self#print_function ~skip_signature:true g);
+          Option.iter p.prop_set ~f:(fun s ->
+              self#print_indent;
+              print_string out "set";
+              self#print_function ~skip_signature:true s));
+      self#println "}"
+
     method private print_class_decl (struc : struct_t) =
       bprintf out "class %s" struc.struc.name;
       if not (Array.is_empty struc.struc.interfaces) then (
@@ -784,21 +965,46 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           (Array.to_list struc.struc.interfaces));
       self#println " {";
       self#println "public:";
+      (* Suppress backing fields named [<Name>] for every property
+         (auto-implemented and otherwise) — they're an implementation
+         detail re-synthesized on lowering, and the surface form would
+         be unparseable. *)
+      let property_backing_field_names =
+        let s = Hash_set.create (module String) in
+        List.iter struc.properties ~f:(fun (p : property_def) ->
+            Hash_set.add s ("<" ^ p.prop_name ^ ">"));
+        s
+      in
       self#with_indent (fun () ->
           Stack.push current_function (lambda_context struc.initval_lambdas);
           List.iter struc.members ~f:(fun v ->
               match v.v.type_ with
               | Void -> ()
+              | _ when Hash_set.mem property_backing_field_names v.v.name -> ()
               | _ ->
                   self#print_indent;
-                  self#pr_vardecl out v.v;
-                  pr_array_dims out v.dims;
-                  Option.iter v.initval ~f:(fun e ->
-                      bprintf out " = %a" (self#pr_expr 0) e);
+                  (match event_name_of_delegate_member v.v with
+                  | Some name ->
+                      bprintf out "event %a %s" self#pr_type v.v.type_ name
+                  | None ->
+                      self#pr_vardecl out v.v;
+                      pr_array_dims out v.dims;
+                      Option.iter v.initval ~f:(fun e ->
+                          bprintf out " = %a" (self#pr_expr 0) e));
                   self#println ";");
           Stack.pop_exn current_function |> ignore;
           if
             (not (Array.is_empty struc.struc.members))
+            && (not (List.is_empty struc.methods)
+               || not (List.is_empty struc.events)
+               || not (List.is_empty struc.properties))
+          then self#print_newline;
+          List.iter struc.events ~f:(fun ev ->
+              self#print_event_prototype ev);
+          List.iter struc.properties ~f:(fun p ->
+              self#print_property_prototype p);
+          if
+            (not (List.is_empty struc.events && List.is_empty struc.properties))
             && not (List.is_empty struc.methods)
           then self#print_newline;
           List.iter struc.methods ~f:(fun func ->
@@ -870,9 +1076,16 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | args -> self#println "(%a);" (pr_param_list self#pr_vardecl) args
 
     method print_hll (funcs : Ain.HLL.function_t array) =
+      (* v11 HLL libraries can declare multiple functions sharing a name
+         but differing in parameter types — emit all entries so the
+         compiler can resolve calls to the right overload. Older sys4c
+         can't parse same-name duplicates, so on pre-v11 ain files keep
+         the existing comment-out behavior to preserve round-tripping
+         against older toolchains. *)
+      let v11 = Ain.ain.vers >= 11 in
       let printed = Hash_set.create (module String) in
       Array.iter funcs ~f:(fun func ->
-          if Hash_set.mem printed func.name then
+          if (not v11) && Hash_set.mem printed func.name then
             print_string out "// (duplicated) "
           else Hash_set.add printed func.name;
           self#print_hll_function func)

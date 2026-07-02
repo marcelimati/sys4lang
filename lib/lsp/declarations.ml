@@ -148,6 +148,11 @@ class type_declare_visitor ctx =
                         compile_error "duplicate member variable declaration"
                           (ASTVariable v)
                     | `Ok -> ())
+            | PropertyDecl _ | EventDecl _ ->
+                (* The compiler's [expand_struct_decls] lowers these
+                   into [MemberDecl] + [Method]; the LSP doesn't need
+                   the lowering for navigation, so a no-op is enough. *)
+                ()
           in
           List.iter s.decls ~f:visit_decl;
           Hashtbl.set ctx.structs ~key:s.name ~data:jaf_s
@@ -278,10 +283,15 @@ let define_library ctx decls hll_name import_name =
       lib with
       functions = Array.of_list_map functions ~f:jaf_to_ain_hll_function;
     };
-  let functions =
-    Hashtbl.create_with_key_exn
-      (module String)
-      ~get_key:(fun (d : fundecl) -> d.name)
-      functions
-  in
-  Hashtbl.set ctx.libraries ~key:import_name ~data:{ hll_name; functions }
+  let functions_tbl = Hashtbl.create (module String) in
+  let overloads_tbl = Hashtbl.create (module String) in
+  List.iter functions ~f:(fun (d : fundecl) ->
+      match Hashtbl.find functions_tbl d.name with
+      | None -> Hashtbl.set functions_tbl ~key:d.name ~data:d
+      | Some _ ->
+          Hashtbl.update overloads_tbl d.name ~f:(function
+            | None -> [ d ]
+            | Some xs -> d :: xs));
+  Hashtbl.set ctx.libraries ~key:import_name
+    ~data:
+      { hll_name; functions = functions_tbl; overloads = overloads_tbl }

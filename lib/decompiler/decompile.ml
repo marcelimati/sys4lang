@@ -305,6 +305,176 @@ let synthesize_scenario_labels code srcs =
           Ain.ain.func.(func_id).name);
     srcs
   end
+(* Compare two [ain_type]s structurally. [Delegate] / [FuncType] wrap a
+   [TypeVar]: two [Delegate]s may point to the same underlying function
+   type through different link chains, so [Poly.equal] on the surface
+   refs is unreliable. Resolve to the root value and compare by id when
+   possible; fall back to [Poly.equal] for everything else. *)
+let ain_type_equal (t1 : Type.ain_type) (t2 : Type.ain_type) =
+  let tv_id tv =
+    match Type.TypeVar.get_value tv with
+    | Type.TypeVar.Id (n, _) -> Some n
+    | _ -> None
+  in
+  match (t1, t2) with
+  | Type.Delegate a, Type.Delegate b | Type.FuncType a, Type.FuncType b -> (
+      match (tv_id a, tv_id b) with
+      | Some n, Some n' -> n = n'
+      | _ -> false)
+  | _ -> Poly.equal t1 t2
+
+(* Detect v11 event method pairs on a struct: methods named
+   [Name::add(T)] and [Name::remove(T)] with matching single-parameter
+   signatures. Returns [(event_pairs, remaining_methods)]. *)
+let extract_event_pairs (methods : CodeGen.function_t list) :
+    CodeGen.event_pair list * CodeGen.function_t list =
+  let split_accessor name =
+    match String.chop_suffix name ~suffix:"::add" with
+    | Some base -> Some (base, `Add)
+    | None -> (
+        match String.chop_suffix name ~suffix:"::remove" with
+        | Some base -> Some (base, `Remove)
+        | None -> None)
+  in
+  let adds = Hashtbl.create (module String) in
+  let removes = Hashtbl.create (module String) in
+  let others = ref [] in
+  let ordered_names = ref [] in
+  let seen_names = Hash_set.create (module String) in
+  let record_name base =
+    if not (Hash_set.mem seen_names base) then (
+      Hash_set.add seen_names base;
+      ordered_names := base :: !ordered_names)
+  in
+  List.iter methods ~f:(fun (m : CodeGen.function_t) ->
+      match split_accessor m.name with
+      | Some (base, `Add) ->
+          Hashtbl.set adds ~key:base ~data:m;
+          record_name base
+      | Some (base, `Remove) ->
+          Hashtbl.set removes ~key:base ~data:m;
+          record_name base
+      | None -> others := m :: !others);
+  let events = ref [] in
+  let unpaired = ref [] in
+  List.iter (List.rev !ordered_names) ~f:(fun base ->
+      match (Hashtbl.find adds base, Hashtbl.find removes base) with
+      | Some add, Some remove -> (
+          match
+            (Ain.Function.args add.func, Ain.Function.args remove.func)
+          with
+          | [ a ], [ r ] when ain_type_equal a.type_ r.type_ ->
+              events :=
+                CodeGen.
+                  {
+                    ev_name = base;
+                    ev_type = a.type_;
+                    ev_add = add;
+                    ev_remove = remove;
+                  }
+                :: !events;
+              Hashtbl.remove removes base
+          | _ -> unpaired := add :: !unpaired)
+      | Some add, None -> unpaired := add :: !unpaired
+      | None, Some _ -> ()
+      | None, None -> ());
+  Hashtbl.iter removes ~f:(fun m -> unpaired := m :: !unpaired);
+  (!events, List.rev !others @ !unpaired)
+
+(* Detect v11 property method groups on a struct: methods named
+   [Name::get] (returning T) and/or [Name::set(T)]. Either may exist
+   alone (read-only / write-only). Classified as "auto-implemented"
+   when both accessor bodies are the trivial shape reading/writing a
+   [<Name>] backing field — those are emitted as [T Name { get; set; }]
+   with no implementation block. Returns
+   [(property_defs, remaining_methods)]. *)
+let extract_property_defs (methods : CodeGen.function_t list) :
+    CodeGen.property_def list * CodeGen.function_t list =
+  let split_accessor name =
+    match String.chop_suffix name ~suffix:"::get" with
+    | Some base -> Some (base, `Get)
+    | None -> (
+        match String.chop_suffix name ~suffix:"::set" with
+        | Some base -> Some (base, `Set)
+        | None -> None)
+  in
+  let gets = Hashtbl.create (module String) in
+  let sets = Hashtbl.create (module String) in
+  let others = ref [] in
+  (* Order-preserving set of property names: methods are scanned in
+     function-table order, so the first [Name::get] (or [Name::set]
+     when get is absent) seen determines the property's position in
+     the output. Hashtbl iteration would scramble ordering and shift
+     where backing fields land. *)
+  let ordered_names = ref [] in
+  let seen_names = Hash_set.create (module String) in
+  let record_name base =
+    if not (Hash_set.mem seen_names base) then (
+      Hash_set.add seen_names base;
+      ordered_names := base :: !ordered_names)
+  in
+  List.iter methods ~f:(fun (m : CodeGen.function_t) ->
+      match split_accessor m.name with
+      | Some (base, `Get) ->
+          Hashtbl.set gets ~key:base ~data:m;
+          record_name base
+      | Some (base, `Set) ->
+          Hashtbl.set sets ~key:base ~data:m;
+          record_name base
+      | None -> others := m :: !others);
+  let properties = ref [] in
+  List.iter (List.rev !ordered_names) ~f:(fun base ->
+      let get = Hashtbl.find gets base in
+      let set = Hashtbl.find sets base in
+      let prop_type =
+        match get with
+        | Some g -> g.func.return_type
+        | None -> (
+            match set with
+            | Some s -> (
+                match Ain.Function.args s.func with
+                | [ p ] -> p.type_
+                | _ -> Type.Void)
+            | None -> Type.Void)
+      in
+      let single_stmt body =
+        match body with
+        | Ast.Block [ s ] -> Some s.txt
+        | s -> Some s
+      in
+      let mangled_field = "<" ^ base ^ ">" in
+      let is_trivial_get (g : CodeGen.function_t) =
+        match single_stmt g.body.txt with
+        | Some (Ast.Return (Some (Ast.Load (Ast.Var (Ast.StructPage, v))))) ->
+            String.equal v.name mangled_field
+        | _ -> false
+      in
+      let is_trivial_set (s : CodeGen.function_t) =
+        match single_stmt s.body.txt with
+        | Some
+            (Ast.Expression (Ast.AssignOp (_, Ast.Var (Ast.StructPage, v), _)))
+          ->
+            String.equal v.name mangled_field
+        | _ -> false
+      in
+      let prop_is_auto =
+        match (get, set) with
+        | Some g, Some s -> is_trivial_get g && is_trivial_set s
+        | Some g, None -> is_trivial_get g
+        | None, Some s -> is_trivial_set s
+        | None, None -> false
+      in
+      properties :=
+        CodeGen.
+          {
+            prop_name = base;
+            prop_type;
+            prop_get = get;
+            prop_set = set;
+            prop_is_auto;
+          }
+        :: !properties);
+  (List.rev !properties, List.rev !others)
 
 let decompile ~move_to_original_file ~continue_on_error =
   let code = Instructions.decode Ain.ain.code in
@@ -318,6 +488,8 @@ let decompile ~move_to_original_file ~continue_on_error =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            events = [];
+            properties = [];
           })
   in
   let global_lambdas = ref [] in
@@ -375,7 +547,41 @@ let decompile ~move_to_original_file ~continue_on_error =
         (fname, List.rev !decompiled_funcs))
   in
   let srcs = synthesize_scenario_labels code srcs in
-  Array.iter structs ~f:(fun s -> s.methods <- List.rev s.methods);
+  Array.iter structs ~f:(fun s ->
+      let methods_in_order = List.rev s.methods in
+      let events, after_events = extract_event_pairs methods_in_order in
+      let properties, remaining = extract_property_defs after_events in
+      s.methods <- remaining;
+      s.events <- events;
+      s.properties <- properties);
+  (* Manual events and non-auto properties round-trip as a single
+     top-level block ([event T Class::Name { add{} remove{} }] /
+     [T Class::Name { get{} set{} }]) replacing the per-class .jaf's
+     pair of qualified-method definitions. Drop the function we DON'T
+     keep as the marker. For events the marker is [add]; for non-auto
+     properties the marker is [get] (or [set] when get is absent).
+     Auto-implemented properties have no implementation block at all,
+     so both accessors are dropped. *)
+  let dropped_func_ids = Hash_set.create (module Int) in
+  Array.iter structs ~f:(fun s ->
+      List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
+          Hash_set.add dropped_func_ids e.ev_remove.func.id);
+      List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
+          if p.prop_is_auto then (
+            Option.iter p.prop_get ~f:(fun g ->
+                Hash_set.add dropped_func_ids g.func.id);
+            Option.iter p.prop_set ~f:(fun set ->
+                Hash_set.add dropped_func_ids set.func.id))
+          else
+            match (p.prop_get, p.prop_set) with
+            | Some _, Some set -> Hash_set.add dropped_func_ids set.func.id
+            | _ -> ()));
+  let srcs =
+    List.map srcs ~f:(fun (fname, funcs) ->
+        ( fname,
+          List.filter funcs ~f:(fun (f : CodeGen.function_t) ->
+              not (Hash_set.mem dropped_func_ids f.func.id)) ))
+  in
   let ain_minor_version = determine_ain_minor_version code in
   {
     srcs;
@@ -398,6 +604,8 @@ let inspect funcname ~print_addr =
             members = to_variable_list struc.members;
             methods = [];
             initval_lambdas = [];
+            events = [];
+            properties = [];
           })
   in
   let CodeSection.{ files; lambdas } =
@@ -446,11 +654,39 @@ let export ~print_addr decompiled ain_path write_to_file =
         ("HLL/" ^ hll.name ^ ".hll")
         (fun pr -> pr#print_hll hll.functions));
   generate "HLL\\hll.inc" (fun pr -> pr#print_hll_inc);
+  (* Marker tables: when a function is the kept "marker" of a
+     non-auto property / manual event accessor pair, replace its
+     normal [print_function] emit with a [T Class::Name { ... }] /
+     [event T Class::Name { ... }] block. *)
+  let event_by_add_id : (int, CodeGen.event_pair) Hashtbl.t =
+    let tbl = Hashtbl.create (module Int) in
+    Array.iter decompiled.structs ~f:(fun (s : CodeGen.struct_t) ->
+        List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
+            Hashtbl.set tbl ~key:e.ev_add.func.id ~data:e));
+    tbl
+  in
+  let property_by_marker_id : (int, CodeGen.property_def) Hashtbl.t =
+    let tbl = Hashtbl.create (module Int) in
+    Array.iter decompiled.structs ~f:(fun (s : CodeGen.struct_t) ->
+        List.iter s.properties ~f:(fun (p : CodeGen.property_def) ->
+            if not p.prop_is_auto then
+              match p.prop_get with
+              | Some g -> Hashtbl.set tbl ~key:g.func.id ~data:p
+              | None ->
+                  Option.iter p.prop_set ~f:(fun set ->
+                      Hashtbl.set tbl ~key:set.func.id ~data:p)));
+    tbl
+  in
   List.iter decompiled.srcs ~f:(fun (fname, funcs) ->
       if not (List.is_empty funcs) then
         generate fname (fun pr ->
-            List.iter funcs ~f:(fun func ->
-                pr#print_function func;
+            List.iter funcs ~f:(fun (func : CodeGen.function_t) ->
+                (match Hashtbl.find event_by_add_id func.func.id with
+                | Some pair -> pr#print_event_def pair
+                | None -> (
+                    match Hashtbl.find property_by_marker_id func.func.id with
+                    | Some prop -> pr#print_property_def prop
+                    | None -> pr#print_function func));
                 pr#print_newline)));
   generate ~add_to_inc:false "main.inc" (fun pr ->
       pr#print_inc (List.rev !sources));

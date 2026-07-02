@@ -108,7 +108,9 @@ class const_eval_visitor ctx =
           | PreInc -> ()
           | PreDec -> ()
           | PostInc -> ()
-          | PostDec -> ())
+          | PostDec -> ()
+          | ForeachInc -> ()
+          | ForeachDec -> ())
       | Binary _ when not in_const_ctx -> ()
       | Binary (op, a, b) -> (
           let mk_compare op a b = if op a b then 1 else 0 in
@@ -194,6 +196,8 @@ class const_eval_visitor ctx =
           | Some e -> const_replace expr e.node
           | None -> const_error v)
       | Member (_, _, _) -> ()
+      | OptionalMember _ -> ()
+      | NullCoalesce _ -> ()
       | Call (_, _, _) -> ()
       | New _ -> ()
       | DummyRef _ -> ()

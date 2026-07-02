@@ -373,7 +373,8 @@ let assign_op ctx op =
             :: rest )
           when Int32.(varno = varno')
                && Type.is_scalar v.type_
-               && String.is_suffix v.name ~suffix:" : 右辺値参照化用>" ->
+               && Ain.Variable.is_dummy v
+               && String.is_substring v.name ~substring:"右辺値参照化用" ->
             ctx.instructions <- rest;
             Void :: TempRef (v, value) :: stack
         | _ -> AssignOp (op, lhs, value) :: stack)
@@ -1869,6 +1870,39 @@ let generate_var_decls (func : Ain.Function.t) bbs =
               { stmt with txt = replace_stmt stmt.txt })
         in
         { bb with code = (terminator, stmts') })
+    |> fun bbs ->
+    (* Locals still in [uninitialized_vars] after the pass above are
+       referenced in the body without any of the patterns that promote
+       them to a [VarDecl] — typically v11 binaries that elide
+       [SH_LOCALCREATE] for struct-typed locals (e.g. a method receiver
+       [foo.Method(...)] on an undeclared local). Emit a plain declaration
+       for each at the front of the entry block so the decompiled source
+       parses; skip dummy / [void] slots that are pure compiler internals. *)
+    let missing =
+      List.filter !uninitialized_vars ~f:(fun v ->
+          (not (Ain.Variable.is_dummy v))
+          && match v.type_ with Type.Void -> false | _ -> true)
+    in
+    let implicit_decls =
+      List.map missing ~f:(fun var ->
+          { txt = VarDecl (var, None); addr = -1; end_addr = -1 })
+    in
+    match implicit_decls with
+    | [] -> bbs
+    | decls ->
+        (* [bbs] isn't necessarily in source order; pick the entry block
+           explicitly by lowest [addr]. Prepend rather than append so the
+           decls land at function entry rather than after a jump/branch
+           terminator. *)
+        let entry_addr =
+          List.fold bbs ~init:Int.max_value ~f:(fun acc bb ->
+              if bb.addr < acc then bb.addr else acc)
+        in
+        List.map bbs ~f:(fun bb ->
+            if bb.addr <> entry_addr then bb
+            else
+              let terminator, stmts = bb.code in
+              { bb with code = (terminator, decls @ stmts) })
 
 (* Ain v0/v1: declare every local at the top of the function body. *)
 let prepend_var_decls (func : Ain.Function.t) (body : Ast.statement loc) =

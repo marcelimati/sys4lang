@@ -32,11 +32,28 @@ type function_t = {
   lambdas : function_t list;
 }
 
+type event_pair = {
+  ev_name : string;
+  ev_type : Type.ain_type;
+  ev_add : function_t;
+  ev_remove : function_t;
+}
+
+type property_def = {
+  prop_name : string;
+  prop_type : Type.ain_type;
+  prop_get : function_t option;
+  prop_set : function_t option;
+  prop_is_auto : bool;
+}
+
 type struct_t = {
   struc : Ain.Struct.t;
   mutable members : variable list;
   mutable methods : function_t list;
   mutable initval_lambdas : function_t list;
+  mutable events : event_pair list;
+  mutable properties : property_def list;
 }
 
 type debug_info
@@ -54,7 +71,12 @@ class code_printer :
 object
   method get_buffer : Buffer.t
   method print_newline : unit
-  method print_function : ?as_lambda:bool -> function_t -> unit
+  method print_function :
+    ?as_lambda:bool -> ?skip_signature:bool -> function_t -> unit
+  method print_event_prototype : event_pair -> unit
+  method print_event_def : event_pair -> unit
+  method print_property_prototype : property_def -> unit
+  method print_property_def : property_def -> unit
   method print_struct_decl : struct_t -> unit
   method print_enum_decl : enum_t -> unit
   method print_functype_decl : string -> Ain.FuncType.t -> unit
