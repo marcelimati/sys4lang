@@ -409,11 +409,22 @@ let recognize_foreach stmt =
   let is_foreach_index (v : Ain.Variable.t) =
     Ain.Variable.is_dummy v || String.is_prefix v.name ~prefix:"<foreach_i_"
   in
+  (* v12 wraps the foreach container init in an extra dummy-listener
+     assignment: `VarDecl container ← AssignOp(ASSIGN, dummy_listener,
+     real_container_expr)`. Peel the intermediate dummy assignment off
+     so the rest of the pattern can match the real array expression. *)
+  let unwrap_intermediate_dummy_assign = function
+    | AssignOp (ASSIGN, Var (LocalPage, v), inner)
+      when Ain.Variable.is_dummy v ->
+        inner
+    | e -> e
+  in
   let maybe_match_foreach i_assign arr_assign while_stmt =
     match (i_assign, arr_assign, while_stmt) with
-    | ( { txt = VarDecl (arr_dummy, Some (ASSIGN, array_expr)); _ },
+    | ( { txt = VarDecl (arr_dummy, Some (ASSIGN, array_expr_raw)); _ },
         { txt = VarDecl (i_var, Some (ASSIGN, i_init)); _ },
         { txt = While (while_cond, while_body); addr; end_addr } ) -> (
+        let array_expr = unwrap_intermediate_dummy_assign array_expr_raw in
         match (i_init, while_cond) with
         | ( Number -1l,
             BinaryOp
@@ -485,12 +496,93 @@ let recognize_foreach stmt =
         | _ -> None)
     | _ -> None
   in
+  (* In v12, ControlFlow.analyze can leave non-foreach statements (a
+     loop-entry Label, unrelated uninit VarDecls like `IFlatParts s;`)
+     between the two dummy-init VarDecls and the While. Also, the
+     index variable may be user-named (e.g. `int index = -1;`) rather
+     than a dummy, when the user originally wrote `foreach (var, index
+     : container)`. To handle both: when we see a While, extract the
+     index var (i_var) and container var (arr_var) from the condition,
+     then scan forward through the list for VarDecls of those exact
+     variables (using phys_equal). Statements skipped during the scan
+     are preserved in their original list position. *)
+  let extract_i_var = function
+    | BinaryOp
+        ( LT,
+          Load (IncDec (Prefix, Increment, Var (LocalPage, i_var))),
+          _ ) ->
+        Some i_var
+    | BinaryOp
+        ( GTE,
+          Load (IncDec (Prefix, Decrement, Var (LocalPage, i_var))),
+          Number 0l ) ->
+        Some i_var
+    | _ -> None
+  in
+  let extract_arr_var_from_cond = function
+    | BinaryOp
+        ( LT,
+          _,
+          Call
+            ( HllFunc ("Array", { name = "Numof"; _ }),
+              [ Load (Var (LocalPage, arr_var)) ] ) ) ->
+        Some arr_var
+    | _ -> None
+  in
+  let extract_arr_var_from_i_init = function
+    | Call
+        ( HllFunc ("Array", { name = "Numof"; _ }),
+          [ Load (Var (LocalPage, arr_var)) ] ) ->
+        Some arr_var
+    | _ -> None
+  in
+  let find_var_decl var rest =
+    let rec aux skipped = function
+      | ({ txt = VarDecl (v, Some (ASSIGN, _)); _ } as s) :: tail
+        when phys_equal v var ->
+          Some (s, List.rev skipped, tail)
+      | (({ txt = VarDecl _; _ } | { txt = Label _; _ }) as s) :: tail ->
+          aux (s :: skipped) tail
+      | _ -> None
+    in
+    aux [] rest
+  in
+  let i_init_of = function
+    | { txt = VarDecl (_, Some (ASSIGN, e)); _ } -> Some e
+    | _ -> None
+  in
   let rec reduce acc stmts =
     match stmts with
-    | s3 :: s2 :: s1 :: tail -> (
-        match maybe_match_foreach s1 s2 s3 with
-        | Some new_stmt -> reduce (new_stmt :: acc) tail
-        | None -> reduce (s3 :: acc) (s2 :: s1 :: tail))
+    | ({ txt = While (while_cond, _); _ } as while_stmt) :: rest -> (
+        match extract_i_var while_cond with
+        | Some i_var -> (
+            match find_var_decl i_var rest with
+            | Some (i_assign, skipped1, rest1) -> (
+                let arr_var =
+                  match extract_arr_var_from_cond while_cond with
+                  | Some v -> Some v
+                  | None ->
+                      Option.bind (i_init_of i_assign)
+                        ~f:extract_arr_var_from_i_init
+                in
+                match arr_var with
+                | Some arr_var -> (
+                    match find_var_decl arr_var rest1 with
+                    | Some (arr_assign, skipped2, rest2) -> (
+                        match
+                          maybe_match_foreach arr_assign i_assign while_stmt
+                        with
+                        | Some foreach_stmt ->
+                            let preserved = skipped1 @ skipped2 in
+                            reduce
+                              (List.rev_append preserved
+                                 (foreach_stmt :: acc))
+                              rest2
+                        | None -> reduce (while_stmt :: acc) rest)
+                    | None -> reduce (while_stmt :: acc) rest)
+                | None -> reduce (while_stmt :: acc) rest)
+            | None -> reduce (while_stmt :: acc) rest)
+        | None -> reduce (while_stmt :: acc) rest)
     | s :: tail -> reduce (s :: acc) tail
     | [] -> List.rev acc
   in

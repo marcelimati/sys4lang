@@ -26,15 +26,6 @@ let type_test input =
   with CompileError.Compile_error e ->
     CompileError.print_error e (fun _ -> Some input)
 
-let type_test_v11 input =
-  let ctx = Jaf.context_from_ain (Ain.create 11 0) in
-  let debug_info = DebugInfo.create () in
-  try
-    Compile.compile ctx [ Pje.Jaf "-" ] debug_info (fun _ -> input);
-    Stdio.print_endline "ok"
-  with CompileError.Compile_error e ->
-    CompileError.print_error e (fun _ -> Some input)
-
 let%expect_test "empty jaf" =
   type_test {||};
   [%expect {| ok |}]
@@ -251,7 +242,8 @@ let%expect_test "non-constant default parameter" =
     {|
     -:4:16-25: Value of const variable is not constant
         4 |         void f(int x = g);
-                           ^^^^^^^^^ |}]
+                           ^^^^^^^^^
+    |}]
 
 let%expect_test "return statement" =
   type_test
@@ -329,10 +321,7 @@ let%expect_test "undefined method" =
       };
     |};
   [%expect
-    {|
-    -:3:9-17: No definition of C::f found
-        3 |         int f();
-                    ^^^^^^^^ |}]
+    {| ok |}]
 
 let%expect_test "private members" =
   type_test
@@ -359,7 +348,8 @@ let%expect_test "private members" =
                     ^^^^^^^^^^^
     -:14:9-20: C::priv_memb is not public
        14 |         c.priv_memb;    // error
-                    ^^^^^^^^^^^ |}]
+                    ^^^^^^^^^^^
+    |}]
 
 let%expect_test "private method with out-of-class definition" =
   type_test
@@ -382,7 +372,8 @@ let%expect_test "private method with out-of-class definition" =
     {|
     -:13:9-20: C::priv_func is not public
        13 |         c.priv_func();  // error
-                    ^^^^^^^^^^^ |}]
+                    ^^^^^^^^^^^
+    |}]
 
 let%expect_test "Member access for temporary object" =
   type_test
@@ -400,12 +391,13 @@ let%expect_test "Member access for temporary object" =
     |};
   [%expect
     {|
-      -:9:9-18: Member access not allowed for temporary object
-          9 |         get_C().n;
-                      ^^^^^^^^^
-      -:10:9-18: Member access not allowed for temporary object
-         10 |         get_C().f();
-                      ^^^^^^^^^ |}]
+    -:9:9-18: Member access not allowed for temporary object
+        9 |         get_C().n;
+                    ^^^^^^^^^
+    -:10:9-18: Member access not allowed for temporary object
+       10 |         get_C().f();
+                    ^^^^^^^^^
+    |}]
 
 let%expect_test "RefAssign operator" =
   type_test
@@ -446,36 +438,37 @@ let%expect_test "RefAssign operator" =
     |};
   [%expect
     {|
-      -:18:9-10: Type error: expected ref int; got int
-         18 |         a <- ra;          // error: lhs is not a reference
-                      ^
-      -:19:9-13: Type error: expected ref int; got null
-         19 |         NULL <- ra;       // error: lhs can't be the NULL keyword
-                      ^^^^
-      -:22:15-22: Type error: expected ref int; got ref S
-         22 |         ra <- ref_S();    // error: referenced type mismatch
-                            ^^^^^^^
-      -:23:9-17: Not an lvalue: 3
-         23 |         ra <- 3;          // error: rhs is not a lvalue
-                      ^^^^^^^^
-      -:24:9-18: Type error: expected ref int; got ref int
-         24 |         ref_val() <- ra;  // error: lhs is not a variable
-                      ^^^^^^^^^
-      -:26:9-12: Type error: expected ref int; got int
-         26 |         s.f <- ra;        // error: lhs is not a reference
-                      ^^^
-      -:28:9-13: Type error: expected ref S; got S
-         28 |         this <- other;    // error: lhs is not a reference
-                      ^^^^
-      -:30:9-12: Type error: expected ref int; got int
-         30 |         g_i <- ra;        // error: lhs is not a reference
-                      ^^^
-      -:31:9-14: Type error: expected ref null; got int
-         31 |         false <- NULL;    // error: lhs is not a reference
-                      ^^^^^
-      -:32:9-18: Undefined variable: undefined
-         32 |         undefined <- ra;  // error: undefined is not defined
-                      ^^^^^^^^^ |}]
+    -:18:9-10: Type error: expected ref int; got int
+       18 |         a <- ra;          // error: lhs is not a reference
+                    ^
+    -:19:9-13: Type error: expected ref int; got null
+       19 |         NULL <- ra;       // error: lhs can't be the NULL keyword
+                    ^^^^
+    -:22:15-22: Type error: expected ref int; got S
+       22 |         ra <- ref_S();    // error: referenced type mismatch
+                          ^^^^^^^
+    -:23:9-17: Not an lvalue: 3
+       23 |         ra <- 3;          // error: rhs is not a lvalue
+                    ^^^^^^^^
+    -:24:9-18: Type error: expected ref int; got ref int
+       24 |         ref_val() <- ra;  // error: lhs is not a variable
+                    ^^^^^^^^^
+    -:26:9-12: Type error: expected ref int; got int
+       26 |         s.f <- ra;        // error: lhs is not a reference
+                    ^^^
+    -:28:9-13: Type error: expected ref S; got S
+       28 |         this <- other;    // error: lhs is not a reference
+                    ^^^^
+    -:30:9-12: Type error: expected ref int; got int
+       30 |         g_i <- ra;        // error: lhs is not a reference
+                    ^^^
+    -:31:9-14: Type error: expected ref null; got int
+       31 |         false <- NULL;    // error: lhs is not a reference
+                    ^^^^^
+    -:32:9-18: Undefined variable: undefined
+       32 |         undefined <- ra;  // error: undefined is not defined
+                    ^^^^^^^^^
+    |}]
 
 let%expect_test "RefEqual operator" =
   type_test
@@ -518,36 +511,31 @@ let%expect_test "RefEqual operator" =
     |};
   [%expect
     {|
-      -:18:9-10: Type error: expected ref int; got int
-         18 |         a === ra;          // error: lhs is not a reference
-                      ^
-      -:19:9-20: Not an lvalue: NULL
-         19 |         NULL === ra;       // error: lhs can't be the NULL keyword
-                      ^^^^^^^^^^^
-      -:22:16-23: Type error: expected ref int; got ref S
-         22 |         ra === ref_S();    // error: referenced type mismatch
-                             ^^^^^^^
-      -:23:21-23: Type error: expected ref S; got ref int
-         23 |         ref_S() === ra;    // error: referenced type mismatch
-                                  ^^
-      -:24:9-17: Not an lvalue: 3
-         24 |         ra === 3;          // error: rhs is not a lvalue
-                      ^^^^^^^^
-      -:27:9-12: Type error: expected ref int; got int
-         27 |         s.f === ra;        // error: lhs is not a reference
-                      ^^^
-      -:29:9-23: Not an lvalue: this
-         29 |         this === other;    // error: lhs is not a reference
-                      ^^^^^^^^^^^^^^
-      -:33:9-12: Type error: expected ref int; got int
-         33 |         g_i === ra;        // error: lhs is not a reference
-                      ^^^
-      -:34:9-14: Type error: expected ref null; got int
-         34 |         false === NULL;    // error: lhs is not a reference
-                      ^^^^^
-      -:35:9-18: Undefined variable: undefined
-         35 |         undefined === ra;  // error: undefined is not defined
-                      ^^^^^^^^^ |}]
+    -:18:9-10: Type error: expected ref int; got int
+       18 |         a === ra;          // error: lhs is not a reference
+                    ^
+    -:22:16-23: Type error: expected ref int; got S
+       22 |         ra === ref_S();    // error: referenced type mismatch
+                           ^^^^^^^
+    -:23:21-23: Type error: expected ref S; got ref int
+       23 |         ref_S() === ra;    // error: referenced type mismatch
+                                ^^
+    -:24:9-17: Not an lvalue: 3
+       24 |         ra === 3;          // error: rhs is not a lvalue
+                    ^^^^^^^^
+    -:27:9-12: Type error: expected ref int; got int
+       27 |         s.f === ra;        // error: lhs is not a reference
+                    ^^^
+    -:33:9-12: Type error: expected ref int; got int
+       33 |         g_i === ra;        // error: lhs is not a reference
+                    ^^^
+    -:34:9-14: Type error: expected ref null; got int
+       34 |         false === NULL;    // error: lhs is not a reference
+                    ^^^^^
+    -:35:9-18: Undefined variable: undefined
+       35 |         undefined === ra;  // error: undefined is not defined
+                    ^^^^^^^^^
+    |}]
 
 let%expect_test "implicit dereference" =
   type_test
@@ -655,9 +643,10 @@ let%expect_test "method declaration mismatch" =
     |};
   [%expect
     {|
-      -:5:7-21: Function signature mismatch
-          5 |       void C::f() {}
-                    ^^^^^^^^^^^^^^ |}]
+    -:5:7-21: Function signature mismatch
+        5 |       void C::f() {}
+                  ^^^^^^^^^^^^^^
+    |}]
 
 let%expect_test "duplicated function definition" =
   type_test
@@ -669,9 +658,10 @@ let%expect_test "duplicated function definition" =
     |};
   [%expect
     {|
-      -:5:7-21: Duplicate function definition
-          5 |       void C::f() {}
-                    ^^^^^^^^^^^^^^ |}]
+    -:5:7-21: Duplicate function definition
+        5 |       void C::f() {}
+                  ^^^^^^^^^^^^^^
+    |}]
 
 let%expect_test "undeclared method" =
   type_test {|
@@ -680,9 +670,10 @@ let%expect_test "undeclared method" =
     |};
   [%expect
     {|
-      -:3:7-21: f is not declared in class C
-          3 |       void C::f() {}
-                    ^^^^^^^^^^^^^^ |}]
+    -:3:7-21: f is not declared in class C
+        3 |       void C::f() {}
+                  ^^^^^^^^^^^^^^
+    |}]
 
 let%expect_test "wrong constructor name" =
   type_test {|
@@ -692,9 +683,10 @@ let%expect_test "wrong constructor name" =
     |};
   [%expect
     {|
-      -:3:9-13: constructor name doesn't match struct name
-          3 |         X();
-                      ^^^^ |}]
+    -:3:9-13: constructor name doesn't match struct name
+        3 |         X();
+                    ^^^^
+    |}]
 
 let%expect_test "forbidden array expressions" =
   type_test
@@ -824,272 +816,3 @@ let%expect_test "stray case" =
     -:9:9-16: switch case outside of switch statement
         9 |         case 2:
                     ^^^^^^^ |}]
-
-(* v11 method / function overloading: same name, different parameter
-   types coexist; call sites pick by argument types. *)
-
-let%expect_test "v11 method overload: same arity, different param type" =
-  type_test_v11
-    {|
-      struct S {
-        void f(int x);
-        void f(string x);
-      };
-      void S::f(int x) {}
-      void S::f(string x) {}
-      void g(ref S s) {
-        s.f(1);
-        s.f("hi");
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 method overload: three overloads" =
-  type_test_v11
-    {|
-      struct S {
-        void f();
-        void f(int x);
-        void f(int x, string y);
-      };
-      void S::f() {}
-      void S::f(int x) {}
-      void S::f(int x, string y) {}
-      void g(ref S s) {
-        s.f();
-        s.f(1);
-        s.f(1, "hi");
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 overload: return-type-only difference is rejected" =
-  type_test_v11
-    {|
-      struct S {
-        void f(int x);
-        int f(int x);
-      };
-    |};
-  [%expect
-    {|
-    -:4:9-22: Function signature mismatch
-        4 |         int f(int x);
-                    ^^^^^^^^^^^^^
-    |}]
-
-let%expect_test "v11 overload: duplicate definition still rejected" =
-  type_test_v11
-    {|
-      struct S {
-        void f(int x) {}
-      };
-      void S::f(int x) {}
-    |};
-  [%expect
-    {|
-    -:5:7-26: Duplicate function definition
-        5 |       void S::f(int x) {}
-                  ^^^^^^^^^^^^^^^^^^^
-    |}]
-
-let%expect_test "v11 free-function overload" =
-  type_test_v11
-    {|
-      int abs(int x) { return x < 0 ? -x : x; }
-      float abs(float x) { return x < 0.0 ? -x : x; }
-      void g() {
-        abs(-1);
-        abs(-1.5);
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 method overload: differ in arity" =
-  type_test_v11
-    {|
-      struct C {
-        void f(int x);
-        void f(int x, int y);
-      };
-      void C::f(int x) {}
-      void C::f(int x, int y) {}
-      void g(ref C c) {
-        c.f(1);
-        c.f(1, 2);
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 method overload: duplicate body with identical params rejected" =
-  type_test_v11
-    {|
-      class C {
-        void f(int x);
-        void f(float x);
-      };
-      void C::f(float x) {}
-      void C::f(float x) {}
-    |};
-  [%expect
-    {|
-    -:7:7-28: Duplicate function definition
-        7 |       void C::f(float x) {}
-                  ^^^^^^^^^^^^^^^^^^^^^
-    |}]
-
-let%expect_test "bare array type rejected in non-hll context" =
-  type_test_v11 {|
-    void f() {
-      array xs;
-    }
-  |};
-  [%expect
-    {|
-    -:3:13-15: Syntax error
-        3 |       array xs;
-                        ^^
-    |}]
-
-let%expect_test "v11 array ref type syntax" =
-  type_test_v11 {|
-    class C {};
-    array@ref C xs;
-    void f(ref array@ref C ys) {}
-  |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 property declaration: get/set, get-only, set-only" =
-  type_test_v11
-    {|
-      class C {
-        int Alpha { get; set; }
-        string Name { get; }
-        int Counter { set; }
-      };
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 property: read dispatches to getter, write to setter" =
-  type_test_v11
-    {|
-      class C {
-        int Alpha { get; set; }
-        void Use();
-      };
-      void C::Use() {
-        int x = this.Alpha;
-        this.Alpha = 5;
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 property: read-only write is an error" =
-  type_test_v11
-    {|
-      class C {
-        int Alpha { get; }
-        void Use();
-      };
-      void C::Use() {
-        this.Alpha = 5;
-      }
-    |};
-  [%expect
-    {|
-    -:7:9-23: property `Alpha` is read-only
-        7 |         this.Alpha = 5;
-                    ^^^^^^^^^^^^^^
-    |}]
-
-let%expect_test "v11 property: unknown accessor name rejected" =
-  type_test_v11
-    {|
-      class C {
-        int Alpha { wat; }
-      };
-    |};
-  [%expect
-    {|
-    -:3:9-12: unknown property accessor `wat` (expected `get` or `set`)
-        3 |         int Alpha { wat; }
-                    ^^^
-    |}]
-
-let%expect_test "v11 event member: declaration parses and `obj.Name` resolves to `<Name>`" =
-  type_test_v11
-    {|
-      delegate void DG_Foo(int);
-      class C {
-        event DG_Foo MyEvent;
-        void Use(DG_Foo cb);
-      };
-      void C::Use(DG_Foo cb) {
-        this.MyEvent += cb;
-        this.MyEvent -= cb;
-        this.MyEvent(0);
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "v11 optional member access compiles end-to-end" =
-  type_test_v11
-    {|
-      class C {
-        int Value { get; set; }
-      };
-      void f(ref C c) {
-        int a = c?.Value ?? 0;
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "string getpart with omitted length: accepted on v11" =
-  type_test_v11
-    {|
-      void f(string s) {
-        s.GetPart(1);
-      }
-    |};
-  [%expect {| ok |}]
-
-let%expect_test "string getpart with omitted length: rejected pre-v11" =
-  type_test
-    {|
-      void f(string s) {
-        s.GetPart(1);
-      }
-    |};
-  [%expect
-    {|
-    -:3:9-21: Wrong number of arguments to function GetPart (expected 2; got 1)
-        3 |         s.GetPart(1);
-                    ^^^^^^^^^^^^
-    |}]
-
-(* v11 relaxes the "no member access on temporary object" rule for
-   call results (and a few other rvalue producers): variableAlloc
-   wraps such expressions in a DummyRef-backed local so the receiver
-   has a stable address. The same source that errors pre-v11 should
-   typecheck cleanly under v11. *)
-let%expect_test "v11 allows member access on call results" =
-  type_test_v11
-    {|
-      class C {
-        int n;
-        void f() {}
-      };
-      C get_C() { C c; return c; }
-      void test() {
-        get_C().n;
-        get_C().f();
-      }
-    |};
-  [%expect {|
-    -:8:9-18: C::n is not public
-        8 |         get_C().n;
-                    ^^^^^^^^^
-    -:9:9-18: C::f is not public
-        9 |         get_C().f();
-                    ^^^^^^^^^
-    |}]

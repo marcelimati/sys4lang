@@ -75,7 +75,7 @@ object
     ?as_lambda:bool -> ?skip_signature:bool -> function_t -> unit
   method print_event_prototype : event_pair -> unit
   method print_event_def : event_pair -> unit
-  method print_property_prototype : property_def -> unit
+  method print_property_prototype : ?initval:Ast.expr -> property_def -> unit
   method print_property_def : property_def -> unit
   method print_struct_decl : struct_t -> unit
   method print_enum_decl : enum_t -> unit

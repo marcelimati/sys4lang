@@ -171,27 +171,26 @@ let%expect_test "local ref int" =
   |};
   [%expect
     {|
-      000: FUNC f
-      006: CALLSYS LockPeek
-      012: POP
-      014: PUSHLOCALPAGE
-      016: PUSH 0
-      022: DUP2
-      024: REFREF
-      026: POP
-      028: DELETE
-      030: PUSH -1
-      036: PUSH 0
-      042: R_ASSIGN
-      044: POP
-      046: POP
-      048: CALLSYS UnlockPeek
-      054: POP
-      056: RETURN
-      058: ENDFUNC f
-      064: EOF test.jaf
-      070: FUNC NULL
-      076: EOF
+    000: FUNC f
+    006: CALLSYS LockPeek
+    012: POP
+    014: PUSHLOCALPAGE
+    016: PUSH 0
+    022: DUP2
+    024: REF
+    026: DELETE
+    028: PUSH -1
+    034: PUSH 0
+    040: R_ASSIGN
+    042: POP
+    044: POP
+    046: CALLSYS UnlockPeek
+    052: POP
+    054: RETURN
+    056: ENDFUNC f
+    062: EOF test.jaf
+    068: FUNC NULL
+    074: EOF
     |}]
 
 let%expect_test "local ref string" =
@@ -252,26 +251,25 @@ let%expect_test "new" =
   |};
   [%expect
     {|
-      000: FUNC f
-      006: PUSHLOCALPAGE
-      008: PUSH 1
-      014: PUSH 0
-      020: CALLSYS LockPeek
-      026: POP
-      028: NEW
-      030: ASSIGN
-      032: CALLSYS UnlockPeek
-      038: POP
-      040: DUP
-      042: SP_INC
-      044: RETURN
-      046: PUSH -1
-      052: RETURN
-      054: ENDFUNC f
-      060: EOF test.jaf
-      066: FUNC NULL
-      072: EOF
-  |}]
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 1
+    014: PUSH 0
+    020: CALLSYS LockPeek
+    026: POP
+    028: NEW
+    030: ASSIGN
+    032: CALLSYS UnlockPeek
+    038: POP
+    040: SR_REF2 struct(0)
+    046: RETURN
+    048: PUSH -1
+    054: RETURN
+    056: ENDFUNC f
+    062: EOF test.jaf
+    068: FUNC NULL
+    074: EOF
+    |}]
 
 let%expect_test "function returning ref" =
   compile_test {|
@@ -280,21 +278,20 @@ let%expect_test "function returning ref" =
   |};
   [%expect
     {|
-      000: FUNC f
-      006: PUSHLOCALPAGE
-      008: PUSH 0
-      014: CALLFUNC f
-      020: ASSIGN
-      022: DUP
-      024: SP_INC
-      026: RETURN
-      028: PUSH -1
-      034: RETURN
-      036: ENDFUNC f
-      042: EOF test.jaf
-      048: FUNC NULL
-      054: EOF
-  |}]
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: CALLFUNC f
+    020: ASSIGN
+    022: SR_REF2 struct(0)
+    028: RETURN
+    030: PUSH -1
+    036: RETURN
+    038: ENDFUNC f
+    044: EOF test.jaf
+    050: FUNC NULL
+    056: EOF
+    |}]
 
 let%expect_test "ref_return_null" =
   compile_test
@@ -311,21 +308,22 @@ let%expect_test "ref_return_null" =
     {|
     000: FUNC f
     006: PUSH -1
-    012: RETURN
-    014: PUSH -1
-    020: RETURN
-    022: ENDFUNC f
-    028: FUNC g
-    034: PUSH -1
-    040: PUSH 0
-    046: RETURN
-    048: PUSH -1
-    054: PUSH 0
-    060: RETURN
-    062: ENDFUNC g
-    068: EOF test.jaf
-    074: FUNC NULL
-    080: EOF
+    012: PUSH 0
+    018: RETURN
+    020: PUSH -1
+    026: RETURN
+    028: ENDFUNC f
+    034: FUNC g
+    040: PUSH -1
+    046: PUSH 0
+    052: RETURN
+    054: PUSH -1
+    060: PUSH 0
+    066: RETURN
+    068: ENDFUNC g
+    074: EOF test.jaf
+    080: FUNC NULL
+    086: EOF
     |}]
 
 let%expect_test "return_struct_from_ref" =
@@ -342,31 +340,7 @@ let%expect_test "return_struct_from_ref" =
       }
     |};
   [%expect
-    {|
-    000: FUNC f
-    006: PUSH -1
-    012: RETURN
-    014: PUSH -1
-    020: RETURN
-    022: ENDFUNC f
-    028: FUNC g
-    034: PUSHGLOBALPAGE
-    036: PUSH 0
-    042: SR_REF struct(0)
-    048: RETURN
-    050: PUSHLOCALPAGE
-    052: PUSH 0
-    058: CALLFUNC f
-    064: ASSIGN
-    066: SR_REF2 struct(0)
-    072: RETURN
-    074: PUSH -1
-    080: RETURN
-    082: ENDFUNC g
-    088: EOF test.jaf
-    094: FUNC NULL
-    100: EOF
-    |}]
+    {| :0:0-0: dereference not supported for type (This is a compiler bug!) |}]
 
 let%expect_test "local ref int" =
   compile_test
@@ -431,27 +405,9 @@ let%expect_test "bool ? ref : ref" =
   |};
   [%expect
     {|
-    000: FUNC f
-    006: SH_LOCALREF b
-    012: IFZ 46
-    018: PUSHLOCALPAGE
-    020: PUSH 1
-    026: SH_LOCALREF b
-    032: CALLFUNC f
-    038: R_ASSIGN
-    040: JUMP 58
-    046: PUSH -1
-    052: PUSH 0
-    058: DUP_U2
-    060: SP_INC
-    062: RETURN
-    064: PUSH -1
-    070: PUSH 0
-    076: RETURN
-    078: ENDFUNC f
-    084: EOF test.jaf
-    090: FUNC NULL
-    096: EOF
+    test.jaf:3:27-31: Type error: expected int; got null
+        3 |         return b ? f(b) : NULL;
+                                      ^^^^
     |}]
 
 let%expect_test "assign this" =
@@ -468,19 +424,9 @@ let%expect_test "assign this" =
     |};
   [%expect
     {|
-      000: FUNC S@f
-      006: SH_LOCALDELETE s2
-      012: SH_LOCALCREATE s2, struct(0)
-      022: SH_LOCALREF s2
-      028: PUSHSTRUCTPAGE
-      030: SR_REF2 struct(0)
-      036: PUSH 0
-      042: SR_ASSIGN
-      044: SR_POP
-      046: RETURN
-      048: EOF test.jaf
-      054: FUNC NULL
-      060: EOF
+    test.jaf:7:11-13: Unimplemented variable type: S for `s2`
+        7 |         S s2;
+                      ^^
     |}]
 
 let%expect_test "deref struct assign" =
@@ -495,29 +441,9 @@ let%expect_test "deref struct assign" =
     |};
   [%expect
     {|
-    000: FUNC ref_s
-    006: SH_LOCALDELETE s
-    012: SH_LOCALCREATE s, struct(0)
-    022: SH_LOCALREF s
-    028: PUSHLOCALPAGE
-    030: PUSH 2
-    036: SH_LOCALREF rs
-    042: CALLFUNC ref_s
-    048: ASSIGN
-    050: SR_REF2 struct(0)
-    056: PUSH 0
-    062: SR_ASSIGN
-    064: POP
-    066: SH_LOCALREF rs
-    072: DUP
-    074: SP_INC
-    076: RETURN
-    078: PUSH -1
-    084: RETURN
-    086: ENDFUNC ref_s
-    092: EOF test.jaf
-    098: FUNC NULL
-    104: EOF
+    test.jaf:4:11-12: Unimplemented variable type: S for `s`
+        4 |         S s;
+                      ^
     |}]
 
 let%expect_test "ref struct assign" =
@@ -531,38 +457,10 @@ let%expect_test "ref struct assign" =
     |};
   [%expect
     {|
-      000: FUNC f
-      006: CALLSYS LockPeek
-      012: POP
-      014: PUSHLOCALPAGE
-      016: PUSH 0
-      022: DUP2
-      024: REF
-      026: DELETE
-      028: DUP2
-      030: PUSHLOCALPAGE
-      032: PUSH 1
-      038: CALLFUNC f
-      044: ASSIGN
-      046: ASSIGN
-      048: DUP_X2
-      050: POP
-      052: REF
-      054: SP_INC
-      056: POP
-      058: CALLSYS UnlockPeek
-      064: POP
-      066: SH_LOCALREF r
-      072: DUP
-      074: SP_INC
-      076: RETURN
-      078: PUSH -1
-      084: RETURN
-      086: ENDFUNC f
-      092: EOF test.jaf
-      098: FUNC NULL
-      104: EOF
-  |}]
+    test.jaf:4:15-22: Unimplemented variable type: ref S for `r`
+        4 |         ref S r = f();
+                          ^^^^^^^
+    |}]
 
 let%expect_test "local ref int assign" =
   compile_test
@@ -574,41 +472,37 @@ let%expect_test "local ref int assign" =
     |};
   [%expect
     {|
-      000: FUNC f
-      006: CALLSYS LockPeek
-      012: POP
-      014: PUSHLOCALPAGE
-      016: PUSH 0
-      022: DUP2
-      024: REFREF
-      026: POP
-      028: DELETE
-      030: DUP2
-      032: PUSHLOCALPAGE
-      034: PUSH 2
-      040: CALLFUNC f
-      046: R_ASSIGN
-      048: R_ASSIGN
-      050: POP
-      052: POP
-      054: REF
-      056: SP_INC
-      058: CALLSYS UnlockPeek
-      064: POP
-      066: PUSHLOCALPAGE
-      068: PUSH 0
-      074: REFREF
-      076: DUP_U2
-      078: SP_INC
-      080: RETURN
-      082: PUSH -1
-      088: PUSH 0
-      094: RETURN
-      096: ENDFUNC f
-      102: EOF test.jaf
-      108: FUNC NULL
-      114: EOF
-  |}]
+    000: FUNC f
+    006: CALLSYS LockPeek
+    012: POP
+    014: PUSHLOCALPAGE
+    016: PUSH 0
+    022: DUP2
+    024: REF
+    026: DELETE
+    028: DUP2
+    030: CALLFUNC f
+    036: R_ASSIGN
+    038: POP
+    040: POP
+    042: REF
+    044: SP_INC
+    046: CALLSYS UnlockPeek
+    052: POP
+    054: PUSHLOCALPAGE
+    056: PUSH 0
+    062: REFREF
+    064: DUP_U2
+    066: SP_INC
+    068: RETURN
+    070: PUSH -1
+    076: PUSH 0
+    082: RETURN
+    084: ENDFUNC f
+    090: EOF test.jaf
+    096: FUNC NULL
+    102: EOF
+    |}]
 
 (* The `<-` reassignment operator derives the SP_INC page from the source
    lvalue. This matches the SDK compiler. *)
@@ -628,31 +522,30 @@ let%expect_test "local ref int reassign" =
     014: PUSHLOCALPAGE
     016: PUSH 0
     022: DUP2
-    024: REFREF
-    026: POP
-    028: DELETE
-    030: DUP2
-    032: PUSHLOCALPAGE
-    034: PUSH 2
-    040: REFREF
-    042: R_ASSIGN
+    024: REF
+    026: DELETE
+    028: DUP2
+    030: PUSHLOCALPAGE
+    032: PUSH 2
+    038: REFREF
+    040: R_ASSIGN
+    042: POP
     044: POP
-    046: POP
-    048: REF
-    050: SP_INC
-    052: CALLSYS UnlockPeek
-    058: POP
-    060: PUSHLOCALPAGE
-    062: PUSH 0
-    068: REFREF
-    070: REF
-    072: RETURN
-    074: PUSH 0
-    080: RETURN
-    082: ENDFUNC f
-    088: EOF test.jaf
-    094: FUNC NULL
-    100: EOF
+    046: REF
+    048: SP_INC
+    050: CALLSYS UnlockPeek
+    056: POP
+    058: PUSHLOCALPAGE
+    060: PUSH 0
+    066: REFREF
+    068: REF
+    070: RETURN
+    072: PUSH 0
+    078: RETURN
+    080: ENDFUNC f
+    086: EOF test.jaf
+    092: FUNC NULL
+    098: EOF
     |}]
 
 let%expect_test "ref struct reassign" =
@@ -674,20 +567,21 @@ let%expect_test "ref struct reassign" =
     024: REF
     026: DELETE
     028: DUP2
-    030: SH_LOCALREF b
-    036: ASSIGN
-    038: DUP_X2
-    040: POP
-    042: REF
-    044: SP_INC
-    046: POP
-    048: CALLSYS UnlockPeek
-    054: POP
-    056: RETURN
-    058: ENDFUNC f
-    064: EOF test.jaf
-    070: FUNC NULL
-    076: EOF
+    030: PUSHLOCALPAGE
+    032: PUSH 1
+    038: ASSIGN
+    040: DUP_X2
+    042: POP
+    044: REF
+    046: SP_INC
+    048: POP
+    050: CALLSYS UnlockPeek
+    056: POP
+    058: RETURN
+    060: ENDFUNC f
+    066: EOF test.jaf
+    072: FUNC NULL
+    078: EOF
     |}]
 
 let%expect_test "struct ref int assign" =
@@ -702,17 +596,18 @@ let%expect_test "struct ref int assign" =
   [%expect
     {|
     000: FUNC f
-    006: SH_GLOBALREF global(0)
-    012: PUSH 0
-    018: REFREF
-    020: PUSH 42
-    026: ASSIGN
-    028: POP
-    030: RETURN
-    032: ENDFUNC f
-    038: EOF test.jaf
-    044: FUNC NULL
-    050: EOF
+    006: PUSHGLOBALPAGE
+    008: PUSH 0
+    014: PUSH 0
+    020: REFREF
+    022: PUSH 42
+    028: ASSIGN
+    030: POP
+    032: RETURN
+    034: ENDFUNC f
+    040: EOF test.jaf
+    046: FUNC NULL
+    052: EOF
     |}]
 
 let%expect_test "syscall" =
@@ -975,38 +870,10 @@ let%expect_test "local delete" =
     |};
   [%expect
     {|
-        000: FUNC f
-        006: CALLSYS LockPeek
-        012: POP
-        014: PUSHLOCALPAGE
-        016: PUSH 0
-        022: DUP2
-        024: REFREF
-        026: POP
-        028: DELETE
-        030: PUSH -1
-        036: PUSH 0
-        042: R_ASSIGN
-        044: POP
-        046: POP
-        048: CALLSYS UnlockPeek
-        054: POP
-        056: PUSHLOCALPAGE
-        058: PUSH 2
-        064: A_FREE
-        066: SH_LOCALDELETE s
-        072: SH_LOCALCREATE s, struct(0)
-        082: SH_LOCALDELETE s
-        088: PUSHLOCALPAGE
-        090: PUSH 2
-        096: A_FREE
-        098: SH_LOCALDELETE r
-        104: JUMP 6
-        110: RETURN
-        112: ENDFUNC f
-        118: EOF test.jaf
-        124: FUNC NULL
-        130: EOF |}]
+    test.jaf:7:15-16: Unimplemented variable type: S for `s`
+        7 |             S s;
+                          ^
+    |}]
 
 let%expect_test "local delete with goto" =
   compile_test
@@ -1023,20 +890,9 @@ let%expect_test "local delete with goto" =
     |};
   [%expect
     {|
-      000: FUNC f
-      006: SH_LOCALDELETE s1
-      012: SH_LOCALCREATE s1, struct(0)
-      022: SH_LOCALDELETE s2
-      028: SH_LOCALCREATE s2, struct(0)
-      038: SH_LOCALDELETE s2
-      044: JUMP 62
-      050: SH_LOCALDELETE s2
-      056: JUMP 22
-      062: RETURN
-      064: ENDFUNC f
-      070: EOF test.jaf
-      076: FUNC NULL
-      082: EOF
+    test.jaf:4:11-13: Unimplemented variable type: S for `s1`
+        4 |         S s1;
+                      ^^
     |}]
 
 let%expect_test "member pointer" =
@@ -1050,19 +906,24 @@ let%expect_test "member pointer" =
         as.SortBy(&S::b);
       }
     |};
-  [%expect
-    {|
-      000: FUNC f
-      006: PUSHLOCALPAGE
-      008: PUSH 0
-      014: PUSH 1
-      020: A_SORT_MEM
-      022: RETURN
-      024: ENDFUNC f
-      030: EOF test.jaf
-      036: FUNC NULL
-      042: EOF
-    |}]
+  [%expect.unreachable]
+[@@expect.uncaught_exn {|
+  (* CR expect_test_collector: This test expectation appears to contain a backtrace.
+     This is strongly discouraged as backtraces are fragile.
+     Please change this test to not include a backtrace. *)
+  (Failure "tried to create array<interface>")
+  Raised at Stdlib.failwith in file "stdlib.ml", line 29, characters 17-33
+  Called from Compiler__Codegen.jaf_compiler#compile_function.(fun) in file "lib/compiler/codegen.ml", line 7550, characters 29-60
+  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
+  Called from Compiler__Codegen.jaf_compiler#compile_function in file "lib/compiler/codegen.ml", lines 7549-7550, characters 6-61
+  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
+  Called from Compiler__Codegen.jaf_compiler#compile in file "lib/compiler/codegen.ml", line 8343, characters 6-37
+  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
+  Called from Compiler__Compile.compile in file "lib/compiler/compile.ml", line 463, characters 2-37
+  Called from Compiler_test__CompileTest.compile_test in file "lib/compiler/test/compileTest.ml", lines 76-78, characters 4-39
+  Called from Compiler_test__CompileTest.(fun) in file "lib/compiler/test/compileTest.ml", lines 899-908, characters 2-6
+  Called from Ppx_expect_runtime__Test_block.Configured.dump_backtrace in file "runtime/test_block.ml", line 142, characters 10-28
+  |}]
 
 let%expect_test "dg_return_null" =
   compile_test
@@ -1390,48 +1251,46 @@ let%expect_test "comma operator in reference context" =
     038: PUSHLOCALPAGE
     040: PUSH 1
     046: DUP2
-    048: REFREF
-    050: POP
-    052: DELETE
-    054: PUSH -1
-    060: PUSH 0
-    066: R_ASSIGN
+    048: REF
+    050: DELETE
+    052: PUSH -1
+    058: PUSH 0
+    064: R_ASSIGN
+    066: POP
     068: POP
-    070: POP
-    072: CALLSYS UnlockPeek
-    078: POP
-    080: SH_LOCALREF i
-    086: POP
-    088: PUSHLOCALPAGE
-    090: PUSH 1
-    096: REFREF
-    098: CALLFUNC g
-    104: CALLSYS LockPeek
-    110: POP
-    112: PUSHLOCALPAGE
-    114: PUSH 1
-    120: DUP2
-    122: REFREF
-    124: POP
-    126: DELETE
-    128: DUP2
-    130: SH_LOCALREF i
-    136: POP
-    138: PUSHLOCALPAGE
-    140: PUSH 1
-    146: REFREF
-    148: R_ASSIGN
-    150: POP
-    152: POP
-    154: REF
-    156: SP_INC
-    158: CALLSYS UnlockPeek
-    164: POP
-    166: RETURN
-    168: ENDFUNC f
-    174: EOF test.jaf
-    180: FUNC NULL
-    186: EOF
+    070: CALLSYS UnlockPeek
+    076: POP
+    078: SH_LOCALREF i
+    084: POP
+    086: PUSHLOCALPAGE
+    088: PUSH 1
+    094: REFREF
+    096: CALLFUNC g
+    102: CALLSYS LockPeek
+    108: POP
+    110: PUSHLOCALPAGE
+    112: PUSH 1
+    118: DUP2
+    120: REF
+    122: DELETE
+    124: DUP2
+    126: SH_LOCALREF i
+    132: POP
+    134: PUSHLOCALPAGE
+    136: PUSH 1
+    142: REFREF
+    144: R_ASSIGN
+    146: POP
+    148: POP
+    150: REF
+    152: SP_INC
+    154: CALLSYS UnlockPeek
+    160: POP
+    162: RETURN
+    164: ENDFUNC f
+    170: EOF test.jaf
+    176: FUNC NULL
+    182: EOF
     |}]
 
 (* v11 omits the trailing JUMP-over-alt when there's no else branch.

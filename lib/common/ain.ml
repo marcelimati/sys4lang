@@ -286,7 +286,19 @@ module Variable = struct
   }
 
   let make ?(index = -1) name value_type =
-    { index; name; name2 = Some ""; value_type; initval = None }
+    (* v12 variables carry a [name2] cstring after the primary
+       name. The original v12 compiler writes [name2 = name] —
+       i.e. the same string duplicated. Emitting an empty [name2]
+       (the previous default) made our struct member layouts diff
+       from original at byte level even when visible fields
+       matched, and the runtime VM crashed at load reading
+       struct-table entries (observed: 0xC0000005 at NULL+0x34
+       in Rance10.exe).
+
+       Exception: the [<void>] placeholder global (inserted after
+       each IFace global) keeps [name2 = ""], matching original. *)
+    let name2 = if String.equal name "<void>" then Some "" else Some name in
+    { index; name; name2; value_type; initval = None }
 end
 
 module Global = struct
@@ -1075,7 +1087,16 @@ let write_variable buf ain (v : Variable.t) =
 
 let write_function buf ain (f : Function.t) =
   let module BB = BinBuffer in
-  BB.add_int buf f.address;
+  (* v12: collapse internal "claimed" marker [-2] (set by [add_function]'s
+     overload disambiguation) back to [-1] (unclaimed prototype) on disk.
+     Original v12 Rance10 has 1764 prototype-only entries at address=-1;
+     ours keeps them at -2 in memory, which would write a different byte
+     sequence than original. Pre-v12 compilers don't have this issue
+     because they don't keep many unstubbed entries. *)
+  let address_to_write =
+    if version_gte ain (12, 0) && f.address = -2 then -1 else f.address
+  in
+  BB.add_int buf address_to_write;
   BB.add_cstring buf f.name;
   if_version_between ain 1 7 (BB.add_bool buf) () f.is_label;
   write_return_type buf ain f.return_type;
@@ -1084,6 +1105,11 @@ let write_function buf ain (f : Function.t) =
   if_version_gte ain (11, 0) (BB.add_bool buf) () f.is_lambda;
   if_version_gte ain (2, 0) (BB.add_int32 buf) () f.crc;
   List.iter f.vars ~f:(write_variable buf ain)
+
+let serialize_function_bytes ain (f : Function.t) =
+  let buf = BinBuffer.create 256 in
+  write_function buf ain f;
+  Stdlib.Bytes.of_string (BinBuffer.contents buf)
 
 let write_global buf ain (g : Global.t) =
   BinBuffer.add_cstring buf g.variable.name;
@@ -1261,6 +1287,13 @@ let to_buffer ain =
   if ain.major_version >= 1 && ain.major_version < 7 then (
     BB.add_string buf "OJMP";
     BB.add_int buf ain.ojmp);
+  (* Both FNCT and DELG carry a section-size prefix after the tag; the
+     v11+ loader validates it, so writing zero makes the file
+     unloadable (observed: Rance10.exe access-violates at NULL+0x34
+     during boot). write_functype_section writes the size the official
+     compiler does: byte length of everything after the 4-byte tag,
+     including the size field itself (verified against pristine Ixseal
+     and Rance10 ains). *)
   (* XXX: section disappears in Rance IX (mid v6) *)
   if Dynarray.length ain.function_types > 0 then
     write_functype_section buf ain "FNCT" ain.function_types;
@@ -1332,8 +1365,27 @@ let set_global_type ain name t =
   match Hashtbl.find ain.global_by_name name with
   | Some i ->
       let g = Dynarray.get ain.globals i in
+      (* v12: globalgroup-scoped globals whose type contains a [Ref]
+         (e.g. [array<ref Quest>] inside [globalgroup ランス１０セーブデータ],
+         or [ref array<int>] inside [globalgroup ３部セーブデータ]) have
+         empty [name2] in original Rance10. Top-level ref globals
+         (e.g. [g_PartsActivityList]) keep [name2 = name]. Rule
+         appears to be: in-group + contains-ref => empty name2. *)
+      let rec contains_ref = function
+        | Type.Ref _ -> true
+        | Type.Array t | Type.Wrap t | Type.Option t | Type.Unknown87 t ->
+            contains_ref t
+        | _ -> false
+      in
+      let new_name2 =
+        if version_gte ain (12, 0)
+           && g.group_index >= 0
+           && contains_ref t
+        then Some ""
+        else g.variable.name2
+      in
       Dynarray.set ain.globals i
-        { g with variable = { g.variable with value_type = t } }
+        { g with variable = { g.variable with value_type = t; name2 = new_name2 } }
   | None -> failwith (sprintf "No global named '%s' in ain object" name)
 
 let set_global_initval ain name initval =
@@ -1356,12 +1408,12 @@ let add_global ain name group_index =
      the same global twice — return the existing index to avoid
      duplicate entries. Pre-v11 keeps the historical append-only
      behavior; the duplicate check happens at the [declarations.ml]
-     callsite via [Hashtbl.add ctx.globals]. *)
-  let existing =
+     callsite via [Hashtbl.add ctx.globals]. Use the [global_by_name]
+     index for an O(1) lookup. *)
+  match
     if version_gte ain (11, 0) then Hashtbl.find ain.global_by_name name
     else None
-  in
-  match existing with
+  with
   | Some i -> i
   | None ->
       let index = Dynarray.length ain.globals in
@@ -1383,6 +1435,30 @@ let add_global_group ain name =
       Dynarray.add_last ain.global_group_names name;
       index
   | exception Found i -> i
+
+(* v12: original Rance10's OBJG names appear sorted by their Shift-JIS
+   byte representation. Our compile assigns group indices in source
+   declaration order. Re-sort the global_group_names array by
+   Shift-JIS bytes after all groups have been registered, and remap
+   each global's group_index to the new sorted position. *)
+let sort_global_groups ain =
+  let n = Dynarray.length ain.global_group_names in
+  if n > 0 then begin
+    let names = Dynarray.to_array ain.global_group_names in
+    let sjis_of i = Sjis.from_utf8 names.(i) in
+    let indexed = Array.init n ~f:(fun i -> (i, sjis_of i)) in
+    Array.sort indexed ~compare:(fun (_, a) (_, b) -> String.compare a b);
+    let old_to_new = Array.create ~len:n 0 in
+    Array.iteri indexed ~f:(fun new_i (old_i, _) -> old_to_new.(old_i) <- new_i);
+    let sorted_names = Array.map indexed ~f:(fun (old_i, _) -> names.(old_i)) in
+    Dynarray.iteri (fun i (g : Global.t) ->
+        if g.group_index >= 0 && g.group_index < n then
+          Dynarray.set ain.globals i
+            { g with group_index = old_to_new.(g.group_index) })
+      ain.globals;
+    Dynarray.clear ain.global_group_names;
+    Array.iter sorted_names ~f:(Dynarray.add_last ain.global_group_names)
+  end
 
 (* functions *)
 
@@ -1407,30 +1483,45 @@ let write_new_function ain (f : Function.t) =
    pre-registration and the later real-lambda [add_function] call
    share the same function-table slot, matching the original
    compiler's behavior. Without this, ghost + real allocate two
-   entries with the same name, breaking lookups and dispatch. *)
+   entries with the same name, breaking lookups and dispatch.
+
+   Post-upstream-merge: storage is [Dynarray] instead of [Array].
+   Stub matching is still a linear scan (the name index only stores
+   the first entry per name, but overloads add multiple same-name
+   entries) — scoped to v11+ to keep the pre-v11 path cheap. *)
 let add_function ?(nr_args = -1) ain name =
   let matching_stub =
-    if version_gte ain (11, 0) then (
-      let len = Dynarray.length ain.functions in
-      let rec find i =
-        if i >= len then None
-        else
-          let f = Dynarray.get ain.functions i in
-          if
-            String.equal f.name name && f.address = -1
-            && (nr_args < 0 || f.nr_args = nr_args)
-          then Some f
-          else find (i + 1)
-      in
-      find 0)
+    if version_gte ain (11, 0) then
+      let exception Found of Function.t in
+      try
+        Dynarray.iter
+          (fun (f : Function.t) ->
+            if
+              String.equal f.name name && f.address = -1
+              && (nr_args < 0 || f.nr_args = nr_args)
+            then Stdlib.raise_notrace (Found f))
+          ain.functions;
+        None
+      with Found f -> Some f
     else None
   in
   match matching_stub with
   | Some f ->
-      Dynarray.set ain.functions f.index { f with address = -2 };
-      Dynarray.get ain.functions f.index
+      let claimed = { f with address = -2 } in
+      Dynarray.set ain.functions f.index claimed;
+      claimed
   | None ->
       let no = Function.create name |> write_new_function ain in
+      (* v11 overload disambiguation: mark the fresh entry as claimed
+         ([address = -2]) and record [nr_args] so a sibling overload's
+         later [add_function] for the same name doesn't treat this
+         entry as an unclaimed [address = -1] stub. Ghost-lambda
+         pre-registration writes its stubs via [write_new_function]
+         directly (bypassing this path) so those stubs remain
+         [address = -1] and are reusable. *)
+      (if nr_args >= 0 then
+         let f = Dynarray.get ain.functions no in
+         Dynarray.set ain.functions no { f with address = -2; nr_args });
       Dynarray.get ain.functions no
 
 (* scenario labels (ain v1 only) *)
@@ -1489,6 +1580,23 @@ let get_enum ain name =
   with
   | () -> None
   | exception Found i -> Some i
+
+let get_enum_name_by_index ain no = ain.enums.(no).name
+
+(* v12 ENUM section. The on-disk format is a count + N cstrings (just
+   names — values live separately as functions). Without this, the
+   ENUM section emits count=0 and the runtime crashes when bytecode
+   references an [Ain.Type.Enum N] / [Enum2 N] index into an empty
+   table (observed: Rance10.exe access-violates at NULL+0x34 during
+   boot). *)
+let add_enum ain name =
+  match get_enum ain name with
+  | Some i -> i
+  | None ->
+      let index = Array.length ain.enums in
+      let entry : Enum.t = { _index = index; name; _symbols = [] } in
+      ain.enums <- Array.append ain.enums [| entry |];
+      index
 
 (* libraries *)
 
@@ -1671,10 +1779,16 @@ let add_file ain name =
 
 let get_code ain = Buffer.contents_bytes ain.code
 
+let set_code ain bytes =
+  Buffer.clear ain.code;
+  Buffer.add_bytes ain.code bytes
+
 let append_bytecode ain (buf : CBuffer.t) =
   Buffer.add_subbytes ain.code buf.buf ~pos:0 ~len:buf.pos
 
 let code_size ain = Buffer.length ain.code
+let get_main_function ain = ain.main
+let get_message_function ain = ain.msgf
 let set_main_function ain no = ain.main <- no
 let set_message_function ain no = ain.msgf <- no
 let nr_globals ain = Dynarray.length ain.globals

@@ -36,6 +36,7 @@ module Type : sig
 
   val to_string : t -> string
   val int_of_data_type : int -> t -> int
+  val int_of_struct_type : ?var:bool -> int -> t -> int
   val is_ref : t -> bool
   val is_scalar : t -> bool
 end
@@ -151,9 +152,16 @@ val set_global_initval : t -> string -> Variable.initval -> unit
 val write_new_global : t -> Variable.t -> int
 val add_global : t -> string -> int -> int
 val add_global_group : t -> string -> int
+val sort_global_groups : t -> unit
 val get_function : t -> string -> Function.t option
 val get_function_by_index : t -> int -> Function.t
 val write_function : t -> Function.t -> unit
+
+(** Serialize one function's FUNC-section bytes to a fresh buffer.
+    The bytes match what would be written to the on-disk FUNC section
+    for this single function. For diagnostic byte-diffing between
+    orig and our compiled .ain. *)
+val serialize_function_bytes : t -> Function.t -> bytes
 val write_new_function : t -> Function.t -> int
 val add_function : ?nr_args:int -> t -> string -> Function.t
 val add_scenario_label : t -> string -> int -> unit
@@ -166,6 +174,8 @@ val add_struct : t -> string -> Struct.t
 val write_switch : t -> Switch.t -> unit
 val add_switch : t -> Switch.case_type -> Switch.t
 val get_enum : t -> string -> int option
+val get_enum_name_by_index : t -> int -> string
+val add_enum : t -> string -> int
 val get_library_index : t -> string -> int option
 val get_library_function_index : t -> int -> string -> int option
 val get_library_by_index : t -> int -> Library.t
@@ -194,8 +204,11 @@ val add_message : t -> string -> int
 val get_file : t -> int -> string option
 val add_file : t -> string -> int
 val get_code : t -> bytes
+val set_code : t -> bytes -> unit
 val append_bytecode : t -> CBuffer.t -> unit
 val code_size : t -> int
+val get_main_function : t -> int
+val get_message_function : t -> int
 val set_main_function : t -> int -> unit
 val set_message_function : t -> int -> unit
 val nr_globals : t -> int

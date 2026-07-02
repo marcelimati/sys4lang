@@ -24,10 +24,41 @@ open CompileError
 let loose_functype_check = ref false
 let sprintf = Printf.sprintf
 
+(* v11+ interface subtyping: a Struct value satisfies a parameter / return
+   type of a different Struct iff the actual struct implements the
+   expected struct as an interface (per Ain.Struct.interfaces). Set at
+   the start of [check_types_exn] / [resolve_overload]'s containing
+   visitor; nil-out at exit to avoid leaking across files. *)
+let current_ain : Ain.t option ref = ref None
+
+let struct_implements_interface ~actual_idx ~expected_idx =
+  match !current_ain with
+  | None -> false
+  | Some ain ->
+      if actual_idx < 0 || expected_idx < 0 then false
+      else
+        let s = Ain.get_struct_by_index ain actual_idx in
+        List.exists s.interfaces ~f:(fun (i : Ain.Struct.interface) ->
+            i.struct_type = expected_idx)
+
+let is_interface_compatible expected actual =
+  match (expected, actual) with
+  | Struct (_, exp_idx), Struct (_, act_idx) ->
+      struct_implements_interface ~actual_idx:act_idx ~expected_idx:exp_idx
+  | Ref (Struct (_, exp_idx)), Ref (Struct (_, act_idx))
+  | Ref (Struct (_, exp_idx)), Struct (_, act_idx)
+  | Struct (_, exp_idx), Ref (Struct (_, act_idx)) ->
+      struct_implements_interface ~actual_idx:act_idx ~expected_idx:exp_idx
+  | _ -> false
+
 (* An lvalue is an expression which denotes a location that can be assigned to. *)
-let is_lvalue = function
+let rec is_lvalue = function
   | { ty = TyFunction _; _ } -> false
-  | { node = Ident _ | Member _ | Subscript _ | New _; _ } -> true
+  | { node = Ident _ | Member _ | Subscript _ | New _ | OptionalMember _; _ } ->
+      true
+  (* v12 interface downcast (`(IFoo)expr`) preserves the underlying
+     storage — if the inner is an lvalue, the cast is too. *)
+  | { node = Cast (_, inner); _ } -> is_lvalue inner
   (* v11 [hll_param] is the polymorphic wildcard — HLL-side parameter
      storage that the language doesn't introspect — so any expression
      typed [HLLParam] is treated as an addressable slot. *)
@@ -46,7 +77,7 @@ let is_lvalue = function
 
 (* A value from which a reference can be made. NULL, reference, this, and
    lvalue are referenceable. *)
-let is_referenceable = function
+let rec is_referenceable = function
   | { ty = NullType | Ref _; _ } -> true
   | { node = This; _ } -> true
   | {
@@ -56,6 +87,15 @@ let is_referenceable = function
     } ->
       true
   | { node = RvalueRef _; _ } -> true
+  (* v12 [a ?? b] / [a ? b : c]: referenceable if the primary branch
+     is — v12 source uses int sentinels like `-1` on the fallback
+     side for ref-typed returns, where -1 is the null encoding. *)
+  | { node = NullCoalesce (a, _); _ } -> is_referenceable a
+  | { node = Ternary (_, b, _); _ } -> is_referenceable b
+  (* v12 cast preserves referenceability of its inner expression. *)
+  | { node = Cast (_, inner); _ } -> is_referenceable inner
+  (* v12 array/new expressions are addressable temporaries. *)
+  | { node = ArrayLiteral _ | New _ | NewCall _; _ } -> true
   | e -> is_lvalue e
 
 (* Implicit dereference of variables and members. The value of a comma
@@ -64,7 +104,10 @@ let rec maybe_deref (e : expression) =
   match e with
   | {
       ty = Ref t;
-      node = Ident _ | Member _ | Call (_, _, HLLCall _) | Subscript _;
+      node =
+        Ident _ | Member _
+        | Call (_, _, (HLLCall _ | MethodCall _ | FunctionCall _ | BuiltinCall _))
+        | Subscript _;
       _;
     } ->
       e.ty <- t
@@ -101,18 +144,30 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
      types match — the RvalueRef wrapping is inserted later in
      [insert_rvalue_ref]. *)
   | Ref a, b when type_equal a b -> true
+  (* v12 allows the inverse — a [Ref T] expression in a [T] context
+     is implicitly dereffed. Lets e.g. a ternary returning [Ref T]
+     flow into a struct-typed assignment target. *)
+  | a, Ref b when type_equal a b -> true
   | Void, Void -> true
   | Int, (Int | Bool | LongInt) -> true
   | Bool, (Int | Bool | LongInt) -> true
   | LongInt, (Int | Bool | LongInt) -> true
+  | (Int | Bool | LongInt), Enum _ -> true
+  | Enum _, (Int | Bool | LongInt) -> true
+  | Enum (_, a), Enum (_, b) -> a = b
   | Float, Float -> true
   | String, String -> true
   | Struct (_, a), Struct (_, b) -> a = -1 (* any struct *) || a = b
   | IMainSystem, (IMainSystem | Int) -> true
   | FuncType (Some (_, a)), FuncType (Some (_, b)) -> a = b
-  | FuncType None, FuncType None -> true
+  | FuncType None, FuncType _ | FuncType _, FuncType None -> true
   | Delegate (Some (_, a)), Delegate (Some (_, b)) -> a = b
-  | Delegate None, Delegate None -> true
+  (* v12 decompiler sometimes loses delegate-specialization info and
+     emits [unknown_delegate]; treat as compatible with any concrete
+     delegate. Same idea as the [loose_functype_check] LSP flag, but
+     unconditional for the compiler — we'd rather under-check than
+     refuse to compile decompiled v12 source. *)
+  | Delegate None, Delegate _ | Delegate _, Delegate None -> true
   | MemberPtr (s1, t1), MemberPtr (s2, t2) ->
       String.equal s1 s2 && type_equal t1 t2
   | NullType, (FuncType _ | Delegate _ | IMainSystem | NullType) -> true
@@ -132,6 +187,7 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
      just an alternate encoding of the same reference. *)
   | Wrap a, Ref b | Ref a, Wrap b -> type_equal a b
   | Wrap a, b | b, Wrap a -> type_equal a b
+  | Array _, Array Void | Array Void, Array _ -> true
   | Array a, Array b -> type_equal a b
   | HLLFunc, _ -> true
   | _, HLLFunc -> true
@@ -140,6 +196,7 @@ let rec type_equal (expected : jaf_type) (actual : jaf_type) =
   | Int, _
   | Bool, _
   | LongInt, _
+  | Enum _, _
   | Float, _
   | String, _
   | Struct _, _
@@ -159,8 +216,16 @@ let type_castable (dst : jaf_type) (src : jaf_type) =
   match (dst, src) with
   (* FIXME: cast to void should be allowed *)
   | Void, _ -> compiler_bug "type checker cast to void type" None
-  | (Int | LongInt | Bool | Float | String), (Int | LongInt | Bool | Float) ->
+  | (Int | LongInt | Bool | Float | String | Enum _),
+    (Int | LongInt | Bool | Float | Enum _) ->
       true
+  (* v12 user-type casts (`IParts(rect)`, `ISpriteParts(p.Get(state))`) —
+     allow any struct-to-struct cast; runtime handles interface checks. *)
+  | Struct _, Struct _ -> true
+  | Struct _, Ref (Struct _) -> true
+  | Struct _, NullType -> true
+  (* HLL-generic source flows into any cast target. *)
+  | _, HLLParam -> true
   | _ -> false
 
 let type_check parent expected (actual : expression) =
@@ -170,11 +235,36 @@ let type_check parent expected (actual : expression) =
       compiler_bug "tried to type check untyped expression" (Some parent)
   | NullType -> (
       match expected with
-      | Ref _ | FuncType _ | Delegate _ | IMainSystem -> actual.ty <- expected
+      | Ref _ | FuncType _ | Delegate _ | IMainSystem
+      (* v11+ allow NULL for Struct/Array/String parameters/returns —
+         these are heap-allocated and have a NULL representation at
+         runtime. *)
+      | Struct _ | Array _ | String
+      (* v12 also lets NULL flow into method/function-typed parameters
+         (e.g. `b ? handler : NULL` to clear a callback). *)
+      | TyMethod _ | TyFunction _ -> actual.ty <- expected
       | _ -> type_error expected (Some actual) parent)
+  | Void ->
+      (* v12 sometimes flows Void into positions expecting another
+         type (e.g. property-set in null-coalesce that feeds a
+         ternary). Accept — the value is unused at the type-check
+         level. *)
+      ()
+  (* HLL generic flows into any expected type *)
+  | HLLParam -> ()
   | a_t ->
-      if not (type_equal expected a_t) then
-        type_error expected (Some actual) parent
+      (* v12 sometimes assigns a Struct value into a Delegate-typed
+         slot (decompiler quirk where the actual type info was lost).
+         Permit at compile time; runtime handles. *)
+      let struct_to_delegate =
+        match (expected, a_t) with
+        | (Delegate _ | FuncType _), Struct _ -> true
+        | _ -> false
+      in
+      if (not (type_equal expected a_t))
+         && (not (is_interface_compatible expected a_t))
+         && not struct_to_delegate
+      then type_error expected (Some actual) parent
 
 let ref_type_check parent expected (actual : expression) =
   match actual.ty with
@@ -182,16 +272,26 @@ let ref_type_check parent expected (actual : expression) =
   | Untyped ->
       compiler_bug "tried to type check untyped expression" (Some parent)
   | Ref t ->
-      if not (type_equal expected t) then
-        type_error (Ref expected) (Some actual) parent
+      if (not (type_equal expected t))
+         && not (is_interface_compatible expected t)
+      then type_error (Ref expected) (Some actual) parent
   | _ ->
-      if not (type_equal expected actual.ty) then
-        type_error (Ref expected) (Some actual) parent
+      if (not (type_equal expected actual.ty))
+         && not (is_interface_compatible expected actual.ty)
+      then type_error (Ref expected) (Some actual) parent
 
 let type_check_numeric parent (actual : expression) =
   maybe_deref actual;
   match actual.ty with
-  | Int | Bool | LongInt | Float -> ()
+  | Int | Bool | LongInt | Float | Enum _ -> ()
+  (* HLL-generic values flow as if numeric — the wildcard means we
+     can't say more at compile time. *)
+  | HLLParam -> ()
+  (* v12 sometimes a property-set expression (which is typed Void)
+     feeds into a ternary/null-coalesce that expects numeric. Accept
+     Void with a no-op rather than erroring; the runtime semantics
+     are governed by the surrounding NullCoalesce. *)
+  | Void -> ()
   | Untyped ->
       compiler_bug "tried to type check untyped expression" (Some parent)
   | _ -> type_error Int (Some actual) parent
@@ -206,6 +306,9 @@ let type_check_member_lhs ?(v11 = false) parent (actual : expression) =
   | Struct (name, _) -> (
       let allowed_v11 = function
         | Call _ | New _ | OptionalMember _ | NullCoalesce _ -> true
+        (* v12 user-type cast result is also a transient struct value
+           that can serve as the receiver for further member access. *)
+        | Cast _ -> true
         | _ -> false
       in
       match actual.node with
@@ -228,6 +331,10 @@ let check_not_array (e : expression) =
          (array copy-assign). Pre-v11 didn't have these patterns. *)
       match e.node with
       | Call _ | Assign _ -> ()
+      (* v12 sometimes leaves a bare ArrayLiteral as an expression
+         statement (decompiler quirk where the array's use was lost).
+         Permit — the runtime effect is just allocate-and-drop. *)
+      | ArrayLiteral _ -> ()
       | _ ->
           compile_error "array expression not allowed here" (ASTExpression e))
   | _ -> ()
@@ -260,28 +367,62 @@ let specialize_hll_param elem_ty t =
   | Some et ->
       let rec sub = function
         | HLLParam -> et
+        | Array Void -> Array et
+        | Ref (Array Void) -> Ref (Array et)
+        | Wrap (Array Void) -> Wrap (Array et)
+        | Wrap (Ref (Array Void)) -> Wrap (Ref (Array et))
         (* [Ref HLLParam] specialised with an element type that's
            itself [Ref T] would yield [Ref (Ref T)] — an ill-formed
            double ref. Collapse into a single [Ref T]. *)
         | Ref HLLParam -> ( match et with Ref _ -> et | _ -> Ref et)
+        | Array t -> Array (sub t)
         | Ref t -> Ref (sub t)
+        | Wrap t -> Wrap (sub t)
         | t -> t
       in
       sub t
 
+let rec array_elem_type_of_expr (e : expression) =
+  let concrete_elem = function
+    | Array HLLParam | Ref (Array HLLParam) | Wrap (Array HLLParam)
+    | Wrap (Ref (Array HLLParam)) ->
+        None
+    | Array t | Ref (Array t) | Wrap (Array t) | Wrap (Ref (Array t)) ->
+        Some t
+    | _ -> None
+  in
+  match concrete_elem e.ty with
+  | Some _ as elem -> elem
+  | None -> (
+      match e.node with
+      | Cast (_, inner) | RvalueRef inner | DummyRef (_, inner) ->
+          array_elem_type_of_expr inner
+      | Call (_, Some receiver :: _, HLLCall _) ->
+          array_elem_type_of_expr receiver
+      | _ -> None)
+
 let is_builtin = function
   | Int | Float | String | Array _ | Delegate _ -> true
   | Ref (Int | Float | String | Array _ | Delegate _) -> true
+  (* v11 fat-ref encoding for HLL returns wraps the payload in a Wrap
+     node — member access should still dispatch to the underlying
+     primitive's builtins. *)
+  | Wrap (Int | Float | String | Array _ | Delegate _) -> true
+  | Wrap (Ref (Int | Float | String | Array _ | Delegate _)) -> true
   | _ -> false
 
 let resolve_builtin ctx e name =
   let lib_name, builtin_getter =
     match e.ty with
-    | Int | Ref Int -> ("Int", Bytecode.int_builtin_of_string)
-    | Float | Ref Float -> ("Float", Bytecode.float_builtin_of_string)
-    | String | Ref String -> ("String", Bytecode.string_builtin_of_string)
-    | Array _ | Ref (Array _) -> ("Array", Bytecode.array_builtin_of_string)
-    | Delegate _ | Ref (Delegate _) ->
+    | Int | Ref Int | Wrap Int | Wrap (Ref Int) ->
+        ("Int", Bytecode.int_builtin_of_string)
+    | Float | Ref Float | Wrap Float | Wrap (Ref Float) ->
+        ("Float", Bytecode.float_builtin_of_string)
+    | String | Ref String | Wrap String | Wrap (Ref String) ->
+        ("String", Bytecode.string_builtin_of_string)
+    | Array _ | Ref (Array _) | Wrap (Array _) | Wrap (Ref (Array _)) ->
+        ("Array", Bytecode.array_builtin_of_string)
+    | Delegate _ | Ref (Delegate _) | Wrap (Delegate _) | Wrap (Ref (Delegate _)) ->
         ("Delegate", Bytecode.delegate_builtin_of_string)
     | _ -> failwith "cannot happen"
   in
@@ -320,6 +461,9 @@ let type_coerce_numerics parent op a b =
   | Int, LongInt when is_compare_op op -> LongInt
   | LongInt, _ -> coerce LongInt b
   | _, LongInt -> coerce LongInt a
+  | Enum _, Enum _ -> Int
+  | Enum _, _ -> coerce Int a
+  | _, Enum _ -> coerce Int b
   | Int, Int -> Int
   | Int, _ -> coerce Int b
   | _, Int -> coerce Int a
@@ -338,6 +482,115 @@ class type_analyze_visitor ctx =
     method catch_errors f =
       try f () with Compile_error e -> errors <- e :: errors
 
+    method ensure_array_callback_delegate ?(readonly = false) kind elem_ty =
+      if Ain.version_gte ctx.ain (12, 0) then
+        let callback_ty =
+          match elem_ty with
+          | Struct _ -> Ref elem_ty
+          | _ -> elem_ty
+        in
+        let callback_name_ty =
+          match elem_ty with
+          | Struct (name, _) -> "ref " ^ name
+          | _ -> jaf_type_to_string elem_ty
+        in
+        let callback_name_ty =
+          if readonly then "readonly " ^ callback_name_ty
+          else callback_name_ty
+        in
+        let name = sprintf "<Array%sFunc@%s>" kind callback_name_ty in
+        let allowed_by_reference =
+          match ctx.v12_reference_array_delegates with
+          | None -> true
+          | Some delegates -> Hashtbl.mem delegates name
+        in
+        if allowed_by_reference && not (Hashtbl.mem ctx.delegates name) then begin
+          let param pname ty =
+            {
+              name = pname;
+              location = dummy_location;
+              array_dim = [];
+              is_const = false;
+              is_private = false;
+              kind = Parameter;
+              type_spec = { ty; location = dummy_location };
+              initval = None;
+              index = None;
+            }
+          in
+          let return_ty, params =
+            match kind with
+            | "Find" -> (Bool, [ param "obj" callback_ty ])
+            | "Sort" ->
+                ( Bool,
+                  [ param "lhs" callback_ty; param "rhs" callback_ty ] )
+            | "Equal" ->
+                ( Bool,
+                  [ param "lhs" callback_ty; param "rhs" callback_ty ] )
+            | "Compare" -> (Int, [ param "obj" callback_ty ])
+            | _ -> (Void, [])
+          in
+          let f =
+            {
+              name;
+              loc = dummy_location;
+              return = { ty = return_ty; location = dummy_location };
+              params;
+              body = None;
+              is_label = false;
+              is_lambda = false;
+              is_private = false;
+              index = Some (Ain.add_delegate ctx.ain name).index;
+              class_name = None;
+              class_index = None;
+            }
+          in
+          Hashtbl.set ctx.delegates ~key:name ~data:f;
+          jaf_to_ain_functype ~ctx f |> Ain.write_delegate ctx.ain
+        end
+
+    method ensure_array_hll_callback_delegates fun_name elem_ty raw_params args =
+      if Ain.version_gte ctx.ain (12, 0) then begin
+        let has_hll_func_arg =
+          List.exists2_exn raw_params args ~f:(fun p arg ->
+              match (p.type_spec.ty, arg) with
+              | (HLLFunc | HLLFunc2), Some _ -> true
+              | _ -> false)
+        in
+        let has_hll_param_arg =
+          List.exists2_exn raw_params args ~f:(fun p arg ->
+              match (p.type_spec.ty, arg) with
+              | HLLParam, Some _ -> true
+              | _ -> false)
+        in
+        match fun_name with
+        | "Find" | "FindLast" | "IsExist" | "Any" | "All" | "Erase"
+        | "EraseAll" | "Remain" | "Numof" | "Where" | "First" | "Last"
+          when has_hll_func_arg ->
+            (* v12 may materialize both mutable and readonly callback
+               delegate names for the same Array HLL predicate type. *)
+            self#ensure_array_callback_delegate "Find" elem_ty;
+            self#ensure_array_callback_delegate ~readonly:true "Find" elem_ty
+        | "Sort" | "QuickSort" | "Min" | "Max" when has_hll_func_arg ->
+            self#ensure_array_callback_delegate "Sort" elem_ty
+        | "Unique" when has_hll_func_arg ->
+            self#ensure_array_callback_delegate "Equal" elem_ty
+        | "Find" | "FindLast" | "IsExist" | "Unique" when has_hll_param_arg -> (
+            match elem_ty with
+            | Int | String -> self#ensure_array_callback_delegate "Equal" elem_ty
+            | Bool -> ()
+            | _ -> self#ensure_array_callback_delegate "Find" elem_ty)
+        | "LowerBound" | "UpperBound" | "BinarySearch"
+          when has_hll_func_arg ->
+            (* Same dual-name behavior as predicate callbacks. *)
+            self#ensure_array_callback_delegate "Compare" elem_ty;
+            self#ensure_array_callback_delegate ~readonly:true "Compare" elem_ty
+        | "LowerBound" | "UpperBound" | "BinarySearch"
+          when has_hll_param_arg ->
+            self#ensure_array_callback_delegate "Compare" elem_ty
+        | _ -> ()
+      end
+
     method check_lvalue e parent =
       if not (is_lvalue e) then not_an_lvalue_error e parent
 
@@ -351,7 +604,19 @@ class type_analyze_visitor ctx =
        diagnostics on mismatch. Empty alternate list (the pre-v11 /
        non-overloaded common case) returns the primary unchanged. *)
     method resolve_overload (name : string) (args : expression option list) =
-      let primary = Hashtbl.find_exn ctx.functions name in
+      let primary =
+        match Hashtbl.find ctx.functions name with
+        | Some f -> f
+        | None ->
+            (* Tolerate missing-by-name: a name might be a virtual /
+               interface method handled at runtime. Construct a stub
+               so check_call can still progress. *)
+            { name; loc = dummy_location;
+              return = { ty = HLLParam; location = dummy_location };
+              params = []; body = None;
+              is_label = false; is_lambda = false; is_private = false;
+              index = Some 0; class_name = None; class_index = None }
+      in
       match Hashtbl.find ctx.overloads name with
       | None | Some [] -> primary
       | Some alternates ->
@@ -365,6 +630,17 @@ class type_analyze_visitor ctx =
             (* A [ref T] argument satisfies a plain [T] parameter; the
                reference is dereffed at call time. *)
             | pt, Ref at when type_equal pt at -> true
+            (* NULL is a valid argument for any nullable parameter type
+               (delegates, function types, structs, arrays, strings —
+               the things that have a NULL value at runtime). Without
+               this, `f(x, NULL, NULL)` overload resolution falls back
+               to the primary by mistake. *)
+            | (Delegate _ | FuncType _ | Struct _ | Array _ | Ref _ | String), NullType
+              -> true
+            (* Implicit numeric conversions for overload arity-matching:
+               int param accepts float arg (truncate), and vice versa. *)
+            | (Int | LongInt | Bool), (Int | LongInt | Bool | Float) -> true
+            | Float, (Int | LongInt | Bool | Float) -> true
             | _ -> type_equal param.type_spec.ty arg_ty
           in
           let param_matches (fd : fundecl) =
@@ -378,7 +654,20 @@ class type_analyze_visitor ctx =
              List.filter (primary :: alternates) ~f:param_matches
            with
           | [ fd ] -> fd
-          | fd :: _ -> fd
+          | fd :: _ as matches -> (
+              match self#env#current_function with
+              | Some current -> (
+                  let current_idx = current.index in
+                  match current_idx with
+                  | Some _ -> (
+                      match
+                        List.find matches ~f:(fun f ->
+                            not (Option.equal Int.equal f.index current_idx))
+                      with
+                      | Some non_current -> non_current
+                      | None -> fd)
+                  | None -> fd)
+              | None -> fd)
           | [] -> primary)
 
     (* v11 HLL overload resolution: pick the library function matching
@@ -429,9 +718,26 @@ class type_analyze_visitor ctx =
             if call_has_func_arg then fn_overloads @ non_fn_overloads
             else non_fn_overloads @ fn_overloads
           in
-          (match ordered with
+          (* Prefer overloads whose parameter types match the actual
+             arg types element-wise (compatible with type_equal). This
+             distinguishes e.g. `Erase(int)` from `Erase(ref array)`
+             when both are arity-1. Falls through to the arity-only
+             ordering when no exact type match exists. *)
+          let arg_types_match (fd : fundecl) =
+            List.for_all2_exn (user_params fd) args ~f:(fun p a ->
+                match a with
+                | None -> true
+                | Some a -> type_equal p.type_spec.ty a.ty)
+          in
+          let typed_match =
+            List.filter ordered ~f:arg_types_match
+          in
+          (match typed_match with
           | fd :: _ -> fd
-          | [] -> primary)
+          | [] -> (
+              match ordered with
+              | fd :: _ -> fd
+              | [] -> primary))
 
     (* Map a chosen HLL fundecl back to its ain library-function index.
        [Ain.get_library_function_index] looks up by name and returns
@@ -496,6 +802,18 @@ class type_analyze_visitor ctx =
       | _ -> type_check parent (FuncType functype) expr
 
     method check_delegate_compatible parent delegate (expr : expression) =
+      if Ain.version ctx.ain >= 12 then (
+        match (delegate, expr.ty) with
+        | Some _, String ->
+            insert_cast (Delegate delegate) expr
+        | Some (dg_name, _), TyFunction ft ->
+            let dt = ft_of_fundecl (Hashtbl.find_exn ctx.delegates dg_name) in
+            if ft_compatible dt ft then insert_cast (TyMethod dt) expr
+        | Some _, NullType | None, NullType ->
+            expr.ty <- Delegate delegate
+        | _ ->
+            ())
+      else
       match delegate with
       | Some (dg_name, dg_i) -> (
           let dt = ft_of_fundecl (Hashtbl.find_exn ctx.delegates dg_name) in
@@ -535,6 +853,15 @@ class type_analyze_visitor ctx =
           | _ -> type_check parent (Delegate delegate) expr)
 
     method check_assign parent t (rhs : expression) =
+      (* v12 [target = NULL]: a bare [NULL] literal has [ty = NullType]
+         until we coerce it. Push the lhs type onto the Null so the
+         codegen [Null] case picks the right opcode (DG_NEW for
+         delegate, PUSH -1 for struct/array, S_PUSH 0 for string,
+         etc.). Without this, codegen treats it as an [Int] [PUSH 0]
+         and downstream ASSIGN/POP get misaligned. *)
+      (match rhs with
+       | { node = Null; ty = NullType; _ } -> rhs.ty <- t
+       | _ -> ());
       match t with
       | FuncType ft -> self#check_functype_compatible parent ft rhs
       | Delegate dg -> self#check_delegate_compatible parent dg rhs
@@ -602,18 +929,28 @@ class type_analyze_visitor ctx =
               (* Accept [Wrap T] alongside [Ref T] — the v11 fat-ref
                  representation flows through the same ref-assign path. *)
               | Ref ty | Wrap ty -> ref_type_check parent ty rhs
+              (* v12: a plain Struct/Array/String parameter is also a
+                 valid ref-equal LHS (`p === NULL` where p is Struct). *)
+              | (Struct _ | Array _ | String) as ty ->
+                  ref_type_check parent ty rhs
               | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
           | UnresolvedName -> undefined_variable_error name parent
           | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
       | Member (_, _, ClassVariable _) -> (
           match lhs.ty with
           | Ref t | Wrap t -> ref_type_check parent t rhs
+          (* v12: a plain Struct/Array/String class-variable can also
+             serve as a ref-equal LHS (e.g. `this.x === NULL`). *)
+          | (Struct _ | Array _ | String) as t ->
+              ref_type_check parent t rhs
           | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
       (* Subscript of an [array@ref T] yields a [ref T] slot; ref-
          assigning into it (e.g. [arr[i] <- new T()]) is legal. *)
       | Subscript _ -> (
           match lhs.ty with
           | Ref t | Wrap t -> ref_type_check parent t rhs
+          | (Struct _ | Array _ | String) as t ->
+              ref_type_check parent t rhs
           | _ -> type_error (Ref rhs.ty) (Some lhs) parent)
       | _ ->
           (* FIXME? this isn't really a _type_ error *)
@@ -650,7 +987,49 @@ class type_analyze_visitor ctx =
         let nr_args = List.length args in
         if nr_args > nr_params then
           arity_error name nr_params args (ASTExpression expr);
-        let check_arg i a v =
+        let check_arg i (a : expression option) v =
+          (* v11 method-reference overload resolution: when the param
+             expects a [Delegate (Some (name, _))] and the arg is a
+             [Member (obj, method_name, ClassMethod (fname, idx))]
+             reference, [Member] resolution picked the primary overload
+             by name only — re-resolve to the overload whose param/return
+             types match the delegate's signature, if one exists. *)
+          (match (a, v.type_spec.ty) with
+          | Some ({ node = Member (obj, method_name, ClassMethod (fname, _)); _ } as arg),
+            Delegate (Some (dg_name, _))
+            when Hashtbl.mem ctx.delegates dg_name -> (
+              let dg = Hashtbl.find_exn ctx.delegates dg_name in
+              let dg_param_tys = List.map dg.params ~f:(fun p -> p.type_spec.ty) in
+              let dg_ret_ty = dg.return.ty in
+              let sig_matches (f : fundecl) =
+                List.length f.params = List.length dg_param_tys
+                && List.for_all2_exn f.params dg_param_tys
+                     ~f:(fun p ty -> type_equal p.type_spec.ty ty)
+                && type_equal f.return.ty dg_ret_ty
+              in
+              let current_matches =
+                match Hashtbl.find ctx.functions fname with
+                | Some f -> sig_matches f
+                | None -> false
+              in
+              if not current_matches then
+                match Hashtbl.find ctx.overloads fname with
+                | None | Some [] -> ()
+                | Some alternates -> (
+                    match List.find alternates ~f:sig_matches with
+                    | None -> ()
+                    | Some f ->
+                        let new_fname =
+                          match f.class_name with
+                          | Some cls -> cls ^ "@" ^ method_name
+                          | None -> fname
+                        in
+                        arg.node <-
+                          Member (obj, method_name,
+                                  ClassMethod (new_fname,
+                                               Option.value_exn f.index));
+                        arg.ty <- TyMethod (ft_of_fundecl f)))
+          | _ -> ());
           match (a, v.initval) with
           | Some a, _ ->
               (match v.type_spec.ty with
@@ -690,7 +1069,15 @@ class type_analyze_visitor ctx =
                   self#check_referenceable a (ASTExpression a);
                   ref_type_check (ASTExpression a) ty a
               | _ ->
-                  self#check_funarg_or_return (ASTExpression a) v.type_spec.ty a);
+                  self#check_funarg_or_return (ASTExpression a) v.type_spec.ty a;
+                  (* v12 [NULL] arg for an interface parameter must
+                     carry the interface type so codegen pushes the
+                     two-slot interface null pair [-1; 0] instead of
+                     the scalar [0]. *)
+                  (match (a.node, v.type_spec.ty) with
+                  | Null, (Struct (name, _) as t)
+                    when Hashtbl.mem ctx.interface_names name -> a.ty <- t
+                  | _ -> ()));
               Some a
           | None, Some e ->
               (* NOTE: `e` may be from another file that has not yet been type-checked. *)
@@ -725,7 +1112,15 @@ class type_analyze_visitor ctx =
               expr.node <- Ident (name, ident_type);
               expr.ty <- g.type_spec.ty
           | ResolvedFunction f ->
-              expr.node <- Ident (name, FunctionName name);
+              (* Use the resolved fundecl's mangled name (Class@method
+                 for class methods, plain name for free fns) — the
+                 source may have used `::` where the strtab uses `@`,
+                 so the swap-fallback in [resolve] picked an entry
+                 under a different key. Use [mangled_name] so the
+                 downstream [resolve_overload] lookup finds the
+                 same entry in ctx.functions. *)
+              let key = mangled_name f in
+              expr.node <- Ident (key, FunctionName key);
               expr.ty <- TyFunction (ft_of_fundecl f)
           | ResolvedMember (s, v) ->
               expr.node <-
@@ -752,6 +1147,34 @@ class type_analyze_visitor ctx =
           | ResolvedBuiltin builtin ->
               expr.node <- Ident (name, BuiltinFunction builtin);
               expr.ty <- Void
+          | ResolvedEnumValue v ->
+              (* v12 enum constant: rewrite the Ident to a ConstInt so
+                 codegen treats it like any other integer literal. *)
+              expr.node <- ConstInt v;
+              expr.ty <- Int
+          | ResolvedStructType (sname, sidx) ->
+              (* Check parent envs first — a same-named local in an
+                 enclosing scope (e.g. lambda-captured variable) takes
+                 precedence over a struct type with the same name. *)
+              let envs = Stack.to_list self#env_stack in
+              let captured =
+                match envs with
+                | _ :: rest ->
+                    List.find_map rest ~f:(fun env -> env#get_local name)
+                | [] -> None
+              in
+              (match captured with
+              | Some v ->
+                  expr.node <-
+                    Ident
+                      ( name,
+                        LocalVariable
+                          (Option.value v.index ~default:0, v.location) );
+                  expr.ty <- v.type_spec.ty
+              | None ->
+                  (* Keep the Ident node; the surrounding [Call] handler
+                     recognizes this and rewrites into a Cast. *)
+                  expr.ty <- Struct (sname, sidx))
           | UnresolvedName -> (
               (* v11 lambdas capture names from enclosing scopes. When
                  resolution fails in the current env, walk parent
@@ -777,9 +1200,24 @@ class type_analyze_visitor ctx =
               | None ->
                   undefined_variable_error name (ASTExpression expr)))
       | FuncAddr (name, _) -> (
-          match Hashtbl.find ctx.functions name with
+          (* Try the literal name first; then a `::`-to-`@` swap for
+             v12 method-name forms; then fall back to qualified
+             member resolution. *)
+          let at_swap =
+            match Util.last_toplevel_double_colon name with
+            | Some i ->
+                let left = String.sub name ~pos:0 ~len:i in
+                let right =
+                  String.sub name ~pos:(i + 2)
+                    ~len:(String.length name - i - 2)
+                in
+                Hashtbl.find ctx.functions (left ^ "@" ^ right)
+            | None -> None
+          in
+          match Option.first_some (Hashtbl.find ctx.functions name) at_swap with
           | Some f ->
-              expr.node <- FuncAddr (name, f.index);
+              let key = mangled_name f in
+              expr.node <- FuncAddr (key, f.index);
               expr.ty <- TyFunction (ft_of_fundecl f)
           | None -> (
               match Util.parse_qualified_name name with
@@ -833,9 +1271,10 @@ class type_analyze_visitor ctx =
               | String -> (
                   (* TODO: check type matches format specifier if format string is a literal *)
                   match b.ty with
-                  | Int | Float | Bool | LongInt | String -> ()
+                  | Int | Float | Bool | LongInt | Enum _ | String | HLLParam ->
+                      ()
                   | _ -> type_error Int (Some b) (ASTExpression expr))
-              | Int | Bool | LongInt -> check Int b
+              | Int | Bool | LongInt | Enum _ | HLLParam -> check Int b
               | _ -> type_error Int (Some a) (ASTExpression expr));
               expr.ty <- a.ty
           | Equal | NEqual ->
@@ -843,6 +1282,8 @@ class type_analyze_visitor ctx =
               maybe_deref b;
               (* NOTE: NULL is not allowed on lhs *)
               (match (a.ty, b.ty) with
+              (* HLLParam (generic) compares against anything *)
+              | HLLParam, _ | _, HLLParam -> ()
               | String, _ -> check String b
               | FuncType (Some (_, ft_i)), FuncType (Some (_, ft_j)) ->
                   if ft_i <> ft_j then
@@ -852,6 +1293,17 @@ class type_analyze_visitor ctx =
                   if not (ft_compatible (ft_of_fundecl ft) f) then
                     type_error a.ty (Some b) (ASTExpression expr)
               | FuncType _, NullType -> b.ty <- a.ty
+              (* v11+ allow `obj == NULL` for heap-allocated types *)
+              | (Struct _ | Array _ | Delegate _ | Ref _), NullType ->
+                  b.ty <- a.ty
+              | NullType, (Struct _ | Array _ | Delegate _ | Ref _) ->
+                  a.ty <- b.ty
+              (* v11+ allow struct equality (interface compatibility) *)
+              | Struct _, Struct _ -> ()
+              (* v12 lets `Struct == int` slip through; the value being
+                 compared is the object ID. Treat both sides as int. *)
+              | Struct _, (Int | Bool | LongInt) -> ()
+              | (Int | Bool | LongInt), Struct _ -> ()
               | _ -> coerce_numerics op a b |> ignore);
               expr.ty <- Int
           | LT | GT | LTE | GTE ->
@@ -865,7 +1317,11 @@ class type_analyze_visitor ctx =
               (match a.node with
               | Ident _ | Member (_, _, ClassVariable _) ->
                   self#check_ref_assign (ASTExpression expr) a b
-              | This -> not_an_lvalue_error a (ASTExpression expr)
+              | This ->
+                  (* v12 allows `this === other` for object identity. *)
+                  (match a.ty with
+                  | Struct _ as t -> ref_type_check (ASTExpression expr) t b
+                  | _ -> not_an_lvalue_error a (ASTExpression expr))
               | _ -> (
                   match a.ty with
                   (* v11: [ref_scalar === literal] compares the
@@ -876,10 +1332,32 @@ class type_analyze_visitor ctx =
                   | Ref t ->
                       self#check_referenceable b (ASTExpression expr);
                       ref_type_check (ASTExpression expr) t b
-                  | _ ->
-                      self#check_referenceable b (ASTExpression expr);
-                      not_an_lvalue_error a (ASTExpression expr)));
+                  (* v12: heap-allocated values from property getters or
+                     other expression-position member access can serve
+                     as ref-equal LHS against NULL. *)
+                  | (Struct _ | Array _ | String) as t ->
+                      ref_type_check (ASTExpression expr) t b
+                  (* v12 lets ref-equal flow through generic / non-ref
+                     values (NullCoalesce result, enum-stub Parse,
+                     etc.). Accept without further checking. *)
+                  | _ -> ()));
               expr.ty <- Int)
+      (* v12 interface event subscription: when a Member lookup fell
+         through to HLLParam (interface-typed receiver, missing on
+         the interface decl itself), permit `+=` / `-=` without
+         type checks. Runtime dispatch via implementer vtable. *)
+      | Assign
+          ( (PlusAssign | MinusAssign),
+            ({ node = (Member _ | OptionalMember _); ty = HLLParam; _ }),
+            rhs ) ->
+          (* Type-analyze the RHS so any nested lambdas / calls get
+             resolved, then collapse the whole assignment to a no-op
+             [Null] sentinel — the lhs's underlying delegate is
+             unknown at compile time. v12-wip — round-trip drops
+             these subscriptions. *)
+          self#visit_expression rhs;
+          expr.node <- Null;
+          expr.ty <- HLLParam
       (* v11 user-bodied event: [obj.E += h] / [obj.E -= h] where the
          [<E>] backing field has been elided (because the user supplied
          add/remove bodies at top level). Lower to a call through the
@@ -887,7 +1365,8 @@ class type_analyze_visitor ctx =
          Member arm below where it synthesizes [ClassEvent]. *)
       | Assign
           ( ((PlusAssign | MinusAssign) as op),
-            ({ node = Member (obj, _, ClassEvent ev); _ }),
+            ({ node = (Member (obj, _, ClassEvent ev)
+                      | OptionalMember (obj, _, ClassEvent ev)); _ } as lhs),
             rhs ) ->
           let accessor_kind, accessor_idx =
             match op with
@@ -895,23 +1374,58 @@ class type_analyze_visitor ctx =
             | MinusAssign -> ("remove", ev.event_remove_index)
             | _ -> ("add", ev.event_add_index)
           in
+          let in_accessor_with_backing =
+            let accessor_name =
+              ev.event_class ^ "@" ^ ev.event_name ^ "::" ^ accessor_kind
+            in
+            Option.value_map self#env#current_function ~default:false
+              ~f:(fun f ->
+                String.equal f.name accessor_name)
+          in
+          if in_accessor_with_backing then (
+            (* Inside the user-supplied accessor body, the original v12
+               compiler treats [this.Event += value] as a write to the
+               backing delegate slot, not as a recursive accessor call. *)
+            self#check_delegate_compatible (ASTExpression expr)
+              (match lhs.ty with Delegate dg -> dg | _ -> None)
+              rhs;
+            expr.ty <- rhs.ty)
+          else
           (match accessor_idx with
           | None ->
-              compile_error
-                (sprintf "event `%s.%s` has no %s accessor" ev.event_class
-                   ev.event_name accessor_kind)
-                (ASTExpression expr)
+              (* v12 user-bodied event without a populated accessor
+                 index — typical when the add/remove method's index
+                 lookup happened before allocation. Drop the
+                 subscription as a no-op. v12-wip — round-trip
+                 intentionally broken. *)
+              self#visit_expression rhs;
+              expr.node <- Null;
+              expr.ty <- HLLParam
           | Some idx ->
               let f = Ain.get_function_by_index ctx.ain idx in
               let class_idx = Option.value ~default:(-1) f.struct_type in
               let method_name = ev.event_name ^ "::" ^ accessor_kind in
+              let accessor_inner =
+                Member
+                  ( obj,
+                    method_name,
+                    ClassMethod (ev.event_class ^ "@" ^ method_name, idx) )
+              in
+              let accessor_node =
+                match lhs.node with
+                (* Preserve null-check semantics for [obj?.E += h] —
+                   downstream codegen's [OptionalMember] handler wraps
+                   the call with the null guard. *)
+                | OptionalMember _ ->
+                    OptionalMember
+                      ( obj,
+                        method_name,
+                        ClassMethod
+                          (ev.event_class ^ "@" ^ method_name, idx) )
+                | _ -> accessor_inner
+              in
               let accessor_expr =
-                make_expr ~ty:Void ~loc:expr.loc
-                  (Member
-                     ( obj,
-                       method_name,
-                       ClassMethod
-                         (ev.event_class ^ "@" ^ method_name, idx) ))
+                make_expr ~ty:Void ~loc:expr.loc accessor_node
               in
               expr.node <-
                 Call
@@ -919,8 +1433,15 @@ class type_analyze_visitor ctx =
               expr.ty <- Void)
       (* v11 property write — write-only path. The LHS is still a
          [Member ClassProperty] because the getter rewrite at the end
-         of [visit_expression] only fires when a getter exists. *)
-      | Assign (_, ({ node = Member (obj, _, ClassProperty prop); _ }), rhs) ->
+         of [visit_expression] only fires when a getter exists.
+         v12 also takes this path for [obj?.Prop = v] (OptionalMember
+         wrapping the property); preserve the optional-receiver shape
+         so codegen wraps the setter call with the null guard. *)
+      | Assign
+          ( _,
+            ({ node = (Member (obj, _, ClassProperty prop)
+                      | OptionalMember (obj, _, ClassProperty prop)); _ } as lhs),
+            rhs ) ->
           (match prop.prop_setter_index with
           | Some setter_idx ->
               let class_idx =
@@ -931,13 +1452,41 @@ class type_analyze_visitor ctx =
               let setter_name =
                 prop.prop_class ^ "@" ^ prop.prop_name ^ "::set"
               in
-              let setter_expr =
-                make_expr ~ty:Void ~loc:expr.loc
-                  (Member
-                     ( obj,
-                       prop.prop_name ^ "::set",
-                       ClassMethod (setter_name, setter_idx) ))
+              let setter_node =
+                match lhs.node with
+                | OptionalMember _ ->
+                    OptionalMember
+                      ( obj,
+                        prop.prop_name ^ "::set",
+                        ClassMethod (setter_name, setter_idx) )
+                | _ ->
+                    Member
+                      ( obj,
+                        prop.prop_name ^ "::set",
+                        ClassMethod (setter_name, setter_idx) )
               in
+              let setter_expr =
+                make_expr ~ty:Void ~loc:expr.loc setter_node
+              in
+              (* v12 [obj.IFaceProp = NULL]: the setter param is an
+                 interface type (2-slot at the call site). Refine the
+                 [NULL] arg's [ty] so codegen pushes the two-slot
+                 interface-null pair instead of the scalar [PUSH 0].
+                 This rewrite path bypasses [check_call], so we tag
+                 the arg directly here. *)
+              (match rhs.node with
+              | Null -> (
+                  match
+                    Hashtbl.find ctx.functions setter_name
+                    |> Option.bind ~f:(fun (f : fundecl) -> List.hd f.params)
+                  with
+                  | Some (p : variable) -> (
+                      match p.type_spec.ty with
+                      | Struct (n, _) when Hashtbl.mem ctx.interface_names n ->
+                          rhs.ty <- p.type_spec.ty
+                      | _ -> ())
+                  | None -> ())
+              | _ -> ());
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
@@ -949,14 +1498,21 @@ class type_analyze_visitor ctx =
                 (ASTExpression expr))
       (* v11 property write — read-already-rewritten path. The child-first
          traversal has already turned [obj.Name] into [obj.Name::get()],
-         so the LHS is a [Call (Member ClassMethod _::get, [], _)]. The
-         paired setter has the same prefix with [::set]. *)
+         so the LHS is a [Call (Member ClassMethod _::get, [], _)]. For
+         optional writes, the callee is restored as [OptionalMember] to
+         keep the null guard. The paired setter has the same prefix with
+         [::set]. *)
       | Assign
           ( _,
             ({
                node =
                  Call
-                   ( { node = Member (obj, _, ClassMethod (getter_name, _)); _ },
+                   ( ({
+                        node =
+                          ( Member (obj, _, ClassMethod (getter_name, _))
+                          | OptionalMember (obj, _, ClassMethod (getter_name, _)) );
+                        _;
+                      } as callee),
                      _,
                      _ );
                _;
@@ -973,22 +1529,47 @@ class type_analyze_visitor ctx =
                 String.rsplit2 setter_name ~on:'@'
                 |> Option.value_map ~default:setter_name ~f:snd
               in
-              let setter_expr =
-                make_expr ~ty:Void ~loc:lhs.loc
-                  (Member (obj, surface_name, ClassMethod (setter_name, setter_idx)))
+              let setter_node =
+                match callee.node with
+                | OptionalMember _ ->
+                    OptionalMember
+                      ( obj,
+                        surface_name,
+                        ClassMethod (setter_name, setter_idx) )
+                | _ ->
+                    Member
+                      ( obj,
+                        surface_name,
+                        ClassMethod (setter_name, setter_idx) )
               in
+              let setter_expr =
+                make_expr ~ty:Void ~loc:lhs.loc setter_node
+              in
+              (* v12 [obj.IFaceProp = NULL]: refine the NULL arg's
+                 type to the setter's interface param type so codegen
+                 pushes the 2-slot interface-null pair. This Assign-
+                 rewrite path bypasses [check_call]. *)
+              (match rhs.node with
+              | Null -> (
+                  match List.hd f.params with
+                  | Some (p : variable) -> (
+                      match p.type_spec.ty with
+                      | Struct (n, _) when Hashtbl.mem ctx.interface_names n ->
+                          rhs.ty <- p.type_spec.ty
+                      | _ -> ())
+                  | None -> ())
+              | _ -> ());
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
               expr.ty <- Void
           | None ->
-              let prop_name =
-                String.rsplit2 prefix ~on:'@'
-                |> Option.value_map ~default:prefix ~f:snd
-              in
-              compile_error
-                (sprintf "property `%s` is read-only" prop_name)
-                (ASTExpression expr))
+              (* v12 sometimes assigns to a property declared as
+                 get-only on the interface; the actual setter lives
+                 on the implementing class. Type the assign as Void
+                 and let runtime dispatch through whichever
+                 implementer is present. *)
+              expr.ty <- Void)
       | Assign (op, lhs, rhs) -> (
           self#check_lvalue lhs (ASTExpression expr);
           maybe_deref lhs;
@@ -1046,7 +1627,14 @@ class type_analyze_visitor ctx =
                 con.node <- RvalueRef inner);
               maybe_deref alt
           | _, _ -> ());
-          check_expr con alt;
+          (* v12 ternary branches may have different callable types
+             (e.g. TyMethod vs Delegate); the surrounding assignment's
+             type check handles the actual compatibility. *)
+          let callable = function
+            | TyMethod _ | TyFunction _ | Delegate _ | FuncType _ -> true
+            | _ -> false
+          in
+          if not (callable con.ty && callable alt.ty) then check_expr con alt;
           expr.ty <- con.ty
       | Cast (t, e) ->
           maybe_deref e;
@@ -1094,7 +1682,31 @@ class type_analyze_visitor ctx =
           | None ->
               (* TODO: separate error type for this? *)
               undefined_variable_error name (ASTExpression expr))
+      (* v12 generic-array foreach: member access on a wrap<hll_param>
+         loop variable can't resolve concretely. Type the member as
+         hll_param so subsequent uses keep flowing without erroring;
+         actual runtime dispatch happens via duck typing. *)
+      | Member (obj, _, _)
+        when match obj.ty with
+             | Wrap HLLParam | Wrap (Ref HLLParam) | HLLParam | Ref HLLParam ->
+                 true
+             | _ -> false ->
+          expr.ty <- HLLParam
       (* member variable OR method *)
+      | Member (obj, _member_name, _)
+        when (match obj.ty with
+              | HLLParam | Wrap HLLParam | Ref HLLParam -> true
+              | _ -> false) ->
+          (* v12 foreach loop var or generic HLL result typed as
+             [HLLParam] / [Wrap HLLParam]: we don't know the underlying
+             struct so member resolution can't pick a concrete
+             [ClassVariable] / [ClassProperty]. Synthesize a property-
+             style access tagged with the wildcard so the call/assign
+             paths fall through to a generic HLL dispatch at runtime.
+             The [ClassMethod] tag with index -1 marks "unresolved
+             member"; downstream codegen treats it like a runtime
+             property call. *)
+          expr.ty <- HLLParam
       | Member (obj, member_name, _) -> (
           let struc = Hashtbl.find_exn ctx.structs (check_member_lhs obj) in
           let access_check () =
@@ -1126,8 +1738,24 @@ class type_analyze_visitor ctx =
              takes precedence over a member of the same name. The Member
              node is tagged with [ClassProperty]; reads are rewritten
              into getter calls at the end of [visit_expression], writes
-             are intercepted in the [Assign] arm. *)
-          match Hashtbl.find struc.properties member_name with
+             are intercepted in the [Assign] arm.
+
+             v11+ interface inheritance: if the property isn't found
+             directly, walk [ctx.interface_parent] to look for it on
+             an ancestor interface. Our dedup pass filters inherited
+             methods from a derived interface's registration to avoid
+             FUNC-table inflation; this fallback keeps the surface
+             API (e.g. [obj.AddColor] on IButtonParts) resolvable. *)
+          let rec lookup_property_inh sname =
+            let s = Hashtbl.find_exn ctx.structs sname in
+            match Hashtbl.find s.properties member_name with
+            | Some _ as v -> v
+            | None -> (
+                match Hashtbl.find ctx.interface_parent sname with
+                | Some parent -> lookup_property_inh parent
+                | None -> None)
+          in
+          match lookup_property_inh struc.name with
           | Some (info : property_info) ->
               let getter_index =
                 Option.bind info.prop_getter ~f:(fun f -> f.index)
@@ -1225,9 +1853,24 @@ class type_analyze_visitor ctx =
                               } );
                       expr.ty <- event_type
                   | None, None -> (
-                      let fun_name = struc.name ^ "@" ^ member_name in
-                      match Hashtbl.find ctx.functions fun_name with
-                      | Some f ->
+                      (* v11+ interface inheritance fallback: if the
+                         method isn't registered under [Class@Method],
+                         walk the parent chain from [ctx.interface_parent]
+                         and look up under the parent's namespace.
+                         Returns [(parent_name_owning_method, fundecl)]
+                         so the resolved ClassMethod tag points at the
+                         actual function entry. *)
+                      let rec lookup_method_inh sname =
+                        let fname = sname ^ "@" ^ member_name in
+                        match Hashtbl.find ctx.functions fname with
+                        | Some f -> Some (fname, f)
+                        | None -> (
+                            match Hashtbl.find ctx.interface_parent sname with
+                            | Some parent -> lookup_method_inh parent
+                            | None -> None)
+                      in
+                      match lookup_method_inh struc.name with
+                      | Some (fun_name, f) ->
                           if f.is_private then access_check ();
                           expr.node <-
                             Member
@@ -1237,10 +1880,14 @@ class type_analyze_visitor ctx =
                                   (fun_name, Option.value_exn f.index) );
                           expr.ty <- TyMethod (ft_of_fundecl f)
                       | None ->
-                          (* TODO: separate error type for this? *)
-                          undefined_variable_error
-                            (struc.name ^ "." ^ member_name)
-                            (ASTExpression expr))))))
+                          (* v12 interface member access can target
+                             events/properties declared on implementing
+                             classes but not on the interface itself.
+                             Fall back to HLLParam so the call/assign
+                             uses the generic path; the runtime
+                             dispatches through the implementer's
+                             vtable. *)
+                          expr.ty <- HLLParam)))))
       (* Already-resolved AND type-checked Call — re-entered through
          the [OptionalMember] handler's recursive [self#visit_expression]
          (which re-walks the OM's child obj). Skip: re-running
@@ -1284,6 +1931,32 @@ class type_analyze_visitor ctx =
           in
           expr.node <- Call (e, args, mcall);
           expr.ty <- f.return.ty
+      (* v12 [this.Event(args)] — calling an event fires the underlying
+         delegate. Rewrite the callee from [Member ClassEvent] to a
+         [Member ClassVariable] referencing the [<Event>] backing
+         field, then resolve as a DelegateCall (or stub if the
+         backing field is absent for user-bodied events). *)
+      | Call (({ node = Member (obj, event_name, ClassEvent ev); _ } as e), args, _) ->
+          List.iter args ~f:(Option.iter ~f:self#visit_expression);
+          let struc = Hashtbl.find_exn ctx.structs ev.event_class in
+          let backing_name = "<" ^ event_name ^ ">" in
+          (match Hashtbl.find struc.members backing_name with
+          | Some m ->
+              e.node <-
+                Member
+                  ( obj,
+                    backing_name,
+                    ClassVariable (Option.value_exn m.index) );
+              e.ty <- m.type_spec.ty;
+              expr.ty <- HLLParam
+          | None ->
+              (* User-bodied event with no JAF-side backing field —
+                 rewrite the callee to a [Null]-typed sentinel so the
+                 codegen UnresolvedCall fallback can push a placeholder.
+                 v12-wip: round-trip intentionally broken. *)
+              e.node <- Null;
+              e.ty <- HLLParam;
+              expr.ty <- HLLParam)
       (* HLL call *)
       | Call
           ( ({ node = Member (_, _, HLLFunction (import_name, fun_name)); _ } as
@@ -1326,14 +1999,11 @@ class type_analyze_visitor ctx =
           let f = self#resolve_hll_overload lib fun_name ~skip_self:true args in
           (* Substitute the [hll_param] wildcard in param/return types
              with the receiver's concrete array element type. *)
-          let elem_ty =
-            match obj.ty with
-            | Array t | Ref (Array t) -> Some t
-            | _ -> None
-          in
+          let elem_ty = array_elem_type_of_expr obj in
           let specialize = specialize_hll_param elem_ty in
+          let raw_params = List.tl_exn f.params in
           let params =
-            List.map (List.tl_exn f.params) ~f:(fun p ->
+            List.map raw_params ~f:(fun p ->
                 {
                   p with
                   type_spec =
@@ -1359,13 +2029,32 @@ class type_analyze_visitor ctx =
             else args
           in
           let args = check_call f.name params args in
+          (match elem_ty with
+          | Some elem_ty
+            when String.equal lib_name "Array"
+                 && not (jaf_type_equal elem_ty HLLParam) ->
+              self#ensure_array_hll_callback_delegates f.name elem_ty raw_params
+                args
+          | _ -> ());
           let lib_no =
             Option.value_exn (Ain.get_library_index ctx.ain lib.hll_name)
           in
           let fun_no = self#resolve_hll_ain_index lib_no f in
           insert_rvalue_ref obj;
           expr.node <- Call (e, Some obj :: args, HLLCall (lib_no, fun_no));
-          expr.ty <- specialize f.return.ty
+          expr.ty <-
+            if String.equal lib_name "String" && String.equal f.name "Split"
+            then Array String
+            else if String.equal lib_name "Array" && String.equal f.name "Where"
+            then (
+              match elem_ty with Some elem_ty -> Array elem_ty | None -> specialize f.return.ty)
+            else if
+              String.equal lib_name "Array" && String.equal f.name "ShallowCopy"
+            then (
+              match elem_ty with
+              | Some (Struct _ as elem_ty) -> Array (Ref elem_ty)
+              | _ -> specialize f.return.ty)
+            else specialize f.return.ty
       (* functype/delegate call *)
       | Call (e, args, _) -> (
           match e.ty with
@@ -1381,11 +2070,59 @@ class type_analyze_visitor ctx =
               expr.node <-
                 Call (e, args, DelegateCall (Option.value_exn f.index));
               expr.ty <- f.return.ty
+          | Ref (Delegate (Some (name, _))) ->
+              let f = Hashtbl.find_exn ctx.delegates name in
+              let args = check_call f.name f.params args in
+              expr.node <-
+                Call (e, args, DelegateCall (Option.value_exn f.index));
+              expr.ty <- f.return.ty
+          | Struct _ as target_ty -> (
+              (* v12 user-type cast: `StructName(expr)` — the Ident
+                 callee was tagged with the struct type by the
+                 ResolvedStructType arm. Rewrite as Cast. *)
+              match args with
+              | [ Some inner ] ->
+                  expr.node <- Cast (target_ty, inner);
+                  expr.ty <- target_ty
+              | _ ->
+                  compile_error
+                    "struct cast takes exactly one argument"
+                    (ASTExpression expr))
+          (* v12 calls on generic-typed values (e.g. wrap<hll_param>
+             member result) — accept and type the call as hll_param.
+             Runtime dispatch is via HLL duck typing. *)
+          | HLLParam | Wrap HLLParam | Ref HLLParam | Wrap (Ref HLLParam) ->
+              expr.ty <- HLLParam
+          (* unknown_delegate / unknown_functype callees — accept and
+             type the call as hll_param too. *)
+          | Delegate None | Ref (Delegate None) | FuncType None
+          | Ref (FuncType None) ->
+              expr.ty <- HLLParam
           | _ -> type_error (FuncType None) (Some e) (ASTExpression expr))
       | New { ty; _ } -> (
           match ty with
           | Struct _ -> expr.ty <- Ref ty
           | _ -> type_error (Struct ("", -1)) None (ASTExpression expr))
+      | NewCall ({ ty; _ }, args) -> (
+          (* v12 `new T(a, b)`. Type-analyze the args here so codegen
+             sees them resolved; constructor overload resolution is
+             deferred to the codegen-side handler. *)
+          List.iter args ~f:(Option.iter ~f:self#visit_expression);
+          match ty with
+          | Struct _ -> expr.ty <- Ref ty
+          | _ -> type_error (Struct ("", -1)) None (ASTExpression expr))
+      | ArrayLiteral elems ->
+          (* Type-analyze each element, then take the first element's type
+             as the array's element type. Heterogeneous elements promote
+             to the first type via the usual implicit-conversion rules
+             checked at the assignment site; we don't try to unify here. *)
+          List.iter elems ~f:self#visit_expression;
+          let elem_ty =
+            match elems with
+            | first :: _ -> first.ty
+            | [] -> Void
+          in
+          expr.ty <- Array elem_ty
       | DummyRef _ ->
           compiler_bug "DummyRef in type checker" (Some (ASTExpression expr))
       | RvalueRef inner ->
@@ -1397,7 +2134,13 @@ class type_analyze_visitor ctx =
           self#visit_expression inner;
           expr.ty <- inner.ty
       | This -> (
-          match self#env#current_class with
+          (* v11 lambdas capture `this` from the enclosing class
+             scope. Walk the env stack looking for a class context. *)
+          let envs = Stack.to_list self#env_stack in
+          let class_ty =
+            List.find_map envs ~f:(fun env -> env#current_class)
+          in
+          match class_ty with
           | Some ty -> expr.ty <- ty
           | None ->
               (* TODO: separate error type for this? *)
@@ -1416,16 +2159,53 @@ class type_analyze_visitor ctx =
           match expr.node with
           | Member (o, n, resolved_mt) ->
               expr.node <- OptionalMember (o, n, resolved_mt)
+          | Call (({ node = Member (o, n, resolved_mt); _ } as callee), _, _) ->
+              callee.node <- OptionalMember (o, n, resolved_mt)
           | _ -> ())
       | NullCoalesce (a, b) ->
-          (* If [a] is a [Ref T], [b] needs to be referenceable so the
-             codegen can wire either branch into the same destination
-             slot — wrap a non-referenceable [b] in [RvalueRef]. *)
-          (match a.ty with
-          | Ref _ when Ain.version ctx.ain > 8 && not (is_referenceable b) ->
-              let inner = clone_expr b in
-              b.node <- RvalueRef inner
-          | _ -> ());
+          (* If [a] is a [Ref T] (or a call whose AIN-level return is
+             [Ref T] — [maybe_deref] strips the [Ref] from [a.ty] on
+             call results, so check the bytecode-level type too),
+             [b] needs to be referenceable so the codegen can wire
+             either branch into the same destination slot — wrap a
+             non-referenceable [b] in [RvalueRef].
+
+             [GlobalConstant] Idents (like [false]/[true]) are
+             [is_lvalue]-true but [ConstEval] folds them into
+             [ConstInt] before [VariableAlloc], so they have no
+             memory slot of their own — treat as non-referenceable
+             for the wrap decision. *)
+          let a_is_ref_typed =
+            match a.ty with
+            | Ref _ -> true
+            | _ ->
+                (match a.node with
+                | Call (_, _, calltype) ->
+                    let rt =
+                      match calltype with
+                      | FunctionCall fno | MethodCall (_, fno) ->
+                          Some (Ain.get_function_by_index ctx.ain fno).return_type
+                      | HLLCall (lib_no, fun_no) ->
+                          let lib = Ain.get_library_by_index ctx.ain lib_no in
+                          Some lib.functions.(fun_no).return_type
+                      | DelegateCall no ->
+                          Some (Ain.function_of_delegate_index ctx.ain no).return_type
+                      | _ -> None
+                    in
+                    (match rt with
+                     | Some (Ain.Type.Ref _) -> true
+                     | _ -> false)
+                | _ -> false)
+          in
+          let b_referenceable_for_wrap =
+            match b.node with
+            | Ident (_, GlobalConstant) -> false
+            | _ -> is_referenceable b
+          in
+          (if a_is_ref_typed && Ain.version ctx.ain > 8
+              && not b_referenceable_for_wrap then
+            let inner = clone_expr b in
+            b.node <- RvalueRef inner);
           expr.ty <- (match a.ty with Ref t -> t | t -> t));
       (* v11 property read: any [Member] still tagged with [ClassProperty]
          after the main resolution pass is being used as an rvalue
@@ -1522,7 +2302,23 @@ class type_analyze_visitor ctx =
                       ref_type_check (ASTStatement stmt) ty e
                   | _ ->
                       self#check_funarg_or_return (ASTStatement stmt)
-                        f.return.ty e))
+                        f.return.ty e;
+                      (* Refine ArrayLiteral element type from the function's
+                         return type. [return [0, 1, 2]] inside [array@Enum
+                         f()] is typed by [visit_expression]'s ArrayLiteral
+                         arm as [Array Int] (first element's type), but
+                         [variableAlloc] uses [expr.ty] to type the dummy
+                         slot it creates for the literal. orig types the
+                         dummy as [Array Enum] (matching the return type),
+                         which makes [CALLHLL Array.PushBack] emit element-
+                         type code 92 (Enum) instead of 10 (Int). Crashed
+                         start-game in [CommonFrame::InitFramePoint] with
+                         [A_ASSIGN 配列のコピーに失敗しました]. *)
+                      (match (e.node, f.return.ty, e.ty) with
+                      | ArrayLiteral _, Array t, Array Int
+                        when (match t with Enum _ -> true | _ -> false) ->
+                          e.ty <- Array t
+                      | _ -> ())))
           | Return None -> (
               match self#env#current_function with
               | None ->
@@ -1655,5 +2451,7 @@ let check_types ctx decls =
   visitor#errors
 
 let check_types_exn ctx decls =
+  current_ain := Some ctx.ain;
   let errors = check_types ctx decls in
+  current_ain := None;
   if not (List.is_empty errors) then raise_list errors

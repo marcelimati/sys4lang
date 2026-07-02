@@ -46,6 +46,46 @@ class variable_alloc_visitor ctx =
     val func_vars : variable list Stack.t = Stack.create ()
     val scopes = Stack.create ()
     val mutable labels = Hashtbl.create (module String)
+    val mutable suppress_direct_new_dummy = 0
+    val mutable suppress_foreach_container_rvalue_call_dummy = 0
+    val mutable suppress_array_literal_dummy = 0
+    val mutable prop_setter_call_dummy_cache :
+        (string, int) Hashtbl.t option =
+      None
+    val mutable null_coalesce_call_dummy_cache :
+        (string, int) Hashtbl.t option =
+      None
+    val mutable current_function_name = None
+    val mutable current_function_return_ty : jaf_type option = None
+    method is_v12_iface_storage_ty ty =
+      let is_true_iface n = Hashtbl.mem ctx.interface_names n in
+      let is_iface_compat_class n =
+        Hashtbl.mem ctx.iface_compatible_classes n
+      in
+      let rec walk_outer = function
+        | Unresolved name -> is_true_iface name || is_iface_compat_class name
+        | Struct (name, _) -> is_true_iface name || is_iface_compat_class name
+        | Ref (Unresolved name) -> is_true_iface name
+        | Ref (Struct (name, _)) -> is_true_iface name
+        | Ref t -> walk_outer t
+        | _ -> false
+      in
+      Ain.version_gte ctx.ain (12, 0) && walk_outer ty
+
+    method defer_v12_uninit_iface_local (v : variable) =
+      self#is_v12_iface_storage_ty v.type_spec.ty
+      && Poly.equal v.kind LocalVar
+      && (not v.is_private)
+      && Option.is_none v.index
+      && Option.is_none v.initval
+
+    method private assignment_to_deferred_iface_local (lhs : expression) =
+      match lhs.node with
+      | Ident (name, LocalVariable _) -> (
+          match self#env#get_local name with
+          | Some v -> self#defer_v12_uninit_iface_local v
+          | None -> false)
+      | _ -> false
 
     method start_scope =
       Stack.push scopes
@@ -141,7 +181,26 @@ class variable_alloc_visitor ctx =
         | [] -> None
       in
       match Option.first_some (in_current ()) (in_parent ()) with
-      | Some v -> Option.value_exn v.index
+      | Some v -> (
+          (* v12 forward-reference: jaf.ml's pre-walk pushes
+             declarations into the env BEFORE their textual location,
+             so the env knows the name exists. The matching slot is
+             still unallocated until the variable is actually used.
+             Allocate now (lazily, on first reference) so the slot
+             ordering matches the original v12 compiler, which
+             allocates in source-encounter order — both for named
+             vars and for the [<dummy : ...>] slots [variableAlloc]
+             creates during expression compilation.
+             Without lazy allocation, my earlier pre-allocate hoist
+             put all named locals before any dummies and shifted
+             every slot index — breaking [Ident -> LocalVariable]
+             references and producing wrong bytecode. *)
+          match v.index with
+          | Some i -> i
+          | None when Ain.version_gte ctx.ain (12, 0) ->
+              self#add_var v;
+              Option.value_exn v.index
+          | None -> compiler_bug ("Undefined variable: " ^ name) None)
       | None -> compiler_bug ("Undefined variable: " ^ name) None
 
     (* v11 lambda capture: how many enclosing frames to walk to find
@@ -171,11 +230,39 @@ class variable_alloc_visitor ctx =
       v.index <- Some i;
       (* v11 [Wrap T] locals also occupy a [Void] companion slot —
          the VM tracks the fat-ref's referent through the second
-         entry, mirroring the existing scalar-ref behaviour. *)
+         entry, mirroring the existing scalar-ref behaviour.
+         v12 interface params/locals also need the void companion
+         (original Rance10 [void ReleaseComponent(IUserComponent c)]
+         has nargs=2 vars=2: IFace + <void>). *)
+      (* IFace void padding applies when the JAF type is:
+         - bare interface name (Struct(I, _) where I in interface_names)
+         - bare class-implementing-interface (Struct(C, _) where C in
+           iface_compatible_classes)
+         - Ref to a bare interface (also encodes as IFace)
+         NOT for Ref to a class-implementing-interface (encodes as
+         Ref Struct, no padding). Matches original Rance10 distinction
+         between method params [IFace x] (IFace+<void>) and dummies
+         like [Ref ClassImpl] (Ref Struct, no padding). *)
+      let is_v12_property_event_ref_param =
+        Ain.version_gte ctx.ain (12, 0)
+        && Poly.equal v.kind Parameter
+        &&
+        (match current_function_name with
+        | Some name ->
+            String.is_suffix name ~suffix:"::postset"
+            || String.is_suffix name ~suffix:"::preset"
+        | None -> false)
+        &&
+        match v.type_spec.ty with
+        | Ref _ -> true
+        | _ -> false
+      in
       let needs_void_slot =
         is_ref_scalar v.type_spec.ty
+        || is_v12_property_event_ref_param
         || Ain.version ctx.ain > 8
            && match v.type_spec.ty with Wrap _ -> true | _ -> false
+        || self#is_v12_iface_storage_ty v.type_spec.ty
       in
       Stack.push func_vars
         (if needs_void_slot then
@@ -196,10 +283,19 @@ class variable_alloc_visitor ctx =
          else v :: vars)
 
     method create_dummy_var name ty =
-      (* create dummy ref variable to store object for extent of statement *)
+      (* create dummy ref variable to store object for extent of statement.
+         v12: original Rance10 names these [<dummy : <descr>>] without
+         a sequence-number suffix. Pre-v12 keeps the seqno for
+         byte-stability of the existing v11 Ixseal target. *)
+      let v_name =
+        if Ain.version_gte ctx.ain (12, 0) then
+          Printf.sprintf "<dummy : %s>" name
+        else
+          Printf.sprintf "<dummy : %s : %d>" name !dummy_var_seqno
+      in
       let v =
         {
-          name = Printf.sprintf "<dummy : %s : %d>" name !dummy_var_seqno;
+          name = v_name;
           location = dummy_location;
           array_dim = [];
           is_const = false;
@@ -246,15 +342,115 @@ class variable_alloc_visitor ctx =
             | _ -> ())
         | _ -> ()
 
+    method option_return_inner (e : expression) =
+      match e.node with
+      | Call (_, _, (FunctionCall fno | MethodCall (_, fno))) -> (
+          match (Ain.get_function_by_index ctx.ain fno).return_type with
+          | Ain.Type.Option inner -> Some inner
+          | _ -> None)
+      | Call (_, _, HLLCall (lib_no, fun_no)) -> (
+          let lib = Ain.get_library_by_index ctx.ain lib_no in
+          match lib.functions.(fun_no).return_type with
+          | Ain.Type.Option inner -> Some inner
+          | _ -> None)
+      | _ -> None
+
+    method private null_coalesce_optional_setter (lhs : expression) =
+      let rec unwrap (e : expression) =
+        match e.node with
+        | DummyRef (_, inner) | Cast (_, inner) | RvalueRef inner -> unwrap inner
+        | _ -> e
+      in
+      match (unwrap lhs).node with
+      | Call
+          ( { node =
+                OptionalMember
+                  ( _,
+                    name,
+                    ClassMethod (_, _) );
+              _ },
+            [ Some _ ],
+            MethodCall _ )
+        when String.is_suffix name ~suffix:"::set" ->
+          true
+      | _ -> false
+
     method! visit_expression expr =
       (* Don't recurse into an already-wrapped [DummyRef]: its inner has
          been walked once during the original wrap, and re-walking would
          fire the Call case again on the clone, producing a nested
          [DummyRef (_, DummyRef (_, Call ...))] with two dummy slots
          for the same call. *)
+      let suppress_v12_direct_struct_new =
+        Ain.version_gte ctx.ain (12, 0)
+        &&
+        match expr.node with
+        | Assign
+            ( EqAssign,
+              { ty = Struct (_, lhs_sno); _ },
+              { node = New { ty = Struct (_, rhs_sno); _ }; _ } ) ->
+            Int.equal lhs_sno rhs_sno
+        | _ -> false
+      in
+      if suppress_v12_direct_struct_new then
+        suppress_direct_new_dummy <- suppress_direct_new_dummy + 1;
+      let prop_setter_cache =
+        if Ain.version_gte ctx.ain (12, 0) then
+          match expr.node with
+          | Call
+              ( { node = Member (_, mname, _); _ },
+                [ Some _ ],
+                MethodCall _ )
+            when String.is_suffix mname ~suffix:"::set" ->
+              Some (Hashtbl.create (module String))
+          | _ -> None
+        else None
+      in
+      let prev_prop_setter_call_dummy_cache = prop_setter_call_dummy_cache in
+      if Option.is_some prop_setter_cache then
+        prop_setter_call_dummy_cache <- prop_setter_cache;
+      let preallocated_newcall_dummy =
+        match expr.node with
+        | NewCall (ts, _)
+          when Ain.version_gte ctx.ain (12, 0)
+               && suppress_direct_new_dummy = 0
+               && not (Stack.is_empty func_vars) ->
+            let varname =
+              match ts.ty with
+              | Struct (name, _) -> "new " ^ name
+              | _ -> "new <unknown>"
+            in
+            Some (self#create_dummy_var varname (Ref ts.ty))
+        | _ -> None
+      in
       (match expr.node with
       | DummyRef _ -> ()
+      | Assign (EqAssign, lhs, rhs)
+        when self#assignment_to_deferred_iface_local lhs ->
+          (* v12 deferred iface local: allocate LHS slot FIRST so the
+             named local matches its source-declaration position. If we
+             visit RHS first, a call dummy gets the lhs's intended slot
+             and the named local lands one slot later — the case-end
+             cleanup pass then emits ASSIGN -1 on the named-local slot
+             (because cleanup walks slots in numeric order), wiping the
+             value we just stored. Matches original Rance10's
+             CEnqueteItemManager@Add layout: Item=slot 1, call dummies
+             at slots 3/5/7/9/11. *)
+          self#visit_expression lhs;
+          self#visit_expression rhs
+      | NullCoalesce (lhs, rhs) when Ain.version_gte ctx.ain (12, 0) ->
+          let prev = null_coalesce_call_dummy_cache in
+          null_coalesce_call_dummy_cache <- Some (Hashtbl.create (module String));
+          Exn.protect
+            ~f:(fun () ->
+              self#visit_expression lhs;
+              self#visit_expression rhs)
+            ~finally:(fun () -> null_coalesce_call_dummy_cache <- prev)
       | _ -> super#visit_expression expr);
+      if Option.is_some prop_setter_cache then
+        prop_setter_call_dummy_cache <- prev_prop_setter_call_dummy_cache;
+      if suppress_v12_direct_struct_new then
+        suppress_direct_new_dummy <- suppress_direct_new_dummy - 1;
       (* After subexpressions are visited, look for a [Call] or
          [Member.ClassMethod] whose receiver is itself a call result —
          wrap the inner call in a [DummyRef] so its returned struct /
@@ -282,27 +478,35 @@ class variable_alloc_visitor ctx =
              [expr.ty] alone misses calls like [CF_CASColor] that return
              [ref CASColor] at bytecode level. Either form needs a
              dummy slot to back the returned reference. *)
-          let ain_returns_ref =
-            if not v11 then false
+          let v12 = Ain.version_gte ctx.ain (12, 0) in
+          let is_ref_or_iface = function
+            | Ain.Type.Ref _ -> true
+            | Ain.Type.IFace _ when v12 -> true
+            | _ -> false
+          in
+          let ain_return_type =
+            if not v11 then None
             else
               match calltype with
-              | FunctionCall fno | MethodCall (_, fno) -> (
-                  match
-                    (Ain.get_function_by_index ctx.ain fno).return_type
-                  with
-                  | Ain.Type.Ref _ -> true
-                  | _ -> false)
-              | HLLCall (lib_no, fun_no) -> (
+              | FunctionCall fno | MethodCall (_, fno) ->
+                  Some (Ain.get_function_by_index ctx.ain fno).return_type
+              | DelegateCall no ->
+                  Some (Ain.function_of_delegate_index ctx.ain no).return_type
+              | HLLCall (lib_no, fun_no) ->
                   let lib = Ain.get_library_by_index ctx.ain lib_no in
-                  match lib.functions.(fun_no).return_type with
-                  | Ain.Type.Ref _ -> true
-                  | _ -> false)
-              | _ -> false
+                  Some lib.functions.(fun_no).return_type
+              | _ -> None
+          in
+          let ain_returns_ref =
+            match ain_return_type with
+            | Some ty -> is_ref_or_iface ty
+            | None -> false
           in
           let expr_ty_ref =
             match expr.ty with Ref _ -> true | _ -> false
           in
           if expr_ty_ref || ain_returns_ref then (
+            let call_key = expr_to_string expr in
             let varname =
               match calltype with
               | FunctionCall fno | MethodCall (_, fno) ->
@@ -316,9 +520,45 @@ class variable_alloc_visitor ctx =
                   compiler_bug "variable_alloc_visitor: unexpected call type"
                     (Some (ASTExpression expr))
             in
-            let dummy_ty = if expr_ty_ref then expr.ty else Ref expr.ty in
-            let v = self#create_dummy_var varname dummy_ty in
-            expr.node <- DummyRef (v, clone_expr expr));
+            let dummy_ty =
+              let ain_return_type_for_dummy =
+                match calltype with HLLCall _ -> None | _ -> ain_return_type
+              in
+              match (calltype, ain_return_type, expr.ty) with
+              | HLLCall _, Some (Ain.Type.Ref _), Struct _ -> Ref expr.ty
+              | _ -> (
+              match ain_return_type_for_dummy with
+              | Some (Ain.Type.Ref _ as ty) -> ain_to_jaf_type ctx.ain ty
+              | Some (Ain.Type.IFace _ as ty) when v12 ->
+                  ain_to_jaf_type ctx.ain ty
+              | _ -> (
+                  match jaf_to_ain_type ~ctx expr.ty with
+                  | Ain.Type.IFace _ when v12 -> expr.ty
+                  | _ -> if expr_ty_ref then expr.ty else Ref expr.ty))
+            in
+            let cache =
+              match null_coalesce_call_dummy_cache with
+              | Some _ as cache -> cache
+              | None -> prop_setter_call_dummy_cache
+            in
+            match cache with
+            | Some cache
+              when Ain.version_gte ctx.ain (12, 0)
+                   && (Option.is_some null_coalesce_call_dummy_cache
+                      || not (self#is_v12_iface_storage_ty dummy_ty)) -> (
+                match Hashtbl.find cache call_key with
+                | Some v ->
+                    expr.node <-
+                      if Option.is_some null_coalesce_call_dummy_cache then
+                        DummyRef (v, clone_expr expr)
+                      else Ident (call_key, LocalVariable (v, expr.loc))
+                | None ->
+                    let v = self#create_dummy_var varname dummy_ty in
+                    Hashtbl.set cache ~key:call_key ~data:v;
+                    expr.node <- DummyRef (v, clone_expr expr))
+            | _ ->
+                let v = self#create_dummy_var varname dummy_ty in
+                expr.node <- DummyRef (v, clone_expr expr));
           (* v11 needs a stable home for any [RvalueRef] argument so the
              callee can take its address. Wrap each such arg in a
              [DummyRef] pointing at a fresh local. For reference-shaped
@@ -331,6 +571,9 @@ class variable_alloc_visitor ctx =
               | Some ({ node = RvalueRef inner; ty; _ } as arg) ->
                   let dummy_ty =
                     match ty with
+                    | Ref (Int | Float | Bool | LongInt | Enum _ | FuncType _
+                          | HLLParam) ->
+                        (match ty with Ref t -> t | _ -> ty)
                     | String | Struct _ | Array _ | Wrap _ | FuncType _
                     | Delegate _ ->
                         Ref ty
@@ -339,7 +582,7 @@ class variable_alloc_visitor ctx =
                   let v = self#create_dummy_var "右辺値参照化用" dummy_ty in
                   arg.node <- DummyRef (v, inner)
               | _ -> ())
-      | New ts ->
+      | New ts when suppress_direct_new_dummy = 0 ->
           let varname =
             match ts.ty with
             | Struct (name, _) -> name
@@ -349,6 +592,47 @@ class variable_alloc_visitor ctx =
           in
           let v = self#create_dummy_var varname (Ref ts.ty) in
           expr.node <- DummyRef (v, clone_expr expr)
+      | NewCall (ts, _)
+        when Ain.version_gte ctx.ain (12, 0)
+             && suppress_direct_new_dummy = 0
+             && not (Stack.is_empty func_vars) ->
+          (* v12 [new T(args)]: wrap in a DummyRef so the result has
+             a stable local slot. Original Rance10's function "0"
+             has 23 dummy slots for [new CASColor]/[new CASVector3D]
+             expressions in global init code. Skip if not inside a
+             function (e.g. member initializers outside func body). *)
+          let v =
+            match preallocated_newcall_dummy with
+            | Some v -> v
+            | None ->
+                let varname =
+                  match ts.ty with
+                  | Struct (name, _) -> "new " ^ name
+                  | _ -> "new <unknown>"
+                in
+                self#create_dummy_var varname (Ref ts.ty)
+          in
+          expr.node <- DummyRef (v, clone_expr expr)
+      | ArrayLiteral _
+        when Ain.version_gte ctx.ain (12, 0)
+             && suppress_array_literal_dummy = 0
+             && not (Stack.is_empty func_vars) ->
+          let v = self#create_dummy_var "new array" expr.ty in
+          expr.node <- DummyRef (v, clone_expr expr)
+      | Binary
+          ( (RefEqual | RefNEqual),
+            ({ node = NullCoalesce (a, { node = Null; _ }); _ } as lhs),
+            { node = Null; _ } )
+        when Ain.version_gte ctx.ain (12, 0)
+             && not (Stack.is_empty func_vars) -> (
+          match self#option_return_inner a with
+          | Some inner ->
+              let v =
+                self#create_dummy_var "右辺値参照化用"
+                  (ain_to_jaf_type ctx.ain inner)
+              in
+              lhs.node <- DummyRef (v, clone_expr lhs)
+          | None -> ())
       | RvalueRef inner when Ain.version_gte ctx.ain (11, 0) ->
           (* v11: wrap any standalone [RvalueRef] (e.g. a non-
              referenceable method receiver) in a [DummyRef] backed by a
@@ -356,58 +640,276 @@ class variable_alloc_visitor ctx =
              take its address. Reference-shaped types use a [Ref T]
              dummy so the VM's cleanup decrements rather than frees.
              Pre-v11 codegen handles [RvalueRef] directly. *)
-          let dummy_ty =
-            match expr.ty with
-            | String | Struct _ | Array _ | Wrap _ | FuncType _ | Delegate _
-              ->
-                Ref expr.ty
-            | _ -> expr.ty
+          let emit_dummy () =
+            let dummy_ty =
+              match expr.ty with
+              | Ref (Int | Float | Bool | LongInt | Enum _ | FuncType _
+                    | HLLParam) ->
+                  (match expr.ty with Ref t -> t | _ -> expr.ty)
+              | String | Struct _ | Array _ | Wrap _ | FuncType _ | Delegate _
+                ->
+                  Ref expr.ty
+              | _ -> expr.ty
+            in
+            let v = self#create_dummy_var "右辺値参照化用" dummy_ty in
+            expr.node <- DummyRef (v, inner)
           in
-          let v = self#create_dummy_var "右辺値参照化用" dummy_ty in
-          expr.node <- DummyRef (v, inner)
+          if suppress_foreach_container_rvalue_call_dummy > 0 then
+            match (inner.node, inner.ty) with
+            | Call _, Array _ -> ()
+            | ArrayLiteral _, Array _ -> ()
+            | DummyRef (_, { node = ArrayLiteral _; _ }), Array _ -> ()
+            | _ -> emit_dummy ()
+          else emit_dummy ()
       | _ -> ()
 
+    method private foreach_container_preinit_expr stmt =
+      match stmt.node with
+      | Declarations { vars = [ v ]; _ }
+        when Ain.version_gte ctx.ain (12, 0)
+             && Poly.equal v.kind LocalVar
+             && String.is_prefix v.name ~prefix:"<foreach_container_" -> (
+          match v.initval with
+          | Some ({ node = Call _; _ } as call)
+            when String.is_suffix (expr_to_string call) ~suffix:"::get()" ->
+              Some call
+          | Some
+              {
+                node =
+                  RvalueRef ({ node = Call _; _ } as call);
+                _;
+              }
+            when String.is_suffix (expr_to_string call) ~suffix:"::get()" ->
+              let dummy_ty =
+                if match call.ty with Ref _ -> true | _ -> false then call.ty
+                else Ref call.ty
+              in
+              let name =
+                String.drop_suffix (expr_to_string call) (String.length "()")
+              in
+              let dv = self#create_dummy_var name dummy_ty in
+              call.node <- DummyRef (dv, clone_expr call);
+              None
+          | Some
+              {
+                node =
+                  RvalueRef
+                    { node = Call ({ node = Member (obj, _, _); _ }, _, _); _ };
+                _;
+              } -> (
+              match obj.node with This | Ident _ -> None | _ -> Some obj)
+          | Some { node = RvalueRef ({ node = ArrayLiteral _; _ } as arr); _ }
+            ->
+              Some arr
+          | _ -> None)
+      | _ -> None
+
+    method private visit_foreach_compound_with_preinit stmts =
+      match stmts with
+      | counter_alloc :: loop_var :: container_init :: rest -> (
+          match self#foreach_container_preinit_expr container_init with
+          | Some expr ->
+              self#visit_statement counter_alloc;
+              self#visit_expression expr;
+              self#visit_statement loop_var;
+              self#visit_statement container_init;
+              List.iter rest ~f:self#visit_statement;
+              true
+          | None -> false)
+      | _ -> false
+
     method! visit_statement stmt =
+      (* v12 [return this.GetX();] where [GetX] returns a [T] (value
+         type) but the enclosing function returns [ref T]: the [Return]
+         codegen needs a local-slot anchor for [SP_INC] to claim the
+         page before the caller's frame tears down the returned value.
+         Wrap the call expression in [RvalueRef] so the existing
+         [RvalueRef -> DummyRef] handler allocates that slot. Mirrors
+         orig's per-call temp dummy for ref-property forwarders like
+         [CCGParts@SurfaceArea::get -> GetSurfaceArea()]. *)
+      (match (stmt.node, current_function_return_ty) with
+      | Return (Some ({ node = Call _; _ } as ret_e)),
+        Some (Ref (Struct _ | Array _ | String | Delegate _) as ret_ty)
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match ret_e.ty with
+                 | Struct _ | Array _ | String | Delegate _ -> true
+                 | _ -> false)
+             && (match ret_ty with
+                 | Ref inner -> Poly.equal ret_e.ty inner
+                 | _ -> false) ->
+          let inner = clone_expr ret_e in
+          ret_e.node <- RvalueRef inner
+      | _ -> ());
+      let started_scope =
+        match stmt.node with
+        | Compound _ ->
+            self#start_scope;
+            true
+        | While (_, _) | DoWhile (_, _) | For (_, _, _, _) ->
+            self#start_scope;
+            true
+        | Switch (_, _) ->
+            self#start_scope;
+            true
+        | _ -> false
+      in
       (match stmt.node with
-      | Compound _ -> self#start_scope
-      | While (_, _) | DoWhile (_, _) -> self#start_scope
-      | For (_, _, _, _) -> self#start_scope
-      | Switch (_, _) -> self#start_scope
       | Label name -> self#add_label name stmt
       | Goto name -> self#add_goto name stmt
       | Continue -> self#add_continue stmt
       | Break -> self#add_break stmt
       | _ -> ());
-      super#visit_statement stmt;
+      let handled =
+        match stmt.node with
+        | Compound stmts -> self#visit_foreach_compound_with_preinit stmts
+        | _ -> false
+      in
+      if not handled then super#visit_statement stmt;
       match stmt.node with
-      | Compound _ -> self#end_scope ScopeAnon
-      | While (_, _) | DoWhile (_, _) -> self#end_scope ScopeLoop
-      | For (_, _, _, _) -> self#end_scope ScopeLoop
-      | Switch (_, _) -> self#end_scope ScopeSwitch
+      | Compound _ when started_scope -> self#end_scope ScopeAnon
+      | (While (_, _) | DoWhile (_, _) | For (_, _, _, _)) when started_scope ->
+          self#end_scope ScopeLoop
+      | Switch (_, _) when started_scope -> self#end_scope ScopeSwitch
       | _ -> ()
 
     method! visit_variable v =
       (match v.kind with
       | (Parameter | LocalVar) when (not v.is_const) || v.is_private ->
-          (* v11 private locals can re-declare a same-named slot; reuse
-             the existing slot rather than allocating a new one. *)
-          let existing =
-            if v.is_private then
-              List.find self#env#var_list ~f:(fun (ev : variable) ->
-                  String.equal ev.name v.name && Option.is_some ev.index)
-            else None
-          in
-          (match existing with
-          | Some ev -> v.index <- ev.index
-          | None -> self#add_var v)
+          (* v12 only: pre-hoist pass may have already allocated the
+             slot (params + body LocalVars), so don't double-add. On
+             v11 the param-add must always run — Ixseal has a
+             user-bodied event whose [value_param] is shared between
+             [Name::add] and [Name::remove] via [merge_with_prev]'s
+             [decl.params <- prev_decl.params]. Skipping by [v.index]
+             would leave the second method's [func_vars] empty. *)
+          let v12 = Ain.version_gte ctx.ain (12, 0) in
+          (* v12: allocate iface locals at their declaration site (no
+             defer). If we wait for first-reference, the local isn't in
+             [scope.initial_vars] of any enclosing block scope (switch,
+             loop) entered between decl and use, so [break]/[continue]
+             cleanup treats it as scope-local and emits
+             [PUSH -1; ASSIGN] on its slot — wiping a value the
+             post-break code expected to survive (e.g., [Item] in
+             CEnqueteItemManager@Add storing the case's call result
+             before [break]). Matches original Rance10 layout where
+             outer-scope iface locals appear in [initial_vars] at
+             every nested scope. *)
+          if (not v12) || Option.is_none v.index then (
+            (* v11 private locals can re-declare a same-named slot;
+               reuse the existing slot rather than allocating a new
+               one. *)
+            let existing =
+              if v.is_private then
+                List.find self#env#var_list ~f:(fun (ev : variable) ->
+                    String.equal ev.name v.name && Option.is_some ev.index)
+              else None
+            in
+            match existing with
+            | Some ev -> v.index <- ev.index
+            | None -> self#add_var v)
       | _ -> ());
-      super#visit_variable v
+      let suppress =
+        Ain.version_gte ctx.ain (12, 0)
+        && Poly.equal v.kind LocalVar
+        && (match v.type_spec.ty with Struct _ -> true | _ -> false)
+        &&
+        match v.initval with
+        | Some { node = New _ | NewCall _; _ } -> true
+        | _ -> false
+      in
+      if suppress then suppress_direct_new_dummy <- suppress_direct_new_dummy + 1;
+      let suppress_foreach_container_rvalue_call_dummy_for_var =
+        Ain.version_gte ctx.ain (12, 0)
+        && v.is_private
+        && String.is_prefix v.name ~prefix:"<foreach_container_"
+        &&
+        match v.initval with
+        | Some { node = RvalueRef { node = Call _; _ }; _ } -> true
+        | Some { node = RvalueRef { node = ArrayLiteral _; _ }; _ } -> true
+        | Some
+            {
+              node =
+                RvalueRef
+                  { node = DummyRef (_, { node = ArrayLiteral _; _ }); _ };
+              _;
+            } ->
+            true
+        | _ -> false
+      in
+      if suppress_foreach_container_rvalue_call_dummy_for_var then
+        suppress_foreach_container_rvalue_call_dummy <-
+          suppress_foreach_container_rvalue_call_dummy + 1;
+      (match (v.type_spec.ty, v.initval) with
+      | (Array elem_ty | Ref (Array elem_ty)),
+        Some ({ node = ArrayLiteral _; _ } as init) ->
+          init.ty <- Array elem_ty
+      | _ -> ());
+      let suppress_array_literal_dummy_for_var =
+        Ain.version_gte ctx.ain (12, 0)
+        && Poly.equal v.kind LocalVar
+        &&
+        match (v.type_spec.ty, v.initval) with
+        | Array _, Some { node = ArrayLiteral _; _ } -> true
+        | _ -> false
+      in
+      if suppress_array_literal_dummy_for_var then
+        suppress_array_literal_dummy <- suppress_array_literal_dummy + 1;
+      super#visit_variable v;
+      if suppress_array_literal_dummy_for_var then
+        suppress_array_literal_dummy <- suppress_array_literal_dummy - 1;
+      if suppress_foreach_container_rvalue_call_dummy_for_var then
+        suppress_foreach_container_rvalue_call_dummy <-
+          suppress_foreach_container_rvalue_call_dummy - 1;
+      if suppress then suppress_direct_new_dummy <- suppress_direct_new_dummy - 1
 
     method! visit_fundecl f =
       if Option.is_some f.body then (
+        let prev_function_name = current_function_name in
+        let prev_function_return_ty = current_function_return_ty in
+        current_function_name <- Some f.name;
+        current_function_return_ty <- Some f.return.ty;
         let parent_labels = labels in
         labels <- Hashtbl.create (module String);
         Stack.push func_vars [];
+        (* v12 hoists block-local var decls to function scope. Pre-walk
+           the body and allocate indices for every LocalVar VarDecl so
+           a hoisted Ident reference (encountered before the textual
+           VarDecl) can resolve to a valid local slot. Mirrors the env
+           pre-pop in [jaf.ml:visit_fundecl].
+
+           Params must occupy the first [nr_args] slots — call
+           [add_var] on each param FIRST, then hoist body locals. The
+           later [super#visit_fundecl] re-visits params via
+           [visit_variable] but [add_var] is gated by [Option.is_none
+           v.index], so each slot is allocated once.
+
+           Reset [p.index] before [add_var] because v11 event/property
+           auto-stubs share their [value_param] across both
+           [Name::add] and [Name::remove] user impls (via
+           [merge_with_prev]'s [decl.params <- prev_decl.params]). A
+           shared param keeps the index from the first visit, which
+           makes the second visit skip allocation and leave [vars=[]]
+           on the second method. Always re-allocate per function.
+
+           v11 doesn't hoist block-local vars — they're allocated in
+           textual order by [super#visit_fundecl]'s [visit_variable]
+           pass. Pre-walking would shift their slot indices and break
+           foreach-pattern recognition in the decompiler. Gate the
+           pre-hoist on v12. *)
+        if Ain.version_gte ctx.ain (12, 0) then (
+          (* Params still need eager allocation: their slot order is
+             fixed (first nr_args slots) and shared params from
+             event/property auto-stub fundecls (via [merge_with_prev]
+             [decl.params <- prev_decl.params]) need a per-function
+             reset. Body LocalVars are NOT pre-allocated here — see
+             [get_var_no] for the lazy-on-first-use path that matches
+             original Rance10's slot ordering. *)
+          List.iter f.params ~f:(fun p ->
+              match p.kind with
+              | Parameter ->
+                  p.index <- None;
+                  self#add_var p
+              | _ -> ()));
         (* Narrow [Ref (Array HLLParam)] / [Wrap (Struct s)] placeholder
            slots to concrete types in the ain-side variable list:
            - foreach-desugared containers carry [Ref (Array HLLParam)]
@@ -421,7 +923,19 @@ class variable_alloc_visitor ctx =
            Both narrowings keep the slot's bytecode-level type aligned
            with the v11 VM's expectations on member access. *)
         let conv_var all_vars index (v : variable) =
-          let ain_type = jaf_to_ain_type v.type_spec.ty in
+          let ain_type = jaf_to_ain_type ~ctx v.type_spec.ty in
+          let ain_type =
+            if Ain.version_gte ctx.ain (12, 0) && Poly.equal v.kind Parameter
+               &&
+               (String.is_suffix f.name ~suffix:"::postset"
+               || String.is_suffix f.name ~suffix:"::preset")
+            then
+              match v.type_spec.ty with
+              | Ref inner ->
+                  Ain.Type.Wrap (jaf_to_ain_type ~ctx inner)
+              | _ -> ain_type
+            else ain_type
+          in
           let ain_type =
             match ain_type with
             | Ain.Type.Ref (Ain.Type.Array Ain.Type.HLLParam) -> (
@@ -485,12 +999,14 @@ class variable_alloc_visitor ctx =
         (match (f.index, f.is_label && Ain.version ctx.ain = 1) with
         | _, true -> ()
         | Some idx, false ->
-            Ain.get_function_by_index ctx.ain idx
-            |> jaf_to_ain_function f |> add_vars vars
-            |> Ain.write_function ctx.ain
+            let obj = Ain.get_function_by_index ctx.ain idx in
+            let updated = add_vars vars (jaf_to_ain_function ~ctx f obj) in
+            Ain.write_function ctx.ain updated
         | None, false ->
             compiler_bug "Undefined function"
               (Some (ASTDeclaration (Function f))));
+        current_function_name <- prev_function_name;
+        current_function_return_ty <- prev_function_return_ty;
         labels <- parent_labels)
   end
 

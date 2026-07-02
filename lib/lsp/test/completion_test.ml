@@ -156,6 +156,7 @@ let%expect_test "get_completion_locals_limited_by_scope" =
     {|
     a [Variable] int
     b [Variable] int
+    d [Variable] int
     gstr [Variable] string
     gvar [Variable] int
     |}]

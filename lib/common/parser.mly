@@ -95,6 +95,12 @@ let rec multidim_array dims t =
 %token <string> C_CONSTANT
 %token <string> S_CONSTANT
 %token <string> IDENTIFIER
+(* TEMPLATE_IDENTIFIER carries an entire templated name including the angle
+   brackets, e.g. "SASPair<string, float>". Emitted by the lexer when an
+   identifier known to be a templated type (via LexerState) is immediately
+   followed by `<`. Treated as a single qualified-name segment by the
+   grammar — the parser does not look inside the brackets. *)
+%token <string> TEMPLATE_IDENTIFIER
 /* arithmetic */
 %token PLUS MINUS TIMES DIV MOD
 /* bitwise */
@@ -116,6 +122,7 @@ let rec multidim_array dims t =
 %token IF ELSE WHILE DO FOR FOREACH FOREACH_R SWITCH CASE DEFAULT NULL THIS NEW
 %token GOTO CONTINUE BREAK RETURN JUMP JUMPS ASSERT
 %token CONST REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM EVENT
+%token IMPLEMENTS INTERFACE
 %token FILE_MACRO LINE_MACRO DATE_MACRO TIME_MACRO GLOBALGROUP UNKNOWN_FUNCTYPE
 %token UNKNOWN_DELEGATE
 
@@ -147,15 +154,22 @@ expression_eof
   : expression EOF { $1 }
   ;
 
-qualified_name
+(* A path segment is either a plain identifier or a templated identifier
+   (which carries its full `<...>` from the lexer). *)
+qualified_segment
   : IDENTIFIER { $1 }
-  | IDENTIFIER COCO qualified_name { $1 ^ "::" ^ $3 }
+  | TEMPLATE_IDENTIFIER { $1 }
+  ;
+
+qualified_name
+  : qualified_segment { $1 }
+  | qualified_segment COCO qualified_name { $1 ^ "::" ^ $3 }
   ;
 
 qualified_funcname
-  : IDENTIFIER { $1 }
+  : qualified_segment { $1 }
   | BITNOT IDENTIFIER { "~" ^ $2 }
-  | IDENTIFIER COCO qualified_funcname { $1 ^ "::" ^ $3 }
+  | qualified_segment COCO qualified_funcname { $1 ^ "::" ^ $3 }
   ;
 
 primary_expression
@@ -168,6 +182,10 @@ primary_expression
   | LPAREN expression RPAREN { {$2 with loc=$sloc} }
   | parameter_list(init_declarator(IDENTIFIER)) FATARROW declaration_specifiers block
     { make_expr ~loc:$sloc (Lambda (func ~is_lambda:true $sloc $3 "<lambda>" $1 (Some $4))) }
+  (* v12 array literal: `[e1, e2, ...]`. The empty form `[]` does
+     appear (e.g. `x ?? []`); element type falls out of context. *)
+  | LBRACKET separated_list(COMMA, assign_expression) RBRACKET
+    { make_expr ~loc:$sloc (ArrayLiteral $2) }
   ;
 
 (* Due to the way menhir handles reduce/reduce conflicts, the generation rule
@@ -206,9 +224,34 @@ postfix_expression
   | primitive_type_specifier LPAREN expression RPAREN { make_expr ~loc:$sloc (Cast ($1, $3)) }
   | postfix_expression arglist { make_expr ~loc:$sloc (Call ($1, $2, UnresolvedCall)) }
   | NEW qualified_name { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
-  | NEW qualified_name LPAREN RPAREN { make_expr ~loc:$sloc (New { ty = Unresolved $2; location = $loc($2) }) }
-  | postfix_expression DOT IDENTIFIER { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
-  | postfix_expression QUESTION_DOT IDENTIFIER { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
+  | NEW qualified_name LPAREN separated_nonempty_list(COMMA, option(assign_expression)) RPAREN
+    (* v12 constructor call. The `arglist`-style trick represents `T()`
+       as a one-element [None] list (`T(,)` is rejected by lexing).
+       Preserve it as [NewCall []] so codegen can distinguish source
+       `new T()` from v12's constructorless `new T`. *)
+    { match $4 with
+      | [ None ] ->
+          make_expr ~loc:$sloc
+            (NewCall ({ ty = Unresolved $2; location = $loc($2) }, []))
+      | args ->
+          make_expr ~loc:$sloc
+            (NewCall ({ ty = Unresolved $2; location = $loc($2) }, args)) }
+  | postfix_expression DOT qualified_name
+    (* v12 allows qualified method names after a member access, e.g.
+       `this.Name::postset(tmp)` — the call target is the method
+       `Name::postset` on `this`. v11 only used bare identifiers; the
+       qualified form is a superset. *)
+    { make_expr ~loc:$sloc (Member ($1, $3, UnresolvedMember)) }
+  (* v11/v12 synthetic angle-bracketed member access (`obj.<Name>`,
+     typically a property backing field). The leading `.` disambiguates
+     so there's no comparison-vs-template hazard — the lexer never sees
+     a bare `<IDENT>`. *)
+  | postfix_expression DOT LT IDENTIFIER GT
+    { make_expr ~loc:$sloc (Member ($1, "<" ^ $4 ^ ">", UnresolvedMember)) }
+  | postfix_expression QUESTION_DOT qualified_name
+    { make_expr ~loc:$sloc (OptionalMember ($1, $3, UnresolvedMember)) }
+  | postfix_expression QUESTION_DOT LT IDENTIFIER GT
+    { make_expr ~loc:$sloc (OptionalMember ($1, "<" ^ $4 ^ ">", UnresolvedMember)) }
   | postfix_expression INC { make_expr ~loc:$sloc (Unary (PostInc, $1)) }
   | postfix_expression DEC { make_expr ~loc:$sloc (Unary (PostDec, $1)) }
   ;
@@ -517,11 +560,16 @@ external_declaration
     { [ FuncTypeDef (func $sloc $2 $3 $4 None) ] }
   | DELEGATE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
     { [ DelegateDef (func $sloc $2 $3 $4 None) ] }
-  | struct_or_class qualified_name LBRACE struct_declaration* RBRACE SEMICOLON
-    { [ StructDef ({ loc = $sloc; is_class = $1; name = $2; decls = $4 }) ] }
+  | struct_or_class qualified_name implements_clause? LBRACE struct_declaration* RBRACE SEMICOLON
+    { [ StructDef ({ loc = $sloc; is_class = $1; name = $2;
+                     interfaces = Option.value $3 ~default:[];
+                     decls = $5 }) ] }
   | ENUM enumerator_list SEMICOLON
     { [ Enum ({ loc=$sloc; name=None; values=$2 }) ] }
-  | ENUM IDENTIFIER enumerator_list SEMICOLON
+  | ENUM qualified_name enumerator_list SEMICOLON
+    (* v12 enums may use qualified names like
+       `enum activityeditor::detail::EDialogType { ... };`. v11 used
+       bare IDENTIFIER; widened to qualified_name as a superset. *)
     { [ Enum ({ loc=$sloc; name=Some $2; values=$3 }) ] }
   | GLOBALGROUP IDENTIFIER SEMICOLON
     { [ GlobalGroup { name = $2; loc = $loc; vardecls = [] } ] }
@@ -601,10 +649,21 @@ hll_declaration
 %inline struct_or_class
   : STRUCT { false }
   | CLASS { true }
+  (* v11+ interface declarations parse with the same body shape as a
+     class. Treat them like structs for the purpose of default access
+     (public, not private) — interface methods are by convention always
+     publicly callable. The .ain side distinguishes interfaces via the
+     [implementers] list, not via a separate flag. *)
+  | INTERFACE { false }
   ;
 
 enumerator_list
-  : LBRACE separated_nonempty_list(COMMA, enumerator) RBRACE { $2 }
+  : LBRACE list(enumerator_with_comma) enumerator? RBRACE
+    { $2 @ (match $3 with Some e -> [ e ] | None -> []) }
+  ;
+
+enumerator_with_comma
+  : enumerator COMMA { $1 }
   ;
 
 enumerator
@@ -636,7 +695,11 @@ struct_declaration
   | CONST declaration_specifiers separated_nonempty_list(COMMA, init_declarator(IDENTIFIER)) SEMICOLON
     { let vars = vardecls ClassVar true $2 $3 in
       MemberDecl { decl_loc=$sloc; typespec=$2; is_const_decls = true; vars } }
-  | declaration_specifiers separated_nonempty_list(COMMA, declarator(IDENTIFIER)) SEMICOLON
+  | declaration_specifiers separated_nonempty_list(COMMA, init_declarator(IDENTIFIER)) SEMICOLON
+    (* v12: non-const class members can carry an initializer
+       (e.g. `IUserComponent UserComponent = NULL;`). v11 only allowed
+       initializers on const members; allowing them here too is a
+       superset, so v11 inputs stay accepted. *)
     { let vars = vardecls ClassVar false $1 $2 in
       MemberDecl { decl_loc=$sloc; typespec=$1; is_const_decls = false; vars } }
   | declaration_specifiers IDENTIFIER LBRACE property_accessor_decl+ RBRACE
@@ -646,7 +709,15 @@ struct_declaration
        plus synthetic get/set methods by the declaration-analysis pass. *)
     { PropertyDecl
         { pd_loc = $sloc; pd_typespec = $1; pd_name = $2;
-          pd_accessors = $4 } }
+          pd_accessors = $4; pd_initval = None } }
+  | declaration_specifiers IDENTIFIER LBRACE property_accessor_decl+ RBRACE ASSIGN assign_expression SEMICOLON
+    (* v11+ property with initializer (`float Rate { get; set; } = 1.0;`).
+       The initializer is attached to the synthesized backing field so
+       the class `@0` ctor emits the assignment, matching how the
+       original compiler encodes default property values. *)
+    { PropertyDecl
+        { pd_loc = $sloc; pd_typespec = $1; pd_name = $2;
+          pd_accessors = $4; pd_initval = Some $7 } }
   | EVENT declaration_specifiers IDENTIFIER SEMICOLON
     (* v11 event declaration. Lowers to a delegate-typed [<Name>]
        backing member plus prototype-only [Name::add(T value)] /
@@ -654,17 +725,31 @@ struct_declaration
        [obj.Name -= h] dispatch through delegate-add/remove on the
        backing field. *)
     { EventDecl { ed_loc = $sloc; ed_typespec = $2; ed_name = $3 } }
-  | declaration_specifiers IDENTIFIER parameter_list(init_declarator(IDENTIFIER)) opt_body
+  | declaration_specifiers qualified_funcname parameter_list(init_declarator(IDENTIFIER)) opt_body
+    (* v12 interface/class member declarations may use qualified names
+       for property accessor signatures, e.g. `string Handle::get();`.
+       v11 only used bare identifiers; allowing qualified names is a
+       superset. The LBRACE-following property declaration rule below
+       still matches first when its tokens fit. *)
     { Method (func $sloc $1 $2 $3 $4) }
-  | IDENTIFIER LPAREN VOID? RPAREN opt_body
-    { Constructor (func $sloc (implicit_void $symbolstartpos) $1 [] $5) }
-  | BITNOT IDENTIFIER LPAREN RPAREN opt_body
+  | qualified_segment parameter_list(init_declarator(IDENTIFIER)) opt_body
+    (* v12 allows constructors with parameters, e.g.
+       `CActivityWrap(string ActivityName);`. v11 only had the no-arg
+       form; this rule subsumes it via the empty parameter_list. The
+       name can be a TEMPLATE_IDENTIFIER for templated classes like
+       `SASPair<string, float>();`. *)
+    { Constructor (func $sloc (implicit_void $symbolstartpos) $1 $2 $3) }
+  | BITNOT qualified_segment LPAREN RPAREN opt_body
     { Destructor (func $sloc (implicit_void $symbolstartpos) ("~" ^ $2) [] $5) }
   ;
 
 access_specifier
   : PUBLIC { Public }
   | PRIVATE { Private }
+  ;
+
+implements_clause
+  : IMPLEMENTS separated_nonempty_list(COMMA, qualified_name) { $2 }
   ;
 
 opt_body

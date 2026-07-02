@@ -189,7 +189,7 @@ let%expect_test "RefAssign operator" =
     {|
     (12, 8) - (12, 9) Type error: expected ref int; got int
     (13, 8) - (13, 12) Type error: expected ref int; got null
-    (16, 14) - (16, 21) Type error: expected ref int; got ref S
+    (16, 14) - (16, 21) Type error: expected ref int; got S
     (17, 8) - (17, 16) Not an lvalue: 3
     (18, 8) - (18, 17) Type error: expected ref int; got ref int
     (20, 8) - (20, 11) Type error: expected ref int; got int
@@ -236,14 +236,11 @@ let%expect_test "RefEqual operator" =
   [%expect
     {|
     (12, 8) - (12, 9) Type error: expected ref int; got int
-    (13, 8) - (13, 19) Not an lvalue: NULL
-    (16, 15) - (16, 22) Type error: expected ref int; got ref S
+    (16, 15) - (16, 22) Type error: expected ref int; got S
     (17, 20) - (17, 22) Type error: expected ref S; got ref int
     (18, 8) - (18, 16) Not an lvalue: 3
     (21, 8) - (21, 11) Type error: expected ref int; got int
-    (23, 8) - (23, 22) Not an lvalue: this
     (27, 8) - (27, 11) Type error: expected ref int; got int
-    (28, 8) - (28, 18) Not an lvalue: 3
     (29, 8) - (29, 17) Undefined variable: undefined
     |}]
 

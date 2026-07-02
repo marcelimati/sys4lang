@@ -35,9 +35,22 @@ class sanity_check_visitor ctx =
       | Ident (_, GlobalConstant) ->
           compiler_bug "global constant not eliminated"
             (Some (ASTExpression expr))
+      | Member (_, _, UnresolvedMember)
+        when (match expr.ty with Jaf.HLLParam -> true | _ -> false) ->
+          (* v12 generic-receiver member access tolerated through the
+             [HLLParam] wildcard — codegen emits a sentinel for these. *)
+          ()
       | Member (_, _, UnresolvedMember) ->
           compiler_bug "member expression has no member_type"
             (Some (ASTExpression expr))
+      | Call (e, _, UnresolvedCall)
+        when (match e.ty with Jaf.HLLParam -> true | _ -> false)
+             || (match expr.ty with Jaf.HLLParam -> true | _ -> false) ->
+          (* v12 generic-callee or generic-result call (member that
+             fell through to HLLParam, delegate of unknown type, etc.).
+             Codegen tolerates by emitting a sentinel. v12-wip —
+             round-trip intentionally broken. *)
+          ()
       | Call (_, _, UnresolvedCall) ->
           compiler_bug "call expression has no call_type"
             (Some (ASTExpression expr))

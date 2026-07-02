@@ -389,7 +389,7 @@ let extract_event_pairs (methods : CodeGen.function_t list) :
    with no implementation block. Returns
    [(property_defs, remaining_methods)]. *)
 let extract_property_defs (methods : CodeGen.function_t list) :
-    CodeGen.property_def list * CodeGen.function_t list =
+    CodeGen.property_def list * CodeGen.function_t list * (int, unit) Hashtbl.t =
   let split_accessor name =
     match String.chop_suffix name ~suffix:"::get" with
     | Some base -> Some (base, `Get)
@@ -413,12 +413,24 @@ let extract_property_defs (methods : CodeGen.function_t list) :
       Hash_set.add seen_names base;
       ordered_names := base :: !ordered_names)
   in
+  (* v12 may emit duplicate getter/setter slots for the same property
+     (interface-level + direct). Keep track of the func.id of the
+     previously-recorded getter/setter so we can drop the duplicates
+     from the output entirely — losing round-trip fidelity for these
+     extra slots but unblocking the compile. *)
+  let dropped_dup_ids : (int, unit) Hashtbl.t = Hashtbl.create (module Int) in
   List.iter methods ~f:(fun (m : CodeGen.function_t) ->
       match split_accessor m.name with
       | Some (base, `Get) ->
+          Option.iter (Hashtbl.find gets base)
+            ~f:(fun (prev : CodeGen.function_t) ->
+              Hashtbl.set dropped_dup_ids ~key:prev.func.id ~data:());
           Hashtbl.set gets ~key:base ~data:m;
           record_name base
       | Some (base, `Set) ->
+          Option.iter (Hashtbl.find sets base)
+            ~f:(fun (prev : CodeGen.function_t) ->
+              Hashtbl.set dropped_dup_ids ~key:prev.func.id ~data:());
           Hashtbl.set sets ~key:base ~data:m;
           record_name base
       | None -> others := m :: !others);
@@ -474,7 +486,7 @@ let extract_property_defs (methods : CodeGen.function_t list) :
             prop_is_auto;
           }
         :: !properties);
-  (List.rev !properties, List.rev !others)
+  (List.rev !properties, List.rev !others, dropped_dup_ids)
 
 let decompile ~move_to_original_file ~continue_on_error =
   let code = Instructions.decode Ain.ain.code in
@@ -547,13 +559,47 @@ let decompile ~move_to_original_file ~continue_on_error =
         (fname, List.rev !decompiled_funcs))
   in
   let srcs = synthesize_scenario_labels code srcs in
+  let dropped_func_ids = Hash_set.create (module Int) in
   Array.iter structs ~f:(fun s ->
       let methods_in_order = List.rev s.methods in
       let events, after_events = extract_event_pairs methods_in_order in
-      let properties, remaining = extract_property_defs after_events in
-      s.methods <- remaining;
+      let properties, remaining, dup_ids =
+        extract_property_defs after_events
+      in
+      (* v12 duplicate method slots: a class may carry two function-table
+         entries for the same `Class@Method(args)` shape (interface +
+         direct dispatch). Drop later duplicates from emission to
+         unblock the compile — round-trip fidelity for these extra
+         slots is sacrificed; fix later by teaching the compiler to
+         emit both. *)
+      let dedup_dup_ids = Hash_set.create (module Int) in
+      let seen_sig = Hashtbl.create (module String) in
+      let dedup =
+        List.filter remaining ~f:(fun (m : CodeGen.function_t) ->
+            let sig_key =
+              let arg_types =
+                List.take (Array.to_list m.func.vars) m.func.nr_args
+                |> List.map ~f:(fun (v : Ain.Variable.t) ->
+                       Type.show_ain_type v.type_)
+                |> String.concat ~sep:","
+              in
+              m.name ^ "(" ^ arg_types ^ ")"
+            in
+            if Hashtbl.mem seen_sig sig_key then (
+              Hash_set.add dedup_dup_ids m.func.id;
+              false)
+            else (
+              Hashtbl.set seen_sig ~key:sig_key ~data:();
+              true))
+      in
+      s.methods <- dedup;
       s.events <- events;
-      s.properties <- properties);
+      s.properties <- properties;
+      (* v12 duplicate property-accessor slots: drop the older slot
+         from emission entirely so it doesn't surface as a regular
+         method alongside the property declaration. *)
+      Hashtbl.iter_keys dup_ids ~f:(Hash_set.add dropped_func_ids);
+      Hash_set.iter dedup_dup_ids ~f:(Hash_set.add dropped_func_ids));
   (* Manual events and non-auto properties round-trip as a single
      top-level block ([event T Class::Name { add{} remove{} }] /
      [T Class::Name { get{} set{} }]) replacing the per-class .jaf's
@@ -562,7 +608,6 @@ let decompile ~move_to_original_file ~continue_on_error =
      properties the marker is [get] (or [set] when get is absent).
      Auto-implemented properties have no implementation block at all,
      so both accessors are dropped. *)
-  let dropped_func_ids = Hash_set.create (module Int) in
   Array.iter structs ~f:(fun s ->
       List.iter s.events ~f:(fun (e : CodeGen.event_pair) ->
           Hash_set.add dropped_func_ids e.ev_remove.func.id);

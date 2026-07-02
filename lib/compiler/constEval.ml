@@ -200,6 +200,8 @@ class const_eval_visitor ctx =
       | NullCoalesce _ -> ()
       | Call (_, _, _) -> ()
       | New _ -> ()
+      | NewCall _ -> ()
+      | ArrayLiteral _ -> ()
       | DummyRef _ -> ()
       | RvalueRef _ -> ()
       | This -> ()
@@ -245,20 +247,29 @@ class const_eval_visitor ctx =
         | None -> const_error v
       else
         match (v.kind, v.initval) with
-        | GlobalVar, Some e ->
-            Ain.set_global_initval ctx.ain v.name
-              (match e.node with
-              | ConstInt i | Cast (LongInt, { node = ConstInt i; _ }) ->
-                  Ain.Variable.Int (Int32.of_int_exn i)
-              | ConstFloat f -> Ain.Variable.Float f
-              | ConstString s -> Ain.Variable.String s
-              | Ident (name, _) -> (
-                  match self#env#resolve name with
-                  | ResolvedGlobal v ->
-                      Ain.Variable.Int
-                        (Int32.of_int_exn (Option.value_exn v.index))
-                  | _ -> const_error v)
-              | _ -> const_error v)
+        | GlobalVar, Some e -> (
+            (* v12 lets non-const globals carry rich initializers like
+               `CASColor::BLACK = new CASColor(0, 0, 0, 255);`. These
+               are runtime-initialized via a generated startup function
+               rather than a static initval in the .ain. Only set the
+               static initval for trivially-constant RHSes; skip for
+               anything that needs runtime evaluation. *)
+            match e.node with
+            | ConstInt i | Cast (LongInt, { node = ConstInt i; _ }) ->
+                Ain.set_global_initval ctx.ain v.name
+                  (Ain.Variable.Int (Int32.of_int_exn i))
+            | ConstFloat f ->
+                Ain.set_global_initval ctx.ain v.name (Ain.Variable.Float f)
+            | ConstString s ->
+                Ain.set_global_initval ctx.ain v.name (Ain.Variable.String s)
+            | Ident (name, _) -> (
+                match self#env#resolve name with
+                | ResolvedGlobal v ->
+                    Ain.set_global_initval ctx.ain v.name
+                      (Ain.Variable.Int
+                         (Int32.of_int_exn (Option.value_exn v.index)))
+                | _ -> ())
+            | _ -> ())
         | Parameter, Some e -> (
             match e.node with
             | ConstInt _ | ConstFloat _ | ConstChar _ | ConstString _ | Null ->

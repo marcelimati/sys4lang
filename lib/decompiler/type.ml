@@ -133,11 +133,17 @@ let rec ain_type_unify t t' =
   | _ -> Poly.(t = t')
 
 and func_type_unify ft ft' =
-  ain_type_unify ft.return_type ft'.return_type
+  let is_unknown_indexed_signature ft =
+    match (ft.return_type, ft.arg_types) with Any, [] -> true | _ -> false
+  in
+  is_unknown_indexed_signature ft
+  || is_unknown_indexed_signature ft'
+  ||
+  (ain_type_unify ft.return_type ft'.return_type
   &&
   match List.for_all2 ft.arg_types ft'.arg_types ~f:ain_type_unify with
   | Ok b -> b
-  | Unequal_lengths -> false
+  | Unequal_lengths -> false)
 
 let is_scalar = function
   | Int | LongInt | Bool | Float | Enum _ -> true
@@ -154,6 +160,12 @@ let is_fat = function
 let rec make_array base = function
   | 0 -> base
   | rank -> Array (make_array base (rank - 1))
+
+let unknown_indexed_signature = { return_type = Any; arg_types = [] }
+
+let indexed_func_type struc =
+  TypeVar.create
+    (if struc >= 0 then Id (struc, unknown_indexed_signature) else Var)
 
 let create enum ~struc ~rank =
   match enum with
@@ -175,10 +187,10 @@ let create enum ~struc ~rank =
   | 24 -> Ref (make_array String rank)
   | 25 -> Ref (make_array (Struct struc) rank)
   | 26 -> IMainSystem
-  | 27 -> FuncType (TypeVar.create Var)
-  | 30 -> make_array (FuncType (TypeVar.create Var)) rank
-  | 31 -> Ref (FuncType (TypeVar.create Var))
-  | 32 -> Ref (make_array (FuncType (TypeVar.create Var)) rank)
+  | 27 -> FuncType (indexed_func_type struc)
+  | 30 -> make_array (FuncType (indexed_func_type struc)) rank
+  | 31 -> Ref (FuncType (indexed_func_type struc))
+  | 32 -> Ref (make_array (FuncType (indexed_func_type struc)) rank)
   | 47 -> Bool
   | 50 -> make_array Bool rank
   | 51 -> Ref Bool
@@ -187,10 +199,10 @@ let create enum ~struc ~rank =
   | 58 -> make_array LongInt rank
   | 59 -> Ref LongInt
   | 60 -> Ref (make_array LongInt rank)
-  | 63 -> Delegate (TypeVar.create Var)
-  | 66 -> make_array (Delegate (TypeVar.create Var)) rank
-  | 67 -> Ref (Delegate (TypeVar.create Var))
-  | 69 -> Ref (make_array (Delegate (TypeVar.create Var)) rank)
+  | 63 -> Delegate (indexed_func_type struc)
+  | 66 -> make_array (Delegate (indexed_func_type struc)) rank
+  | 67 -> Ref (Delegate (indexed_func_type struc))
+  | 69 -> Ref (make_array (Delegate (indexed_func_type struc)) rank)
   | 71 -> HllFunc2
   | 74 -> HllParam
   | 75 -> Ref HllParam
@@ -214,8 +226,8 @@ let create_ain11 enum ~struc ~subtype =
   | 21 -> Ref (Struct struc)
   | 47 -> Bool
   | 51 -> Ref Bool
-  | 63 -> Delegate (TypeVar.create Var)
-  | 67 -> Ref (Delegate (TypeVar.create Var))
+  | 63 -> Delegate (indexed_func_type struc)
+  | 67 -> Ref (Delegate (indexed_func_type struc))
   | 79 -> Array (Option.value_exn subtype)
   | 80 -> Ref (Array (Option.value_exn subtype))
   | 82 -> FatRef (Option.value_exn subtype)

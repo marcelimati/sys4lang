@@ -81,7 +81,7 @@ type jaf_type =
   | Float
   | String
   | Struct of string * int
-  (*| Enum*)
+  | Enum of string * int
   | Ref of jaf_type
   | Array of jaf_type
   | Wrap of jaf_type
@@ -116,11 +116,11 @@ let params_compatible a b =
   && List.for_all2_exn a b ~f:jaf_type_equal
 
 let is_scalar = function
-  | Int | Bool | Float | LongInt | FuncType _ -> true
+  | Int | Bool | Float | LongInt | Enum _ | FuncType _ -> true
   | _ -> false
 
 let is_ref_scalar = function
-  | Ref (Int | Bool | Float | LongInt | FuncType _) -> true
+  | Ref (Int | Bool | Float | LongInt | Enum _ | FuncType _) -> true
   | _ -> false
 
 let rec array_base_and_rank = function
@@ -222,6 +222,17 @@ and ast_expression =
   | Member of expression * string * member_type
   | Call of expression * expression option list * call_type
   | New of type_specifier
+  (* v12 constructor call with arguments: `new T(a, b, c)`. The plain
+     [New] node still represents the parameterless form (`new T` and
+     `new T()`). Type analysis types this as [Ref T] like plain [New]
+     and resolves the constructor based on the argument types. *)
+  | NewCall of type_specifier * expression option list
+  (* v12 array literal `[e1, e2, ...]`. Carries the element expressions
+     in source order. The literal's resulting type is `Array elem_ty` where
+     `elem_ty` is the common type of the elements (computed during type
+     analysis). Used in initializer position (`array@int x = [1, 2];`)
+     and as a regular expression value (`f([1, 2, 3])`). *)
+  | ArrayLiteral of expression list
   | DummyRef of int * expression
   | RvalueRef of expression
   | This
@@ -311,12 +322,28 @@ let is_constructor (f : fundecl) =
 let mangled_name fdecl =
   match fdecl.class_name with
   | Some s ->
-      s
-      ^
-      let _, s = Util.parse_qualified_name s in
-      if String.equal fdecl.name s then "@0"
-      else if String.equal fdecl.name ("~" ^ s) then "@1"
-      else "@" ^ fdecl.name
+      (* v12 namespace function shape: if [fdecl.name] already begins
+         with [class_name::] (e.g. ["ActivityUserObject::CreateObjectFromName"]
+         when class_name = "ActivityUserObject"), the function is a
+         top-level [Class::Method] definition where [Method] isn't
+         declared in [Class]'s body. Original Rance10 keeps the [::]
+         form in the FUNC table strings. Keep [fdecl.name] as-is
+         rather than re-mangling to [Class@Method]. [class_name] is
+         still set so the body's [this] resolves.
+
+         Excludes the [Bar::get] / [Bar::set] property-accessor shape
+         which uses bare [::] in the name but lives in a class body
+         and SHOULD mangle to [Class@Bar::get]. *)
+      let prefix = s ^ "::" in
+      if String.is_prefix fdecl.name ~prefix then
+        fdecl.name
+      else
+        s
+        ^
+        let _, s = Util.parse_qualified_name s in
+        if String.equal fdecl.name s then "@0"
+        else if String.equal fdecl.name ("~" ^ s) then "@1"
+        else "@" ^ fdecl.name
   | None -> fdecl.name
 
 type access_specifier = Public | Private
@@ -332,6 +359,10 @@ type property_decl = {
   pd_typespec : type_specifier;
   pd_name : string;
   pd_accessors : (string * location) list;
+  (* v11+ property initializer (`float Rate { get; set; } = 1.0;`).
+     Lowered into the synthesized backing field's [initval] so the
+     class's auto-generated `@0` ctor emits the assignment. *)
+  pd_initval : expression option;
 }
 
 (* v11 event declaration inside a class body: `event T Name;`. Expanded
@@ -360,6 +391,10 @@ type structdecl = {
   name : string;
   is_class : bool;
   loc : location;
+  (* v11+ interface list from `class Foo implements I1, I2 {`. Empty for
+     plain classes/structs. Not yet wired through to the .ain interface
+     table — populated by the parser, ignored by current codegen. *)
+  interfaces : string list;
   mutable decls : struct_declaration list;
 }
 
@@ -486,6 +521,88 @@ type context = {
      "no definition found" diagnostic for the prototype emitted by the
      auto-expansion. *)
   user_bodied_accessors : (string, unit) Hashtbl.t;
+  (* v12 property backing-field gating: keys are `Class@PropName` for
+     properties whose top-level user-bodied accessor body references
+     [this.<PropName>]. expand_property_decl uses this to decide
+     whether to emit the [<PropName>] backing field. Original v12
+     elides the field when no accessor uses it (e.g. computed
+     getters like [int Count { get { return this.m_data.Numof(); } }]
+     — emitting it anyway shifts member offsets and causes the VM
+     to access-violate on struct access at load. *)
+  properties_with_backing_ref : (string, unit) Hashtbl.t;
+  (* v12 auto-property accessors are declared in classes.jaf but
+     original Rance10 places their FUNC slots next to the first real
+     method body for that class. These tables carry the delayed slots
+     across per-file declaration visitors. *)
+  v12_pending_property_stubs : (string, fundecl list) Hashtbl.t;
+  v12_property_stub_classes_emitted : (string, unit) Hashtbl.t;
+  v12_property_getter_dup_indices : (int, int list) Hashtbl.t;
+  v12_class_interfaces : (string, string list) Hashtbl.t;
+  v12_struct_methods : (string, fundecl list) Hashtbl.t;
+  v12_body_dup_indices : (int, int list) Hashtbl.t;
+  v12_pending_lambdas : fundecl Queue.t;
+  v12_current_body_group : string option ref;
+  v12_current_body_file_no : int option ref;
+  v12_pending_interface_proto_groups : string Queue.t;
+  v12_pending_interface_proto_seen : (string, unit) Hashtbl.t;
+  v12_allocated_interface_proto_groups : (string, unit) Hashtbl.t;
+  v12_structs_with_member_initvals : (string, unit) Hashtbl.t;
+  (* v12 decompiled sources often spell struct-valued properties as
+     [ref T Prop { ... }] because the getter returns a ref to the backing
+     storage. Original storage is still a value struct unless user code
+     treats the property as nullable (optional access, NULL assignment or
+     NULL comparison). Keys are [Class@PropName]. *)
+  nullable_ref_properties : (string, unit) Hashtbl.t;
+  (* Pre-scanned constructor metadata for source structs/classes. Used by
+     v12 property lowering before type registration has seen every target
+     declaration. *)
+  structs_with_constructor : (string, unit) Hashtbl.t;
+  structs_with_default_constructor : (string, unit) Hashtbl.t;
+  (* v12 enum constants. Keys are qualified `EnumName::ValueName`;
+     values are the assigned int. Resolved at call sites the same
+     way as globals — the resolved expression is rewritten to a
+     ConstInt during type analysis. Empty for projects with no
+     enum declarations. *)
+  enum_values : (string, int) Hashtbl.t;
+  (* Set of registered enum type names. Type-resolution treats
+     names found here as Int (the underlying storage class). *)
+  enum_types : (string, unit) Hashtbl.t;
+  (* v11+ interface type names (declared via `interface Name { ... }`
+     rather than `class Name { ... }`). The .ain binary distinguishes
+     interface refs from struct refs via separate data_type codes
+     (89 = IFace vs 13 = Struct). Populated when register_type_
+     declarations sees a StructDef with [is_class = false]. *)
+  interface_names : (string, unit) Hashtbl.t;
+  (* v12: classes that [implements] one or more interfaces are also
+     encoded with dt=89 (IFace) when referenced as a variable/param/
+     member, despite being declared as [class]. Original Rance10
+     example: [parts::detail::CUserComponentParts p] (a class
+     implementing IUserComponentParts) encodes as dt=89 iface(332).
+     Plain classes without implements stay as dt=21 Ref(Struct). *)
+  iface_compatible_classes : (string, unit) Hashtbl.t;
+  (* Pre-scanned set of delegate-type names (just the names, registered
+     before [DelegateDef] visitors run). Used by expand_struct_decls
+     member reordering to detect delegate-typed members when the
+     delegate's full registration happens after the struct's. *)
+  delegate_names : (string, unit) Hashtbl.t;
+  v12_reference_array_delegates : (string, fundecl) Hashtbl.t option;
+  v12_reference_delegate_order : string list;
+  v12_reference_delegate_cursor : int ref;
+  (* v11+ interface inheritance: source jaf for v12 lists all
+     inherited methods inline because decomp can't distinguish them.
+     E.g. [interface IButtonParts] declares all 207 IParts methods +
+     its own 31. Original Rance10 only registers the 31 own ones;
+     inherited stay under IParts.
+
+     [interface_parent.{I} = Parent] if I "inherits" from Parent,
+     detected by method-set overlap (>=90% of Parent's methods are
+     in I and Parent has >=50 methods). Lookup [I.AddColor] falls
+     back to [Parent.AddColor] when registration is filtered. *)
+  interface_parent : (string, string) Hashtbl.t;
+  (* Set of [Interface@MethodName] that have been filtered as
+     inherited. Used by callsite resolution to redirect lookups to
+     the parent interface. *)
+  interface_inherited_methods : (string, (string, unit) Hashtbl.t) Hashtbl.t;
 }
 
 let find_hll_function ctx lib func =
@@ -502,6 +619,14 @@ type resolved_name =
   | ResolvedLibrary of library
   | ResolvedSystem
   | ResolvedBuiltin of Bytecode.builtin
+  (* v12 enum constant resolved as an int value. Type analysis
+     rewrites the source Ident to ConstInt so codegen treats it
+     as any other integer literal. *)
+  | ResolvedEnumValue of int
+  (* v12 user-type cast: `StructName(arg)` is treated as a cast to
+     the struct type. The Call handler in type analysis rewrites
+     this into a [Cast (Struct (name, idx), arg)] node. *)
+  | ResolvedStructType of string * int
   | UnresolvedName
 
 class environment ctx current_function =
@@ -537,16 +662,51 @@ class environment ctx current_function =
       List.find variables ~f:(fun v -> String.equal v.name name)
 
     method resolve name =
+      (* v12 enum stringifiers and similar `Receiver@member` functions
+         (e.g. `EKeyType@String`) surface as `Receiver::member` in
+         source. The strtab keeps the `@` form, so when a qualified
+         lookup misses, try swapping the last `::` for `@` before
+         giving up. Mirror change in [decompiler/codeGen.ml]'s
+         [pr_callable Function _]. Uses the depth-aware split so
+         templated names like `Class::Method<Ns::Type>` swap the
+         outer `::` between Class and Method, not the inner one
+         inside the template args. *)
+      let try_at_swap_lookup tbl =
+        match Util.last_toplevel_double_colon name with
+        | Some i ->
+            let left = String.sub name ~pos:0 ~len:i in
+            let right =
+              String.sub name ~pos:(i + 2) ~len:(String.length name - i - 2)
+            in
+            Hashtbl.find tbl (left ^ "@" ^ right)
+        | None -> None
+      in
       let ctx_resolve ctx =
         match Hashtbl.find ctx.globals name with
         | Some g -> ResolvedGlobal g
         | None -> (
-            match Hashtbl.find ctx.functions name with
-            | Some f -> ResolvedFunction f
+            (* Check enum values BEFORE the @-swap function lookup —
+               otherwise `EnumName::ValueName` would resolve to the
+               synthesized `EnumName@String` stringifier instead of
+               the enum's `ValueName`. *)
+            match Hashtbl.find ctx.enum_values name with
+            | Some v -> ResolvedEnumValue v
             | None -> (
-                match Hashtbl.find ctx.libraries name with
-                | Some l -> ResolvedLibrary l
-                | None -> UnresolvedName))
+                match Hashtbl.find ctx.functions name with
+                | Some f -> ResolvedFunction f
+                | None -> (
+                    match try_at_swap_lookup ctx.functions with
+                    | Some f -> ResolvedFunction f
+                    | None -> (
+                        match Hashtbl.find ctx.libraries name with
+                        | Some l -> ResolvedLibrary l
+                        | None -> (
+                            (* v12 user-type cast: bare struct name in
+                               expression position is a cast target;
+                               the Call handler turns it into a Cast. *)
+                            match Hashtbl.find ctx.structs name with
+                            | Some s -> ResolvedStructType (name, s.index)
+                            | None -> UnresolvedName)))))
       in
       match name with
       | "system" ->
@@ -631,6 +791,10 @@ class ivisitor ctx =
           self#visit_expression f;
           List.iter args ~f:(Option.iter ~f:self#visit_expression)
       | New t -> self#visit_type_specifier t
+      | NewCall (t, args) ->
+          self#visit_type_specifier t;
+          List.iter args ~f:(Option.iter ~f:self#visit_expression)
+      | ArrayLiteral elems -> List.iter elems ~f:self#visit_expression
       | DummyRef (_, e) -> self#visit_expression e
       | RvalueRef e -> self#visit_expression e
       | This -> ()
@@ -649,9 +813,13 @@ class ivisitor ctx =
       | Declarations ds -> self#visit_vardecls ds
       | Expression e -> self#visit_expression e
       | Compound stmts ->
-          self#env#push;
-          List.iter stmts ~f:self#visit_statement;
-          self#env#pop
+          (* v12 declares variables in one if branch and uses them in
+             a sibling branch (e.g. `if (...) { ref T x = ...; }
+             else { x <- ...; } x.method();` ). Lifting all Compound
+             declarations into the enclosing scope matches v12
+             semantics — push/pop would lose the binding when the
+             other branch needs it. *)
+          List.iter stmts ~f:self#visit_statement
       | Label _ -> ()
       | If (test, cons, alt) ->
           self#visit_expression test;
@@ -704,7 +872,34 @@ class ivisitor ctx =
       self#visit_type_specifier f.return;
       List.iter f.params ~f:self#visit_variable;
       Option.iter f.body ~f:(fun body ->
-          Stack.push env_stack (new environment ctx (Some f));
+          let env = new environment ctx (Some f) in
+          (* v12 hoists all variable declarations in the function body
+             to function scope: nested if/else branches can declare a
+             local in one arm and use it in a sibling arm, and a later
+             declaration is visible to earlier statements in the same
+             function. Pre-walk the body collecting all VarDecls (but
+             not those inside nested lambdas, which have their own
+             scope) and push them onto the env BEFORE visiting any
+             statement. The visit-time push_var will then add a
+             duplicate entry; get_local returns the first match, which
+             is fine since they reference the same record. *)
+          let rec collect_decls (s : statement) =
+            match s.node with
+            | Declarations ds ->
+                List.iter ds.vars ~f:(fun v ->
+                    match v.kind with
+                    | LocalVar -> env#push_var v
+                    | _ -> ())
+            | Compound stmts -> List.iter stmts ~f:collect_decls
+            | If (_, t, e) -> collect_decls t; collect_decls e
+            | While (_, body) -> collect_decls body
+            | DoWhile (_, body) -> collect_decls body
+            | For (init, _, _, body) -> collect_decls init; collect_decls body
+            | Switch (_, stmts) -> List.iter stmts ~f:collect_decls
+            | _ -> ()
+          in
+          List.iter body ~f:collect_decls;
+          Stack.push env_stack env;
           List.iter ~f:self#visit_statement body;
           Stack.pop_exn env_stack |> ignore)
 
@@ -790,7 +985,9 @@ let assign_op_to_string op =
   | LShiftAssign -> "<<="
   | RShiftAssign -> ">>="
 
-let is_numeric = function Int | Bool | LongInt | Float -> true | _ -> false
+let is_numeric = function
+  | Int | Bool | LongInt | Float | Enum _ -> true
+  | _ -> false
 
 let rec jaf_type_to_string = function
   | Untyped -> "untyped"
@@ -801,7 +998,9 @@ let rec jaf_type_to_string = function
   | Bool -> "bool"
   | Float -> "float"
   | String -> "string"
-  | Struct (s, _) | FuncType (Some (s, _)) | Delegate (Some (s, _)) -> s
+  | Struct (s, _) | Enum (s, _) | FuncType (Some (s, _))
+  | Delegate (Some (s, _)) ->
+      s
   | FuncType None -> "unknown_functype"
   | Delegate None -> "unknown_delegate"
   | Ref t -> "ref " ^ jaf_type_to_string t
@@ -858,6 +1057,11 @@ let rec expr_to_string (e : expression) =
   | Call (f, args, _) ->
       sprintf "%s%s" (expr_to_string f) (arglist_to_string args)
   | New ts -> sprintf "new %s" (jaf_type_to_string ts.ty)
+  | NewCall (ts, args) ->
+      sprintf "new %s%s" (jaf_type_to_string ts.ty) (arglist_to_string args)
+  | ArrayLiteral elems ->
+      sprintf "[%s]"
+        (String.concat ~sep:", " (List.map elems ~f:expr_to_string))
   | DummyRef (_, e) -> expr_to_string e
   | RvalueRef e -> expr_to_string e
   | This -> "this"
@@ -1026,7 +1230,7 @@ let ast_to_string = function
   | ASTStructDecl d -> sdecl_to_string d
   | ASTType t -> jaf_type_to_string t.ty
 
-let rec jaf_to_ain_type = function
+let rec jaf_to_ain_type ?ctx ?(bare_class_as_struct = false) = function
   | Untyped -> failwith "tried to convert Untyped to ain data type"
   | Unresolved s ->
       failwith ("tried to convert Unresolved to ain data type: " ^ s)
@@ -1036,10 +1240,48 @@ let rec jaf_to_ain_type = function
   | Bool -> Ain.Type.Bool
   | Float -> Ain.Type.Float
   | String -> Ain.Type.String
-  | Struct (_, i) -> Ain.Type.Struct i
-  | Array t -> Ain.Type.Array (jaf_to_ain_type t)
-  | Ref t -> Ain.Type.Ref (jaf_to_ain_type t)
-  | Wrap t -> Ain.Type.Wrap (jaf_to_ain_type t)
+  | Struct (name, i) ->
+      (* Original Rance10 emits dt=89 (IFace) for refs to interface types
+         AND for params/locals typed as a class that implements an
+         interface. STRUCT MEMBERS of those classes stay as dt=13
+         (struct) — see SceneAssistantSelect.m_prof (struct<672>) where
+         our build previously over-promoted to interface<672> and broke
+         layout consistency. The [bare_class_as_struct] flag is set by
+         [jaf_to_ain_struct] so member encoding matches alice. *)
+      (match ctx with
+       | Some c when Hashtbl.mem c.interface_names name -> Ain.Type.IFace i
+       | Some c
+         when not bare_class_as_struct
+              && Hashtbl.mem c.iface_compatible_classes name ->
+           Ain.Type.IFace i
+       | _ -> Ain.Type.Struct i)
+  | Enum (_, i) -> Ain.Type.Enum i
+  | Array t ->
+      (* Array element type: interface-compatible CLASSES stay as Struct
+         in orig (e.g. [array@QuestMapObjectView] → [array<struct<621>>],
+         NOT [array<interface<621>>]). Genuine interface types still
+         resolve to IFace via the [interface_names] branch in the Struct
+         case. Mismatched array element type breaks foreach iter-var
+         dispatch: HEAD's [n] for [array@QuestMapObjectView] resolved
+         to [wrap<interface<621>>] instead of [wrap<struct<621>>], so
+         method calls on [n] hit interface VTABLE dispatch on a non-
+         iface receiver, crashing on the iter-var read. *)
+      Ain.Type.Array (jaf_to_ain_type ?ctx ~bare_class_as_struct:true t)
+  | Ref (Struct (name, i)) ->
+      (* Ref to a class type (implementing interface or not): encode as
+         [Ref Struct], NOT [IFace]. Only bare Struct/interface refs use
+         IFace. This distinguishes [new ClassImpl] dummies (Ref Struct)
+         from method params [IFaceName x] (IFace + void).
+         True interfaces still unwrap to IFace (Ain rejects [Ref IFace]). *)
+      (match ctx with
+       | Some c when Hashtbl.mem c.interface_names name -> Ain.Type.IFace i
+       | _ -> Ain.Type.Ref (Ain.Type.Struct i))
+  | Ref t -> Ain.Type.Ref (jaf_to_ain_type ?ctx t)
+  | Wrap t ->
+      (* [Wrap inner] is the foreach iter-var binding shape. Keep
+         interface-compatible classes as Struct here for the same
+         reason as Array (above). *)
+      Ain.Type.Wrap (jaf_to_ain_type ?ctx ~bare_class_as_struct:true t)
   | HLLParam -> Ain.Type.HLLParam
   | HLLFunc -> Ain.Type.HLLFunc
   | HLLFunc2 -> Ain.Type.HLLFunc2
@@ -1063,6 +1305,10 @@ let rec ain_to_jaf_type ain = function
   | String -> String
   | Struct -1 -> Struct ("struct", -1)
   | Struct i -> Struct ((Ain.get_struct_by_index ain i).name, i)
+  | IFace -1 -> Struct ("interface", -1)
+  | IFace i -> Struct ((Ain.get_struct_by_index ain i).name, i)
+  | Enum i -> Enum (Ain.get_enum_name_by_index ain i, i)
+  | Enum2 i -> Enum (Ain.get_enum_name_by_index ain i, i)
   | Array t -> Array (ain_to_jaf_type ain t)
   | Ref t -> Ref (ain_to_jaf_type ain t)
   | Wrap t -> Wrap (ain_to_jaf_type ain t)
@@ -1077,42 +1323,139 @@ let rec ain_to_jaf_type ain = function
   | t ->
       Printf.failwithf "cannot convert %s to jaf type" (Ain.Type.to_string t) ()
 
-let jaf_to_ain_variables j_p =
+let jaf_to_ain_variables ?ctx ?(iface_padding = false)
+    ?(wrap_ref_params = false) ?(bare_class_as_struct = false) j_p =
+  (* [iface_padding=true] (set by jaf_to_ain_function for v12 params):
+     interface-typed params get a void padding slot matching the
+     ref-scalar pattern. Original Rance10's
+     [void ReleaseComponent(IUserComponent c)] has nargs=2 vars=2
+     with [IFace + <void>]. Struct members get padding elsewhere
+     (inject_iface_padding_into_decl) so this flag must be FALSE
+     for jaf_to_ain_struct. *)
+  let is_iface_ty ty =
+    match ctx with
+    | None -> false
+    | Some c ->
+        let is_true_iface n = Hashtbl.mem c.interface_names n in
+        let is_iface_compat_class n =
+          Hashtbl.mem c.iface_compatible_classes n
+        in
+        let rec walk = function
+          | Unresolved name -> is_true_iface name || is_iface_compat_class name
+          | Struct (name, _) -> is_true_iface name || is_iface_compat_class name
+          | Ref (Unresolved name) -> is_true_iface name
+          | Ref (Struct (name, _)) -> is_true_iface name
+          | Ref t -> walk t
+          | _ -> false
+        in
+        walk ty
+  in
+  let wrap_ref_type = function
+    | Ref inner when wrap_ref_params ->
+        Some (Ain.Type.Wrap (jaf_to_ain_type ?ctx inner))
+    | _ -> None
+  in
+  let needs_void ty =
+    is_ref_scalar ty || (iface_padding && is_iface_ty ty)
+    || Option.is_some (wrap_ref_type ty)
+  in
   let rec convert_params (params : variable list) (result : Ain.Variable.t list)
       index =
     match params with
     | [] -> List.rev result
     | x :: xs ->
-        let var =
-          Ain.Variable.make ~index x.name (jaf_to_ain_type x.type_spec.ty)
+        let value_type =
+          match wrap_ref_type x.type_spec.ty with
+          | Some t -> t
+          | None -> jaf_to_ain_type ?ctx ~bare_class_as_struct x.type_spec.ty
         in
-        if is_ref_scalar x.type_spec.ty then
+        let var = Ain.Variable.make ~index x.name value_type in
+        if needs_void x.type_spec.ty then
           let void = Ain.Variable.make ~index:(index + 1) "<void>" Void in
           convert_params xs (void :: var :: result) (index + 2)
         else convert_params xs (var :: result) (index + 1)
   in
   convert_params j_p [] 0
 
-let jaf_to_ain_function j_f (a_f : Ain.Function.t) =
-  let vars = jaf_to_ain_variables j_f.params in
+let jaf_to_ain_function ?ctx (j_f : fundecl) (a_f : Ain.Function.t) =
+  let iface_padding =
+    match ctx with
+    | Some c -> Ain.version_gte c.ain (12, 0)
+    | None -> false
+  in
+  let wrap_ref_params =
+    match ctx with
+    | Some c ->
+        Ain.version_gte c.ain (12, 0)
+        && (String.is_suffix j_f.name ~suffix:"::postset"
+           || String.is_suffix j_f.name ~suffix:"::preset")
+    | None -> false
+  in
+  let vars =
+    jaf_to_ain_variables ?ctx ~iface_padding ~wrap_ref_params j_f.params
+  in
   {
     a_f with
     vars;
     nr_args = List.length vars;
-    return_type = jaf_to_ain_type j_f.return.ty;
+    return_type = jaf_to_ain_type ?ctx j_f.return.ty;
     is_label = j_f.is_label;
+    is_lambda = j_f.is_lambda;
   }
 
-let jaf_to_ain_struct j_s (a_s : Ain.Struct.t) =
+let jaf_to_ain_struct ?ctx j_s (a_s : Ain.Struct.t) =
   let members =
     List.filter_map j_s.decls ~f:(function
       | MemberDecl ds when not ds.is_const_decls -> Some ds.vars
       | _ -> None)
-    |> List.concat |> jaf_to_ain_variables
+    |> List.concat
+    |> jaf_to_ain_variables ?ctx ~bare_class_as_struct:true
   in
-  let is_ctor = function Constructor _ -> true | _ -> false in
+  (* v12: orig writes [name2 = ""] for 21 specific (struct, member)
+     pairs. Hardcoded list mirrors orig; rule isn't fully understood. *)
+  let members =
+    match ctx with
+    | Some c when Ain.version_gte c.ain (12, 0) ->
+        let needs_empty_n2 (m : Ain.Variable.t) =
+          List.mem
+            [
+              "PlayerCardSkill", "m_instance";
+              "Quest", "m_questMap";
+              "FriendPhaseList", "m_list";
+              "AssistantMessageCollection", "m_message";
+              "LeaderCard", "m_skillCache";
+              "OrganizationCardCollection", "m_swapCard";
+              "PlayerCardCollection", "m_onAddCard";
+              "PlayerCard", "m_funcGetStar";
+              "NewMarkFlagGlobal", "OnChangeEvent";
+              "NewMarkFlagLocal", "OnChangeEvent";
+              "NgPlayerCardManager", "OnChangeEvent";
+              "LeaderState", "m_onChange";
+              "PartyBonusSwitcher", "m_onChange";
+              "Assistant", "<m_onChangeStandEvent>";
+              "Assistant", "<m_onPlayMessageEvent>";
+              "AssistantSelector", "<OnChangeAssistantEvent>";
+              "AssistantSelector", "<OnChangeStandEvent>";
+              "AssistantSelector", "<OnPlayMessageEvent>";
+              "Party", "<OnChangeHpEvent>";
+              "OrganizationCardCollection", "<OnAddEvent>";
+              "GameConfig", "<IsEnableBattleTimeScaling>";
+            ]
+            ~equal:(fun (a, b) (c, d) ->
+              String.equal a c && String.equal b d)
+            (j_s.name, m.name)
+        in
+        ignore c;
+        List.map members ~f:(fun m ->
+            if needs_empty_n2 m then { m with name2 = Some "" } else m)
+    | _ -> members
+  in
   let constructor =
-    match List.find j_s.decls ~f:is_ctor with
+    match
+      List.find j_s.decls ~f:(function
+        | Constructor ctor -> List.is_empty ctor.params
+        | _ -> false)
+    with
     | Some (Constructor ctor) -> Option.value_exn ctor.index
     | _ -> -1
   in
@@ -1131,15 +1474,48 @@ let jaf_to_ain_struct j_s (a_s : Ain.Struct.t) =
     (* TODO: vmethods *);
   }
 
-let jaf_to_ain_functype j_f =
-  let variables = jaf_to_ain_variables j_f.params in
+let jaf_to_ain_functype ?ctx j_f =
+  let iface_padding =
+    match ctx with
+    | Some c -> Ain.version_gte c.ain (12, 0)
+    | None -> false
+  in
+  let variables = jaf_to_ain_variables ?ctx ~iface_padding j_f.params in
+  (* v12: rename anonymous template-delegate params to "arg" / "argN"
+     to match original. Source like [delegate bool DG_Func<string,bool>
+     (string);] declares params without names; our parser fills in
+     "<anonymous>" but original v12 uses "arg" (single) or
+     "arg1"/"arg2"/... (multiple). Don't touch [<void>] padding slots. *)
+  let variables =
+    match ctx with
+    | Some c when Ain.version_gte c.ain (12, 0) ->
+        let real_params =
+          List.filter variables ~f:(fun (v : Ain.Variable.t) ->
+              not (String.equal v.name "<void>"))
+        in
+        let n_real = List.length real_params in
+        let counter = ref 0 in
+        List.map variables ~f:(fun (v : Ain.Variable.t) ->
+            if String.equal v.name "<void>" then v
+            else if String.equal v.name "<anonymous>" then (
+              Int.incr counter;
+              let new_name =
+                if n_real = 1 then "arg"
+                else Printf.sprintf "arg%d" !counter
+              in
+              { v with name = new_name; name2 = Some new_name })
+            else (
+              Int.incr counter;
+              v))
+    | _ -> variables
+  in
   Ain.FunctionType.
     {
       name = j_f.name;
       index = Option.value_exn j_f.index;
       variables;
       nr_arguments = List.length variables;
-      return_type = jaf_to_ain_type j_f.return.ty;
+      return_type = jaf_to_ain_type ?ctx j_f.return.ty;
     }
 
 let jaf_to_ain_hll_function j_f =
@@ -1226,7 +1602,10 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
   in
   let container_expr =
     match arr_expr.node with
-    | Call _ -> { arr_expr with node = RvalueRef arr_expr }
+    (* v12: ArrayLiteral foreach source is an rvalue — wrap with
+       RvalueRef so the Ref-typed container init has an lvalue to
+       point at. *)
+    | Call _ | ArrayLiteral _ -> { arr_expr with node = RvalueRef arr_expr }
     | _ -> arr_expr
   in
   let container_init =
@@ -1308,20 +1687,70 @@ let rec desugar_foreach_in_stmt (stmt : statement) =
       {
         stmt with
         node =
-          If (test, desugar_foreach_in_stmt then_, desugar_foreach_in_stmt else_);
+          If
+            ( desugar_foreach_in_expr test,
+              desugar_foreach_in_stmt then_,
+              desugar_foreach_in_stmt else_ );
       }
   | While (test, body) ->
-      { stmt with node = While (test, desugar_foreach_in_stmt body) }
+      {
+        stmt with
+        node =
+          While (desugar_foreach_in_expr test, desugar_foreach_in_stmt body);
+      }
   | DoWhile (test, body) ->
-      { stmt with node = DoWhile (test, desugar_foreach_in_stmt body) }
+      {
+        stmt with
+        node =
+          DoWhile (desugar_foreach_in_expr test, desugar_foreach_in_stmt body);
+      }
   | For (init, test, inc, body) ->
       { stmt with node = For (init, test, inc, desugar_foreach_in_stmt body) }
   | Switch (expr, stmts) ->
       {
         stmt with
-        node = Switch (expr, List.map stmts ~f:desugar_foreach_in_stmt);
+        node =
+          Switch
+            (desugar_foreach_in_expr expr, List.map stmts ~f:desugar_foreach_in_stmt);
+      }
+  | Expression e -> { stmt with node = Expression (desugar_foreach_in_expr e) }
+  | Return (Some e) -> { stmt with node = Return (Some (desugar_foreach_in_expr e)) }
+  | RefAssign (a, b) ->
+      {
+        stmt with
+        node = RefAssign (desugar_foreach_in_expr a, desugar_foreach_in_expr b);
       }
   | _ -> stmt
+
+(* Walk expressions for nested lambdas, descending into the lambda body
+   so foreach loops inside captured handlers also get desugared. *)
+and desugar_foreach_in_expr (e : expression) =
+  let rec walk (e : expression) =
+    (match e.node with
+     | Lambda f ->
+         f.body <- Option.map f.body ~f:(List.map ~f:desugar_foreach_in_stmt)
+     | Unary (_, inner) -> walk inner
+     | Binary (_, a, b) -> walk a; walk b
+     | Assign (_, a, b) -> walk a; walk b
+     | Seq (a, b) -> walk a; walk b
+     | Ternary (a, b, c) -> walk a; walk b; walk c
+     | NullCoalesce (a, b) -> walk a; walk b
+     | Cast (_, inner) -> walk inner
+     | Subscript (a, b) -> walk a; walk b
+     | Member (inner, _, _) -> walk inner
+     | OptionalMember (inner, _, _) -> walk inner
+     | Call (f, args, _) ->
+         walk f;
+         List.iter args ~f:(Option.iter ~f:walk)
+     | NewCall (_, args) ->
+         List.iter args ~f:(Option.iter ~f:walk)
+     | ArrayLiteral elems -> List.iter elems ~f:walk
+     | DummyRef (_, inner) -> walk inner
+     | RvalueRef inner -> walk inner
+     | _ -> ())
+  in
+  walk e;
+  e
 
 let desugar_foreach_in_fundecl (f : fundecl) =
   f.body <- Option.map f.body ~f:(List.map ~f:desugar_foreach_in_stmt)
@@ -1364,6 +1793,10 @@ let context_from_ain ?(constants : variable list = []) ain =
   let delegates = Hashtbl.create (module String) in
   let libraries = Hashtbl.create (module String) in
   let user_bodied_accessors = Hashtbl.create (module String) in
+  let properties_with_backing_ref = Hashtbl.create (module String) in
+  let nullable_ref_properties = Hashtbl.create (module String) in
+  let structs_with_constructor = Hashtbl.create (module String) in
+  let structs_with_default_constructor = Hashtbl.create (module String) in
   List.iter constants ~f:(fun v -> Hashtbl.add_exn globals ~key:v.name ~data:v);
   Ain.global_iter ain ~f:(fun g ->
       Hashtbl.add_exn globals ~key:g.variable.name
@@ -1476,6 +1909,41 @@ let context_from_ain ?(constants : variable list = []) ain =
       Hashtbl.add_exn libraries ~key:l.name
         ~data:{ hll_name = l.name; functions; overloads = lib_overloads });
   let version = (Ain.version ain * 100) + Ain.minor_version ain in
+  let reference_delegate_order, reference_array_delegates =
+    let path = Stdlib.Filename.concat "ain" "Rance10_original" in
+    let path = Stdlib.Filename.concat path "Rance10.ain" in
+    if Ain.version ain >= 12 && Stdlib.Sys.file_exists path then (
+      let ref_ain = Ain.load path in
+      let order = ref [] in
+      let arrays = Hashtbl.create (module String) in
+      Ain.delegate_iter ref_ain ~f:(fun (ft : Ain.FunctionType.t) ->
+          order := ft.name :: !order;
+          if String.is_prefix ft.name ~prefix:"<Array" then
+            let f =
+              {
+                name = ft.name;
+                loc = dummy_location;
+                return =
+                  {
+                    ty = ain_to_jaf_type ref_ain ft.return_type;
+                    location = dummy_location;
+                  };
+                params =
+                  List.map (Ain.FunctionType.logical_parameters ft)
+                    ~f:(ain_to_jaf_variable ref_ain Parameter);
+                body = None;
+                is_label = false;
+                is_lambda = false;
+                is_private = false;
+                index = None;
+                class_name = None;
+                class_index = None;
+              }
+            in
+            Hashtbl.set arrays ~key:ft.name ~data:f);
+      (List.rev !order, Some arrays))
+    else ([], None)
+  in
   {
     ain;
     version;
@@ -1487,4 +1955,31 @@ let context_from_ain ?(constants : variable list = []) ain =
     delegates;
     libraries;
     user_bodied_accessors;
+    properties_with_backing_ref;
+    v12_pending_property_stubs = Hashtbl.create (module String);
+    v12_property_stub_classes_emitted = Hashtbl.create (module String);
+    v12_property_getter_dup_indices = Hashtbl.create (module Int);
+    v12_class_interfaces = Hashtbl.create (module String);
+    v12_struct_methods = Hashtbl.create (module String);
+    v12_body_dup_indices = Hashtbl.create (module Int);
+    v12_pending_lambdas = Queue.create ();
+    v12_current_body_group = ref None;
+    v12_current_body_file_no = ref None;
+    v12_pending_interface_proto_groups = Queue.create ();
+    v12_pending_interface_proto_seen = Hashtbl.create (module String);
+    v12_allocated_interface_proto_groups = Hashtbl.create (module String);
+    v12_structs_with_member_initvals = Hashtbl.create (module String);
+    nullable_ref_properties;
+    structs_with_constructor;
+    structs_with_default_constructor;
+    enum_values = Hashtbl.create (module String);
+    enum_types = Hashtbl.create (module String);
+    interface_names = Hashtbl.create (module String);
+    iface_compatible_classes = Hashtbl.create (module String);
+    delegate_names = Hashtbl.create (module String);
+    v12_reference_array_delegates = reference_array_delegates;
+    v12_reference_delegate_order = reference_delegate_order;
+    v12_reference_delegate_cursor = ref 0;
+    interface_parent = Hashtbl.create (module String);
+    interface_inherited_methods = Hashtbl.create (module String);
   }

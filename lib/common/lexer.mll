@@ -118,6 +118,8 @@ let () =
               "public",       PUBLIC;
               "enum",         ENUM;
               "event",        EVENT;
+              "implements",   IMPLEMENTS;
+              "interface",    INTERFACE;
               "__FILE__",     FILE_MACRO;
               "__LINE__",     LINE_MACRO;
               "__DATE__",     DATE_MACRO;
@@ -222,11 +224,16 @@ rule token = parse
   | ';'                     { SEMICOLON }
   | '@'                     { AT }
   | '#'                     { HASH }
-  | l as c                  { IDENTIFIER(c) }
+  | l as c                  {
+                              if LexerState.is_templated c then maybe_template c lexbuf
+                              else IDENTIFIER(c)
+                            }
   | (l a*) as s             {
                               match Hashtbl.find keyword_table s with
                               | Some kw -> kw
-                              | None -> IDENTIFIER(s)
+                              | None ->
+                                  if LexerState.is_templated s then maybe_template s lexbuf
+                                  else IDENTIFIER(s)
                             }
   | _                       { raise Error }
   | eof                     { EOF }
@@ -236,3 +243,28 @@ and block_comment = parse
   | [^ '\n']  { block_comment lexbuf }
   | ['\n']    { Lexing.new_line lexbuf; block_comment lexbuf }
   | eof       { raise Error }
+
+(* Called immediately after lexing an identifier known to be the base of a
+   templated type. If a `<` follows directly (no whitespace), consume the
+   balanced `<...>` block and emit a single TEMPLATE_IDENTIFIER carrying the
+   full templated name (e.g. "SASPair<string, float>"). Otherwise emit a
+   plain IDENTIFIER so the bare-name case still works. The whitespace gate
+   keeps comparison expressions `a < b > 0` safe — those have spaces. *)
+and maybe_template name = parse
+  | '<' {
+      let buf = Buffer.create 64 in
+      Buffer.add_string buf name;
+      Buffer.add_char buf '<';
+      template_args buf 1 lexbuf;
+      TEMPLATE_IDENTIFIER (Buffer.contents buf)
+    }
+  | "" { IDENTIFIER name }
+
+and template_args buf depth = parse
+  | '<' { Buffer.add_char buf '<'; template_args buf (depth + 1) lexbuf }
+  | '>' { Buffer.add_char buf '>';
+          if depth = 1 then ()
+          else template_args buf (depth - 1) lexbuf }
+  | '\n' { Buffer.add_char buf '\n'; Lexing.new_line lexbuf; template_args buf depth lexbuf }
+  | [^ '<' '>' '\n']+ as s { Buffer.add_string buf s; template_args buf depth lexbuf }
+  | eof { raise Error }

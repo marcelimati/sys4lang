@@ -41,6 +41,7 @@ type cflow_stmt = {
      releases). The "cumulative SH_LOCALDELETE" block visible in
      switch fall-through code comes from this list. *)
   mutable inline_deleted_dummies : int list;
+  mutable switch_break_deleted_dummies : int list;
 }
 
 type scope = { mutable vars : Ain.Variable.t list }
@@ -66,6 +67,23 @@ class jaf_compiler ctx debug_info =
     (* The function currently being compiled. *)
     val mutable current_function : Ain.Function.t option = None
 
+    (* Enclosing functions for the current lambda body, parent-first.
+       Populated when entering a lambda by parsing the lambda's name
+       (the pattern is [Class@<lambda : ParentName(line, col)>]); used
+       by [compile_dereference] for [CapturedVariable] to look up the
+       parent slot's actual ain type, since the lambda-side [expr.ty]
+       drops the [Wrap] wrapper that foreach iteration vars carry. *)
+    val mutable enclosing_functions : Ain.Function.t list = []
+
+    (* v12: true while compiling the expression of a [Return _] stmt.
+       The [ArrayLiteral] DummyRef path consults this to decide whether
+       the literal's backing slot escapes via the return value (drop
+       from [scope.vars] so [end_scope] doesn't free what the caller is
+       about to read) or stays local (keep in [scope.vars] so
+       [end_scope] emits the [Array.Free <slot>] orig requires to keep
+       the slot from leaking past its branch). *)
+    val mutable is_in_return_expr = false
+
     (* The bytecode output buffer. *)
     val mutable buffer = CBuffer.create 2048
 
@@ -86,6 +104,16 @@ class jaf_compiler ctx debug_info =
        list doesn't double-emit [SH_LOCALDELETE] for them. *)
     val mutable inline_deleted_dummies : int list = []
 
+    val mutable last_condition_deleted_dummies : int list = []
+
+    val mutable end_switch_deleted_dummies : int list = []
+
+    val mutable v12_last_use_deleted_vars : int list = []
+
+    val mutable suppress_inline_deleted_scope_cleanup = false
+
+    val mutable block_depth : int = 0
+
     (* v11: lambda body indexes whose JUMP-over-body has already been
        written by [pre_emit_lambda_args] before the enclosing call
        evaluates its arguments. The [Lambda] expression case consults
@@ -95,6 +123,43 @@ class jaf_compiler ctx debug_info =
     val pre_emitted_lambdas : (int, unit) Hashtbl.t =
       Hashtbl.create (module Int)
 
+    (* v12 delegate assignment emits inline lambda bodies before the
+       destination lvalue, matching the original compiler. Keep this
+       separate from [pre_emitted_lambdas], which is also used for
+       argument-lambda queueing. *)
+    val v12_assignment_lambdas : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    (* v12: track duplicate prototype slots we've already emitted a body
+       for, so the recursive compile_function on the dup doesn't try to
+       duplicate the dup. *)
+    val body_dup_emitted : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    val mutable v12_current_body_dup_rank : int option = None
+
+    val mutable v12_iface_local_init_owns_cast_guard = false
+
+    val v12_dummy_slots_initialized : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    (* v12: iface locals whose next statement (after declaration)
+       unconditionally assigns them — original Rance10 skips the
+       NULL-init prefix for these since the assignment overwrites
+       the slot before any read. Populated by [compile_block] before
+       processing the Declarations statement. *)
+    val v12_skip_iface_init : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    (* v12: lambda fundecls deferred for top-level emission. The v12
+       original compiler emits each lambda as a separate function table
+       entry placed AFTER its containing function — not inline via the
+       v11 [JUMP-over-body] idiom. Queue lambdas as they're encountered
+       during caller compilation; drain to top-level emission after the
+       containing non-lambda function's ENDFUNC. Draining a lambda may
+       queue further nested lambdas; the drain loop runs until empty. *)
+    val v12_lambda_queue : Jaf.fundecl Queue.t = Queue.create ()
+
     (* v11 property-setter argument context. Set true while compiling
        arguments for a property setter call (the [DUP_X2 + CALLMETHOD
        + DELETE/POP] idiom). Suppresses [compile_argument]'s [A_REF]
@@ -103,8 +168,10 @@ class jaf_compiler ctx debug_info =
        [SH_LOCALDELETE] without an extra incref. *)
     val mutable in_prop_setter_arg : bool = false
 
+    val mutable bare_new_receiver_uses_default_ctor : bool = false
+
     (* The currentl active scopes. *)
-    val scopes = Stack.create ()
+    val mutable scopes = Stack.create ()
 
     (* Labels/gotos record for the current function. *)
     val mutable labels = Hashtbl.create (module String)
@@ -120,13 +187,37 @@ class jaf_compiler ctx debug_info =
     method end_scope =
       let scope = Stack.pop_exn scopes in
       (* delete scope-local variables *)
-      (* NOTE: Variables are deleted automatically by the VM upon function
-               return. This code is emitted only to ensure that destructors are
-               called at the correct time; hence function-scoped variables need
-               not be deleted here. *)
-      match Stack.top scopes with
-      | None -> ()
-      | Some _ -> List.iter scope.vars ~f:self#compile_delete_var
+      let is_function_scope = Option.is_none (Stack.top scopes) in
+      let vars =
+        List.sort scope.vars ~compare:(fun a b ->
+            Int.descending a.index b.index)
+      in
+      List.iter vars ~f:(fun v ->
+          let already_inline_deleted =
+            Ain.version_gte ctx.ain (12, 0)
+            && (List.mem end_switch_deleted_dummies v.index ~equal:Int.equal
+               || (suppress_inline_deleted_scope_cleanup
+                  && List.mem inline_deleted_dummies v.index
+                       ~equal:Int.equal))
+          in
+          let already_last_use_deleted =
+            Ain.version_gte ctx.ain (12, 0)
+            && List.mem v12_last_use_deleted_vars v.index ~equal:Int.equal
+          in
+          if is_function_scope then
+            (* At function exit, emit no cleanup. Variables are
+               released by the VM's RETURN opcode auto-free. The
+               earlier experiment of emitting an end-of-scope IFace
+               cleanup here (introduced in 51077c2 to address
+               RunIScene's RETURN crash) regressed 10 property getter
+               functions audit-wise and broke menu/survey runtime in
+               c8889e7→HEAD comparison. Keep the function-exit a
+               no-op until the RunIScene RETURN issue is fixed
+               upstream (likely in IFace last-use tracking, not
+               here). *)
+            ()
+          else if already_inline_deleted || already_last_use_deleted then ()
+          else self#compile_delete_var v)
 
     (** Add a variable to the current scope. *)
     method scope_add_var v =
@@ -168,10 +259,16 @@ class jaf_compiler ctx debug_info =
         leaves non-comparison expressions (e.g. a plain [int] or
         dereffed ref) at whatever numeric value they evaluated to,
         and the [Bool] type's runtime cast makes the branch unstable
-        without normalisation. No-op on pre-v11. *)
+        without normalisation. No-op on pre-v11.
+
+        v12: original Rance10 emits only 65 ITOB total across the
+        entire .ain — vs ~15k from this path in ours. The v12 IFZ
+        evidently tolerates non-bool values directly, so skip this
+        condition-side normalisation entirely. *)
     method maybe_emit_condition_itob (test : expression) =
       if
-        Ain.version ctx.ain > 8
+        Ain.version_lt ctx.ain (12, 0)
+        && Ain.version ctx.ain > 8
         && (not (TypeAnalysis.is_bool_producing_expr test))
         && (match test.ty with Bool -> false | _ -> true)
         &&
@@ -190,10 +287,76 @@ class jaf_compiler ctx debug_info =
       match expr.node with
       | Call (_, _, (FunctionCall fno | MethodCall (_, fno))) ->
           Some (Ain.get_function_by_index ctx.ain fno).return_type
+      | Call (_, _, DelegateCall no) ->
+          Some (Ain.function_of_delegate_index ctx.ain no).return_type
       | Call (_, _, HLLCall (lib_no, fun_no)) ->
           let lib = Ain.get_library_by_index ctx.ain lib_no in
           Some lib.functions.(fun_no).return_type
       | _ -> None
+
+    (** v12 ownership classification of a value expression — single
+        source of truth for "does the stacked value carry an owning
+        page-ref that the consumer is about to drop without incref?".
+        Replaces the four ad-hoc DummyRef/Call walks scattered across
+        compile_argument, ArrayLiteral, NullCoalesce, etc.
+
+        - [`Owned]   : producer just created a fresh page (NEW/NEWCALL)
+                      and the value lives only in a synthetic dummy
+                      slot that scope-exit will release. Consumer must
+                      A_REF before storing.
+        - [`Borrowed]: producer is a call whose ain-level return type
+                      is [Ref _] (Array.At, *.First, getter returning
+                      [ref T], ...). Same A_REF need as [`Owned] — the
+                      dummy holds the only stack-side reference.
+        - [`Stable]  : already-incref'd source (member, ident slot,
+                      direct lvalue). No A_REF needed.
+
+        The classifier walks through transparent wrappers (Cast,
+        RvalueRef, DummyRef) before inspecting the producer node, so
+        callers don't have to repeat that boilerplate. *)
+    method expression_ownership (expr : expression) =
+      let is_optional_dispatch (call_expr : expression) =
+        match call_expr.node with
+        | Call ({ node = OptionalMember _; _ }, _, _) -> true
+        | _ -> false
+      in
+      let rec walk (e : expression) =
+        match e.node with
+        | New _ | NewCall _ -> `Owned
+        | DummyRef (_, ({ node = New _ | NewCall _; _ })) -> `Owned
+        | DummyRef (_, ({ node = Call _; _ } as inner)) ->
+            if is_optional_dispatch inner then `Stable
+            else (
+              match self#ain_call_return_type inner with
+              | Some (Ain.Type.Ref _) -> `Borrowed
+              | _ -> (
+                  match inner.ty with
+                  | Ref _ -> `Borrowed
+                  | _ -> `Stable))
+        | DummyRef (_, inner) -> walk inner
+        | Cast (_, inner) | RvalueRef inner -> walk inner
+        | Call _ ->
+            if is_optional_dispatch e then `Stable
+            else (
+              match self#ain_call_return_type e with
+              | Some (Ain.Type.Ref _) -> `Borrowed
+              | _ -> `Stable)
+        | _ -> `Stable
+      in
+      walk expr
+
+    (** True iff the expression's stacked value needs an [A_REF] bump
+        before a v12 consumer that takes ownership without incref-ing
+        (CALLHLL store, ArrayLiteral PushBack, String arg to a
+        ref-receiving HLL). Centralises the
+        [dummy_inner_returns_ref || bare_new_arg] / per-element
+        ArrayLiteral walks into one predicate. *)
+    method needs_a_ref_for_consume (expr : expression) =
+      Ain.version_gte ctx.ain (12, 0)
+      &&
+      match self#expression_ownership expr with
+      | `Owned | `Borrowed -> true
+      | `Stable -> false
 
     (** v11: release every DummyRef slot allocated since [vars_before]
         in the topmost scope, in LIFO (newest-first) order. Records
@@ -205,23 +368,41 @@ class jaf_compiler ctx debug_info =
         observed behaviour of redundantly re-emitting at every exit
         path. *)
     method cleanup_condition_dummyrefs vars_before =
+      last_condition_deleted_dummies <- [];
       if Ain.version ctx.ain > 8 then
         match Stack.top scopes with
         | None -> ()
         | Some scope ->
             let n_new = List.length scope.vars - vars_before in
             if n_new > 0 then (
-              let new_vars = List.take scope.vars n_new in
+              let raw = List.take scope.vars n_new in
+              let new_vars =
+                let filtered =
+                  if Ain.version_gte ctx.ain (12, 0) then
+                    (* v12: skip Array-typed dummies here. They live to
+                       [end_scope] and the [Array.Free <slot>] fires
+                       there. Per-statement cleanup would double-free
+                       the slot's populated array. *)
+                    List.filter raw ~f:(fun (v : Ain.Variable.t) ->
+                        match v.value_type with
+                        | Array _ -> false
+                        | _ -> true)
+                  else raw
+                in
+                if Ain.version_gte ctx.ain (12, 0) then
+                  List.sort filtered ~compare:(fun a b ->
+                      Int.descending a.index b.index)
+                else filtered
+              in
               List.iter new_vars ~f:self#compile_delete_var;
-              List.iter new_vars ~f:(fun v ->
-                  inline_deleted_dummies <-
-                    v.index :: inline_deleted_dummies);
+              let new_idxs = List.map new_vars ~f:(fun v -> v.index) in
+              last_condition_deleted_dummies <- new_idxs;
+              inline_deleted_dummies <- new_idxs @ inline_deleted_dummies;
               match Stack.top cflow_stmts with
               | None -> ()
               | Some s ->
-                  List.iter new_vars ~f:(fun v ->
-                      s.inline_deleted_dummies <-
-                        v.index :: s.inline_deleted_dummies))
+                  s.inline_deleted_dummies <-
+                    new_idxs @ s.inline_deleted_dummies)
 
     (** v11: replay [SH_LOCALDELETE] for every dummy slot that
         [cleanup_condition_dummyrefs] has released in the current
@@ -236,6 +417,42 @@ class jaf_compiler ctx debug_info =
             List.iter s.inline_deleted_dummies ~f:(fun idx ->
                 self#write_instruction1 SH_LOCALDELETE idx)
 
+    method emit_inline_deleted_dummy_cleanup =
+      if Ain.version ctx.ain > 8 then
+        List.iter inline_deleted_dummies ~f:(fun idx ->
+            self#write_instruction1 SH_LOCALDELETE idx)
+
+    method emit_last_condition_dummy_cleanup =
+      if Ain.version ctx.ain > 8 then
+        List.iter last_condition_deleted_dummies ~f:(fun idx ->
+            self#write_instruction1 SH_LOCALDELETE idx)
+
+    method record_switch_break_deleted_vars idxs =
+      if Ain.version ctx.ain > 8 then
+        match Stack.top cflow_stmts with
+        | Some ({ kind = CFlowSwitch _; _ } as s) ->
+            let idxs = List.rev idxs in
+            let idxs =
+              List.filter idxs ~f:(fun idx ->
+                  let v : Ain.Variable.t = self#get_local idx in
+                  String.is_prefix v.name ~prefix:"<dummy")
+            in
+            let idxs =
+              List.filter idxs ~f:(fun idx ->
+                  not
+                    (List.mem s.inline_deleted_dummies idx
+                       ~equal:Int.equal))
+            in
+            let idxs =
+              List.filter idxs ~f:(fun idx ->
+                  not
+                    (List.mem s.switch_break_deleted_dummies idx
+                       ~equal:Int.equal))
+            in
+            s.switch_break_deleted_dummies <-
+              s.switch_break_deleted_dummies @ idxs
+        | _ -> ()
+
     (** Begin a loop. *)
     method start_loop continue_addr =
       Stack.push cflow_stmts
@@ -245,13 +462,14 @@ class jaf_compiler ctx debug_info =
           continue_addrs = [];
           scopes_at_start = Stack.length scopes;
           inline_deleted_dummies = [];
+          switch_break_deleted_dummies = [];
         }
 
     (** Begin a switch statement. *)
     method start_switch ty node =
       let op, case_type =
         match ty with
-        | Jaf.Bool | Int | LongInt -> (SWITCH, Ain.Switch.IntCase)
+        | Jaf.Bool | Int | LongInt | Enum _ -> (SWITCH, Ain.Switch.IntCase)
         | String -> (STRSWITCH, Ain.Switch.StringCase)
         | _ -> compiler_bug "invalid switch type" (Some node)
       in
@@ -263,6 +481,7 @@ class jaf_compiler ctx debug_info =
           continue_addrs = [];
           scopes_at_start = Stack.length scopes;
           inline_deleted_dummies = [];
+          switch_break_deleted_dummies = [];
         };
       self#write_instruction1 op switch.index
 
@@ -301,8 +520,13 @@ class jaf_compiler ctx debug_info =
          match Stack.top cflow_stmts with
          | None -> ()
          | Some s ->
-             List.iter s.inline_deleted_dummies ~f:(fun idx ->
-                 self#write_instruction1 SH_LOCALDELETE idx));
+             let deleted_dummies =
+               s.inline_deleted_dummies @ s.switch_break_deleted_dummies
+             in
+             List.iter deleted_dummies ~f:(fun idx ->
+                 self#write_instruction1 SH_LOCALDELETE idx);
+             end_switch_deleted_dummies <-
+               deleted_dummies @ end_switch_deleted_dummies);
       self#end_cflow_stmt
 
     method add_switch_case expr node =
@@ -381,13 +605,245 @@ class jaf_compiler ctx debug_info =
     method array_element_type_code (ty : Jaf.jaf_type) =
       match ty with
       | Array t | Ref (Array t) ->
-          Ain.Type.int_of_data_type (Ain.version ctx.ain) (jaf_to_ain_type t)
+          Ain.Type.int_of_data_type (Ain.version ctx.ain)
+            (jaf_to_ain_type ~ctx t)
       | _ -> -1
 
+    method array_element_type_code_for_expr (e : expression) =
+      let from_ain_type = function
+        | Ain.Type.Array Ain.Type.HLLParam | Ref (Array Ain.Type.HLLParam) ->
+            self#array_element_type_code e.ty
+        | Ain.Type.Array t | Ref (Array t) ->
+            Ain.Type.int_of_data_type (Ain.version ctx.ain) t
+        | _ -> self#array_element_type_code e.ty
+      in
+      let rec loop (e : expression) =
+        match e.node with
+        | Cast (_, inner) | RvalueRef inner | DummyRef (_, inner) -> loop inner
+        | Call (_, Some receiver :: _, HLLCall _) -> (
+            match self#array_element_type_code e.ty with
+            | -1 | 74 -> loop receiver
+            | t -> t)
+        | Ident (_, LocalVariable (i, _)) ->
+            let v : Ain.Variable.t = self#get_local i in
+            from_ain_type v.value_type
+        | Ident (_, GlobalVariable i) ->
+            let v : Ain.Variable.t = Ain.get_global_by_index ctx.ain i in
+            from_ain_type v.value_type
+        | Member (_, _, ClassVariable _) -> from_ain_type (self#member_type e)
+        | Member ({ node = This; _ }, member_name, _) -> (
+            match current_function with
+            | Some f -> (
+                match String.lsplit2 f.name ~on:'@' with
+                | Some (class_name, _) -> (
+                    match Ain.get_struct ctx.ain class_name with
+                    | Some s -> (
+                        match
+                          List.find s.members ~f:(fun (v : Ain.Variable.t) ->
+                              String.equal v.name member_name
+                              || String.equal v.name ("<" ^ member_name ^ ">"))
+                        with
+                        | Some v -> from_ain_type v.value_type
+                        | None -> self#array_element_type_code e.ty)
+                    | None -> self#array_element_type_code e.ty)
+                | None -> self#array_element_type_code e.ty)
+            | None -> self#array_element_type_code e.ty)
+        | _ -> self#array_element_type_code e.ty
+      in
+      loop e
+
+    method emit_interface_vtable_init class_index =
+      if Ain.version_gte ctx.ain (12, 0) then
+        let s = Ain.get_struct_by_index ctx.ain class_index in
+        if not (List.is_empty s.interfaces) then (
+          let vtable_slot =
+            List.find_mapi s.members ~f:(fun i (v : Ain.Variable.t) ->
+                if String.equal v.name "<vtable>" then Some i else None)
+          in
+          match vtable_slot with
+          | None -> ()
+          | Some vtable_slot ->
+              let total_methods =
+                List.fold s.interfaces ~init:0
+                  ~f:(fun acc (iface : Ain.Struct.interface) ->
+                    let iface_s =
+                      Ain.get_struct_by_index ctx.ain iface.struct_type
+                    in
+                    acc + List.length iface_s.vmethods)
+              in
+              match
+                ( Ain.get_library_index ctx.ain "Array",
+                  Ain.get_library_index ctx.ain "Array"
+                  |> Option.bind ~f:(fun lib_no ->
+                         Ain.get_library_function_index ctx.ain lib_no
+                           "Alloc") )
+              with
+              | Some array_lib, Some array_alloc ->
+                  let vtable = Array.create ~len:total_methods 0 in
+                  List.iter s.interfaces
+                    ~f:(fun (iface : Ain.Struct.interface) ->
+                      let iface_s =
+                        Ain.get_struct_by_index ctx.ain iface.struct_type
+                      in
+                      List.iteri iface_s.vmethods
+                        ~f:(fun i iface_fn_idx ->
+                          let iface_fn =
+                            Ain.get_function_by_index ctx.ain iface_fn_idx
+                          in
+                          let prefix = iface_s.name ^ "@" in
+                          let short_name =
+                            if String.is_prefix iface_fn.name ~prefix then
+                              String.chop_prefix_exn iface_fn.name ~prefix
+                            else iface_fn.name
+                          in
+                          let same_shape (owner : Ain.Struct.t)
+                              (candidate : Ain.Function.t) =
+                            let candidate_short =
+                              let prefix = owner.name ^ "@" in
+                              if String.is_prefix candidate.name ~prefix then
+                                String.chop_prefix_exn candidate.name ~prefix
+                              else candidate.name
+                            in
+                            String.equal candidate_short short_name
+                            && Int.equal candidate.nr_args iface_fn.nr_args
+                          in
+                          let iface_rank =
+                            List.take iface_s.vmethods i
+                            |> List.count ~f:(fun prev_idx ->
+                                   let prev =
+                                     Ain.get_function_by_index ctx.ain prev_idx
+                                   in
+                                   same_shape iface_s prev)
+                          in
+                          let iface_group_count =
+                            List.count iface_s.vmethods ~f:(fun idx ->
+                                let fn =
+                                  Ain.get_function_by_index ctx.ain idx
+                                in
+                                same_shape iface_s fn)
+                          in
+                          let reverse_duplicate_group =
+                            String.is_suffix short_name ~suffix:"::get"
+                            || String.is_suffix short_name ~suffix:"::set"
+                          in
+                          let impl_rank =
+                            if reverse_duplicate_group then
+                              Int.max 0 (iface_group_count - 1 - iface_rank)
+                            else iface_rank
+                          in
+                          let impl_idx =
+                            let rank = ref 0 in
+                            let from_vmethods =
+                              List.find_map s.vmethods ~f:(fun impl_idx ->
+                                  let impl_fn =
+                                    Ain.get_function_by_index ctx.ain impl_idx
+                                  in
+                                  if same_shape s impl_fn then
+                                    if Int.equal !rank impl_rank then
+                                      Some impl_idx
+                                    else (
+                                      Int.incr rank;
+                                      None)
+                                  else None)
+                            in
+                            match from_vmethods with
+                            | Some _ -> from_vmethods
+                            | None ->
+                                let matches = ref [] in
+                                Ain.function_iter ctx.ain ~f:(fun impl_fn ->
+                                    if same_shape s impl_fn then
+                                      matches := impl_fn.index :: !matches);
+                                List.rev !matches |> Fn.flip List.nth impl_rank
+                          in
+                          match impl_idx with
+                          | Some impl_idx ->
+                              vtable.(iface.vtable_offset + i) <- impl_idx
+                          | None -> ()));
+                  self#write_instruction0 PUSHSTRUCTPAGE;
+                  self#write_instruction1 PUSH vtable_slot;
+                  self#write_instruction0 REF;
+                  self#write_instruction0 DUP;
+                  self#write_instruction1 PUSH total_methods;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction3 CALLHLL array_lib array_alloc 10;
+                  Array.iteri vtable ~f:(fun i impl_idx ->
+                      self#write_instruction0 DUP;
+                      self#write_instruction1 PUSH i;
+                      self#write_instruction1 PUSH impl_idx;
+                      self#write_instruction0 ASSIGN;
+                      self#write_instruction0 POP);
+                  self#write_instruction0 POP
+              | _ -> ())
+
+    method private ensure_v12_dummy_slot_initialized var_no =
+      (* EXPERIMENTAL: disabled. diff_opcodes showed sys4lang emits the
+         5-opcode pattern [PUSHLOCALPAGE; PUSH var; PUSH -1; ASSIGN; POP]
+         ~15,495 times more than the original Rance10.ain. The
+         original doesn't emit this pre-init and works at runtime.
+         Removing the pre-init brings the bytecode closer to orig.
+
+         Earlier observation noted that disabling for Ref/Struct
+         broke menu/survey at runtime, but that was caused by the
+         IFace last-use cleanup landing as dead code after RETURN
+         (now fixed in [emit_v12_last_use_cleanup]). With that fixed,
+         the dummy-init disable should also be safe. *)
+      ignore var_no;
+      ()
+
     method write_instruction0 op =
-      CBuffer.write_int16 buffer (int_of_opcode op);
-      self#crc_push_word (int_of_opcode op);
-      current_address <- current_address + 2
+      (* v12 dropped three delegate shorthand opcodes. Original v12 emits
+         these expansions (verified by dasm comparison against original
+         Rance10):
+
+         - [DG_CLEAR] (0xF8): clear a delegate-typed slot.
+             stack before: [dg_lvalue_pageref]
+             v12 form: DG_NEW (push empty dg); DG_ASSIGN; DELETE
+
+         - [DG_SET] (0xF2): assign single method to delegate.
+             stack before: [dg_lvalue_pageref, page=-1, method_idx]
+             v12 form: DG_NEW_FROM_METHOD; DG_ASSIGN; DELETE
+             (the [-1, method_idx] pair already feeds DG_NEW_FROM_METHOD)
+
+         - [DG_ERASE] (0xF7): erase single method from delegate.
+             stack before: [dg_lvalue_pageref, method_idx]
+             v12 form: PUSH -1; SWAP; DG_NEW_FROM_METHOD; DG_MINUSA; DELETE
+             (need to inject the [-1] page argument under method_idx)
+
+         Pre-v12 keeps emitting the shorthand for byte-stability. *)
+      if Ain.version_gte ctx.ain (12, 0) then (
+        match op with
+        | DG_CLEAR ->
+            self#write_instruction0 DG_NEW;
+            self#write_instruction0 DG_ASSIGN;
+            self#write_instruction0 DELETE
+        | DG_SET ->
+            self#write_instruction0 DG_NEW_FROM_METHOD;
+            self#write_instruction0 DG_ASSIGN;
+            self#write_instruction0 DELETE
+        | DG_ERASE ->
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 SWAP;
+            self#write_instruction0 DG_NEW_FROM_METHOD;
+            self#write_instruction0 DG_MINUSA;
+            self#write_instruction0 DELETE
+        | _ ->
+            CBuffer.write_int16 buffer (int_of_opcode op);
+            self#crc_push_word (int_of_opcode op);
+            current_address <- current_address + 2)
+      else (
+        CBuffer.write_int16 buffer (int_of_opcode op);
+        self#crc_push_word (int_of_opcode op);
+        current_address <- current_address + 2)
+
+    (* v12 dropped [CHECKUDO] (opcode 0x78) — the VM rejects it at execute
+       time with "undefined opcode 120". The original v12 compiler emits
+       [DELETE] (0x77) in the same positions (slot release before reassign).
+       Pre-v12 keeps emitting [CHECKUDO] for byte-stability. *)
+    method emit_slot_release =
+      if Ain.version_gte ctx.ain (12, 0) then self#write_instruction0 DELETE
+      else self#write_instruction0 CHECKUDO
 
     method write_instruction1 op arg0 =
       match op with
@@ -401,10 +857,33 @@ class jaf_compiler ctx debug_info =
           self#write_instruction1 PUSH arg0;
           self#write_instruction0 S_MOD
       | _ ->
-          CBuffer.write_int16 buffer (int_of_opcode op);
-          self#crc_push_word (int_of_opcode op);
-          CBuffer.write_int32 buffer arg0;
-          current_address <- current_address + 6
+          (* v12 dropped [SH_LOCALDELETE n] (opcode 0x82). Original v12
+             uses an 8-instruction sequence that releases the held value
+             AND nulls the slot, so the VM's auto-cleanup on function exit
+             doesn't double-release:
+
+               PUSHLOCALPAGE; PUSH n; DUP2; REF; DELETE;
+               PUSH -1; ASSIGN; POP
+
+             The DUP2 keeps a copy of the (page,slot) lvalue on the stack
+             for the ASSIGN at the end. SH_LOCALDELETE call sites in our
+             codegen are all for Ref / Struct slots, so PUSH -1 (NULL
+             page-ref sentinel) is the right empty value. *)
+          if Ain.version_gte ctx.ain (12, 0) && phys_equal op SH_LOCALDELETE
+          then (
+            self#write_instruction0 PUSHLOCALPAGE;
+            self#write_instruction1 PUSH arg0;
+            self#write_instruction0 DUP2;
+            self#write_instruction0 REF;
+            self#write_instruction0 DELETE;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 ASSIGN;
+            self#write_instruction0 POP)
+          else (
+            CBuffer.write_int16 buffer (int_of_opcode op);
+            self#crc_push_word (int_of_opcode op);
+            CBuffer.write_int32 buffer arg0;
+            current_address <- current_address + 6)
 
     method write_instruction1_float op arg0 =
       CBuffer.write_int16 buffer (int_of_opcode op);
@@ -413,11 +892,35 @@ class jaf_compiler ctx debug_info =
       current_address <- current_address + 6
 
     method write_instruction2 op arg0 arg1 =
-      CBuffer.write_int16 buffer (int_of_opcode op);
-      self#crc_push_word (int_of_opcode op);
-      CBuffer.write_int32 buffer arg0;
-      CBuffer.write_int32 buffer arg1;
-      current_address <- current_address + 10
+      (* v12 dropped [SH_LOCALCREATE n sno] (opcode 0x81). Original v12
+         emits [PUSHLOCALPAGE; PUSH n; NEW sno -1; ASSIGN; POP], using
+         ctor=-1 even when a constructor exists — the v12 VM does default
+         init for -1.
+
+         The preceding [SH_LOCALDELETE] (which we already expand to the
+         8-instr release-and-null sequence) leaves the slot at -1, so this
+         expansion just creates the fresh struct and stores it. Original
+         combines both into an 11-instr sequence; we emit them separately
+         (~21 instr total) for simplicity — semantically equivalent. *)
+      if Ain.version_gte ctx.ain (12, 0) && phys_equal op SH_LOCALCREATE
+      then (
+        self#write_instruction0 PUSHLOCALPAGE;
+        self#write_instruction1 PUSH arg0;
+        self#write_instruction0 DUP2;
+        self#write_instruction0 REF;
+        self#write_instruction0 DELETE;
+        self#write_instruction0 DUP2;
+        self#write_instruction2 NEW arg1 (-1);
+        self#write_instruction0 ASSIGN;
+        self#write_instruction0 POP;
+        self#write_instruction0 POP;
+        self#write_instruction0 POP)
+      else (
+        CBuffer.write_int16 buffer (int_of_opcode op);
+        self#crc_push_word (int_of_opcode op);
+        CBuffer.write_int32 buffer arg0;
+        CBuffer.write_int32 buffer arg1;
+        current_address <- current_address + 10)
 
     method write_instruction3 op arg0 arg1 arg2 =
       CBuffer.write_int16 buffer (int_of_opcode op);
@@ -478,6 +981,29 @@ class jaf_compiler ctx debug_info =
 
     method compile_delete_var (v : Ain.Variable.t) =
       match v.value_type with
+      | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+          self#write_instruction0 PUSHLOCALPAGE;
+          self#write_instruction1 PUSH v.index;
+          self#write_instruction0 DUP2;
+          self#write_instruction0 REF;
+          self#write_instruction0 DELETE;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 ASSIGN;
+          self#write_instruction0 POP
+      | (Ref _ | Struct _) when Ain.version_gte ctx.ain (12, 0) ->
+          (* v12 dropped [SH_LOCALDELETE] (per [v12-dropped-opcodes]).
+             Emit the same 8-op expansion as the IFace arm so dummy
+             Ref-Struct slots get the proper temp-slot cleanup orig
+             emits after [this.X = new T()] property setter consumes
+             the value. *)
+          self#write_instruction0 PUSHLOCALPAGE;
+          self#write_instruction1 PUSH v.index;
+          self#write_instruction0 DUP2;
+          self#write_instruction0 REF;
+          self#write_instruction0 DELETE;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 ASSIGN;
+          self#write_instruction0 POP
       | Ref _ | Struct _ -> self#write_instruction1 SH_LOCALDELETE v.index
       | Array _ when Ain.version ctx.ain > 8 -> (
           match Ain.get_library_index ctx.ain "Array" with
@@ -498,11 +1024,240 @@ class jaf_compiler ctx debug_info =
           self#write_instruction0 A_FREE
       | _ -> ()
 
+    method private add_local_use uses i =
+      if List.mem uses i ~equal:Int.equal then uses else i :: uses
+
+    method private local_uses_expr uses (e : expression) =
+      let opt_expr uses = function
+        | Some e -> self#local_uses_expr uses e
+        | None -> uses
+      in
+      let opt_exprs uses es = List.fold es ~init:uses ~f:opt_expr in
+      match e.node with
+      | Ident (_, LocalVariable (i, _)) -> self#add_local_use uses i
+      | Ident _ | FuncAddr _ | MemberAddr _ | This | Null | ConstInt _
+      | ConstFloat _ | ConstChar _ | ConstString _ | New _ ->
+          uses
+      | DummyRef (i, e) ->
+          (* The DummyRef binds a hidden local slot [i] (the dummy) to
+             hold the inner expression's value. Treat the slot itself
+             as used here so [emit_v12_last_use_cleanup] can release
+             IFace dummies at their last-use statement, matching orig's
+             pattern of emitting [PUSHLOCALPAGE; PUSH i; DUP2; REF;
+             DELETE; ...] immediately after the call that fills the
+             dummy. Without this the dummy survives past RETURN and
+             Rance10.exe's RETURN handler rejects the local-page free. *)
+          self#local_uses_expr (self#add_local_use uses i) e
+      | Unary (_, e) | Cast (_, e) | RvalueRef e
+      | OptionalMember (e, _, _) | Member (e, _, _) ->
+          self#local_uses_expr uses e
+      | Binary (_, a, b) | Assign (_, a, b) | Seq (a, b)
+      | NullCoalesce (a, b) | Subscript (a, b) ->
+          self#local_uses_expr (self#local_uses_expr uses a) b
+      | Ternary (a, b, c) ->
+          self#local_uses_expr
+            (self#local_uses_expr (self#local_uses_expr uses a) b)
+            c
+      | Call (callee, args, _) ->
+          opt_exprs (self#local_uses_expr uses callee) args
+      | NewCall (_, args) -> opt_exprs uses args
+      | ArrayLiteral es -> List.fold es ~init:uses ~f:self#local_uses_expr
+      | Lambda _ -> uses
+
+    method private local_uses_stmt uses (stmt : statement) =
+      let opt_expr uses = function
+        | Some e -> self#local_uses_expr uses e
+        | None -> uses
+      in
+      let stmt_uses uses s = self#local_uses_stmt uses s in
+      match stmt.node with
+      | EmptyStatement | Label _ | Goto _ | Continue | Break | Default
+      | Jump _ | Message _ ->
+          uses
+      | Declarations decls ->
+          List.fold decls.vars ~init:uses ~f:(fun uses v ->
+              opt_expr
+                (List.fold v.array_dim ~init:uses ~f:self#local_uses_expr)
+                v.initval)
+      | Expression e | Case e | Jumps e -> self#local_uses_expr uses e
+      | Compound stmts | Switch (_, stmts) ->
+          List.fold stmts ~init:uses ~f:stmt_uses
+      | If (test, con, alt) ->
+          stmt_uses (stmt_uses (self#local_uses_expr uses test) con) alt
+      | While (test, body) | DoWhile (test, body) ->
+          stmt_uses (self#local_uses_expr uses test) body
+      | For (init, test, incr, body) ->
+          stmt_uses (opt_expr (opt_expr (stmt_uses uses init) test) incr) body
+      | ForEach (_, _, _, container, body) ->
+          stmt_uses (self#local_uses_expr uses container) body
+      | Return e -> opt_expr uses e
+      | RefAssign (lhs, rhs) | ObjSwap (lhs, rhs) ->
+          self#local_uses_expr (self#local_uses_expr uses lhs) rhs
+
+    method private should_v12_last_use_cleanup i =
+      Ain.version_gte ctx.ain (12, 0)
+      && (not (List.mem inline_deleted_dummies i ~equal:Int.equal))
+      && (not (List.mem v12_last_use_deleted_vars i ~equal:Int.equal))
+      &&
+      let f = Option.value_exn current_function in
+      i >= f.nr_args
+      &&
+      let local = self#get_local i in
+      (* IFace DUMMIES only — anonymous compile-time temps.
+
+         Named IFace source-locals (e.g. [ILayoutBoxParts LayoutBox]
+         in [CEnqueteView::InitLayout]) must NOT be last-use cleaned
+         here: this method runs per-statement inside nested blocks
+         and its [future_stmts] argument only covers the SIBLING
+         remaining statements at the same block depth. A named local
+         used inside an inner [if]-block but then used again AFTER
+         the [if]-block looks "last-used" within the inner block, and
+         we'd zero it just before the outer code tries to read it
+         — observed runtime crash: survey's [LayoutBox.Core.Number]
+         hits REF Page=-1 because [LayoutBox] was zeroed inside the
+         preceding [if (LayoutBox.IsExistLayoutChild(...)) {...}]
+         block.
+
+         Dummy slots are safe because their lifetime is always the
+         single expression that filled them — the source AST never
+         references a dummy slot across statement boundaries. *)
+      String.is_prefix local.name ~prefix:"<dummy"
+      &&
+      match local.value_type with
+      | IFace _ -> true
+      | _ -> false
+
+    method private emit_v12_last_use_cleanup stmt future_stmts =
+      if Ain.version_gte ctx.ain (12, 0)
+         && not (self#statement_guaranteed_returns stmt)
+      then
+        (* Skip last-use cleanup when the statement guarantees its own
+           RETURN — any cleanup emitted here lands after the RETURN as
+           dead code that diverges from orig's bytecode and audit-
+           regresses property getters like
+           [CInfoText@GetPartsNumber]. The slots will be released by
+           the VM's RETURN local-page free anyway. *)
+        let current_uses = self#local_uses_stmt [] stmt in
+        let future_uses =
+          List.fold future_stmts ~init:[] ~f:self#local_uses_stmt
+        in
+        current_uses
+        |> List.filter ~f:(fun i ->
+               (not (List.mem future_uses i ~equal:Int.equal))
+               && self#should_v12_last_use_cleanup i)
+        |> List.iter ~f:(fun i ->
+               self#compile_delete_var (self#get_local i);
+               v12_last_use_deleted_vars <- i :: v12_last_use_deleted_vars)
+
+    (** Walk lambda parent chain from [name]. The lambda-name pattern is
+        [...<lambda : PARENT(line, col)>], possibly nested when a lambda
+        is defined inside another lambda. Returns the list of enclosing
+        ain functions, parent-first, so [List.nth result (level - 1)]
+        gives the function whose local slot a CapturedVariable references. *)
+    method find_lambda_parents (name : string) : Ain.Function.t list =
+      let prefix = "<lambda : " in
+      (* The function name in the ain table omits both the signature
+         and the (line, col) suffix that the lambda-name embeds:
+         [Class@Method(arg_types)(line, col)] → [Class@Method]. Strip
+         trailing balanced [(...)] groups one at a time and look up at
+         each step. When a strip reveals a signature like [(string)],
+         use it to disambiguate overloads — looking up by bare name
+         alone returns the FIRST matching overload, which for e.g.
+         [Find(string)] vs [Find(int, int)] silently picks the wrong
+         one. The wrong parent's [vars[0]] then has a different type
+         than the captured variable, and [compile_dereference] emits
+         the wrong dereference pattern (e.g. drops [A_REF] for String
+         because the parent slot looked like [Int]). That manifests as
+         a refcount leak in the captured string at lambda RETURN. *)
+      let strip_one_paren_group body =
+        let len = String.length body in
+        if len > 0 && Char.equal body.[len - 1] ')' then
+          let rec find_open i depth =
+            if i < 0 then None
+            else
+              match body.[i] with
+              | ')' -> find_open (i - 1) (depth + 1)
+              | '(' when depth = 1 -> Some i
+              | '(' -> find_open (i - 1) (depth - 1)
+              | _ -> find_open (i - 1) depth
+          in
+          match find_open (len - 1) 0 with
+          | Some i ->
+              Some
+                ( String.sub body ~pos:0 ~len:i,
+                  String.sub body ~pos:(i + 1) ~len:(len - i - 2) )
+          | None -> None
+        else None
+      in
+      let parent_signature (f : Ain.Function.t) =
+        List.take f.vars f.nr_args
+        |> List.map ~f:(fun (v : Ain.Variable.t) ->
+               Jaf.jaf_type_to_string (ain_to_jaf_type ctx.ain v.value_type))
+        |> String.concat ~sep:", "
+      in
+      let lookup_by_name_and_sig bare_name sig_str =
+        let result = ref None in
+        Ain.function_iter ctx.ain ~f:(fun (f : Ain.Function.t) ->
+            if Option.is_none !result
+               && String.equal f.name bare_name
+               && String.equal (parent_signature f) sig_str
+            then result := Some f);
+        !result
+      in
+      let rec lookup_parent body =
+        match Ain.get_function ctx.ain body with
+        | Some f -> Some f
+        | None -> (
+            match strip_one_paren_group body with
+            | Some (shorter, sig_str) -> (
+                (* Signature-disambiguated lookup; the [sig_str] only
+                   resolves to a real overload after [(line, col)] has
+                   already been stripped, so this short-circuits the
+                   right level of the recursion. *)
+                match lookup_by_name_and_sig shorter sig_str with
+                | Some f -> Some f
+                | None -> lookup_parent shorter)
+            | None -> None)
+      in
+      let rec walk acc cur_name =
+        match String.substr_index cur_name ~pattern:prefix with
+        | None -> List.rev acc
+        | Some start ->
+            let body_start = start + String.length prefix in
+            let len = String.length cur_name in
+            let rec find_close i depth =
+              if i >= len then None
+              else
+                match cur_name.[i] with
+                | '<' -> find_close (i + 1) (depth + 1)
+                | '>' when depth = 0 -> Some i
+                | '>' -> find_close (i + 1) (depth - 1)
+                | _ -> find_close (i + 1) depth
+            in
+            (match find_close body_start 0 with
+            | None -> List.rev acc
+            | Some close ->
+                let body =
+                  String.sub cur_name ~pos:body_start
+                    ~len:(close - body_start)
+                in
+                match lookup_parent body with
+                | None -> List.rev acc
+                | Some parent -> walk (parent :: acc) body)
+      in
+      walk [] name
+
     (** Emit the code to put the value of a variable onto the stack (including
         member variables and array elements). Assumes a page + page-index is
         already on the stack. *)
     method compile_dereference (t : Ain.Type.t) =
       match t with
+      (* v12 [Wrap (IFace _)] rvalue: emit a single [REFREF] so the
+         unwrap leaves the 2-slot iface fat-ref [page, offset] on the
+         stack. The consumer (dispatch, comparison) adds the right
+         deref pattern. *)
+      | Wrap (IFace _) when Ain.version_gte ctx.ain (12, 0) ->
+          self#write_instruction0 REFREF
       | Wrap inner ->
           (* v11 fat-ref: [REFREF] then [REF] appropriate for the inner
              type. Strings need the extra [A_REF] the v11 VM requires
@@ -513,10 +1268,11 @@ class jaf_compiler ctx debug_info =
           | String when Ain.version ctx.ain > 8 ->
               self#write_instruction0 A_REF
           | _ -> ())
-      | Ref (Int | Float | Bool | LongInt | FuncType _) ->
+      | Ref (Int | Float | Bool | LongInt | Enum _ | FuncType _) ->
           self#write_instruction0 REFREF;
           self#write_instruction0 REF
-      | Int | Float | Bool | LongInt | FuncType _ -> self#write_instruction0 REF
+      | Int | Float | Bool | LongInt | Enum _ | FuncType _ ->
+          self#write_instruction0 REF
       | String | Ref String ->
           (* v11 uses [REF; A_REF] instead of [S_REF] for string
              dereference — [S_REF] doesn't incref/copy in v11 and the
@@ -530,7 +1286,10 @@ class jaf_compiler ctx debug_info =
           (* ain v0/v1 has no A_REF; array rvalues are passed by reference
              without a deep copy. *)
           if ctx.version > 100 then self#write_instruction0 A_REF
-      | (Struct _ | Ref (Struct _)) when Ain.version ctx.ain > 8 ->
+      | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+          self#write_instruction0 REFREF
+      | (Struct _ | Ref (Struct _) | Ref (IFace _))
+        when Ain.version ctx.ain > 8 ->
           (* v11 struct dereference is [REF; A_REF], not [SR_REF no].
              [SR_REF] doesn't incref the destination in v11 and the VM
              panics when the caller frees the returned struct. *)
@@ -554,7 +1313,7 @@ class jaf_compiler ctx debug_info =
              incref (the callee doesn't take ownership). *)
           self#write_instruction0 REF
       | Void | IMainSystem | HLLFunc2 | HLLParam | Ref _ | Option _
-      | Unknown87 _ | IFace _ | Enum2 _ | Enum _ | HLLFunc | Unknown98
+      | Unknown87 _ | IFace _ | Enum2 _ | HLLFunc | Unknown98
       | IFaceWrap _ | Function | Method | NullType ->
           compiler_bug "dereference not supported for type" None
 
@@ -590,15 +1349,22 @@ class jaf_compiler ctx debug_info =
           self#write_instruction1 PUSH member_no
       | Subscript (obj, index) ->
           self#compile_lvalue obj;
-          self#compile_expression index
+          self#compile_expression index;
+          (match e.ty with
+          | (Struct (name, _) | Wrap (Struct (name, _)))
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              self#write_instruction1 PUSH 2;
+              self#write_instruction0 MUL
+          | _ -> ())
+      (* v12 cast wrappers around a variable / member ref are no-ops at
+         codegen — pass through to the inner expression's lvalue. *)
+      | Cast (_, inner) -> self#compile_variable_ref inner
       | _ -> compiler_bug "Invalid variable ref" (Some (ASTExpression e))
 
-    method compile_delete_ref ty =
+    method compile_delete_ref _ty =
       self#write_instruction0 DUP2;
-      if is_ref_scalar ty then (
-        self#write_instruction0 REFREF;
-        self#write_instruction0 POP)
-      else self#write_instruction0 REF;
+      self#write_instruction0 REF;
       self#write_instruction0 DELETE
 
     (** Emit the code to put a location (variable, struct member, or array
@@ -611,9 +1377,20 @@ class jaf_compiler ctx debug_info =
         | Wrap String ->
             self#write_instruction0 REFREF;
             self#write_instruction0 REF
+        | Wrap (IFace _) when Ain.version_gte ctx.ain (12, 0) ->
+            (* v12 [Wrap (IFace _)] lvalue: emit a single [REFREF] so
+               the unwrap leaves the 2-slot iface fat-ref [page, offset]
+               on the stack. The consumer (method dispatch, comparison,
+               etc.) then adds the right deref pattern. Previously this
+               emitted [REFREF; REF] (or [REFREF; REFREF] for I-prefix
+               names) which over- or under-derefs depending on the
+               consumer. *)
+            self#write_instruction0 REFREF
         | Ref (Int | Float | Bool | LongInt) -> self#write_instruction0 REFREF
         | Ref (String | Array _ | Struct _ | Delegate _) ->
             self#write_instruction0 REF
+        | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+            self#write_instruction0 REFREF
         | String | Array _ | Struct _ | Delegate _ ->
             self#write_instruction0 REF
         | _ -> ()
@@ -685,13 +1462,38 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 REF
           | _ -> ());
           self#compile_expression index;
+          (match e.ty with
+          | (Struct (name, _) | Wrap (Struct (name, _)))
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              self#write_instruction1 PUSH 2;
+              self#write_instruction0 MUL
+          | _ -> ());
           compile_lvalue_after (jaf_to_ain_type e.ty)
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression e))
+      | NewCall ({ ty = Struct (struct_name, s_no); _ }, args)
+        when Ain.version ctx.ain > 8 ->
+          (* v12 [new T(args)] as a method receiver / ref-assign
+             target: emit constructor args before [NEW], leaving the
+             new struct page-ref on the stack. *)
+          self#compile_newcall struct_name s_no args
+      | NewCall _ ->
+          compiler_bug "NewCall as lvalue — needs dummy-ref lowering"
+            (Some (ASTExpression e))
+      | ArrayLiteral _ ->
+          (* v12 [[…].Method(…)] — array literal as a method receiver.
+             Push a [-1] sentinel. v12-wip stub. *)
+          self#write_instruction1 PUSH (-1)
       | DummyRef (var_no, ref_expr) -> (
           self#scope_add_var (self#get_local var_no);
           let call_returns_ref =
             match self#ain_call_return_type ref_expr with
-            | Some (Ain.Type.Ref _) -> true
+            | Some (Ain.Type.Ref _ | Ain.Type.IFace _) -> true
+            | _ -> false
+          in
+          let dummy_is_iface =
+            match (self#get_local var_no).value_type with
+            | Ain.Type.IFace _ when Ain.version_gte ctx.ain (12, 0) -> true
             | _ -> false
           in
           let dummy_is_ref_scalar =
@@ -703,26 +1505,199 @@ class jaf_compiler ctx debug_info =
             when Ain.version ctx.ain > 8 ->
               (* v11 NEW is a 2-operand opcode (struct-id + ctor-id).
                  Prepare the dummy slot, release any previous value via
-                 [REF; CHECKUDO], then [PUSHLOCALPAGE; PUSH i; NEW s c;
+              [REF; CHECKUDO], then [PUSHLOCALPAGE; PUSH i; NEW s c;
                  ASSIGN] stores the freshly constructed object. The
                  pre-v11 form [PUSH s; NEW] would leave the operand
                  bytes unread by the v11 disassembler. *)
+              self#ensure_v12_dummy_slot_initialized var_no;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH var_no;
               self#write_instruction0 REF;
-              self#write_instruction0 CHECKUDO;
+              self#emit_slot_release;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH var_no;
-              let ctor =
-                (Ain.get_struct_by_index ctx.ain s_no).constructor
-              in
+              let ctor = self#receiver_new_ctor s_no in
               self#write_instruction2 NEW s_no ctor;
-              self#write_instruction0 ASSIGN
+              self#write_instruction0 ASSIGN;
+              if Ain.version_lt ctx.ain (12, 0) then
+                self#write_instruction0 A_REF
+          (* v12 [new T(args)] in a DummyRef: prepare the dummy slot,
+             release any previous value, then assign the constructed
+             page-ref into the slot. *)
+          | { node = NewCall ({ ty = Struct (struct_name, s_no); _ }, args); _ }
+            when Ain.version ctx.ain > 8 ->
+              self#ensure_v12_dummy_slot_initialized var_no;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#emit_slot_release;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#compile_newcall struct_name s_no args;
+              self#write_instruction0 ASSIGN;
+              if Ain.version_lt ctx.ain (12, 0) then
+                self#write_instruction0 A_REF
+          | { node = ArrayLiteral elems; ty = Array _; _ }
+            when Ain.version ctx.ain > 8 ->
+              (* v12: when the literal is the return value (e.g.
+                 [return [];]), the slot's array escapes via [SP_INC]
+                 and must NOT be cleaned at scope exit — drop the
+                 dummy from [scope.vars] (matches historical behaviour).
+                 Otherwise keep it so [end_scope] emits the
+                 [Array.Free <slot>] orig requires to release the
+                 populated array at branch exit. *)
+              let drop_from_scope =
+                Ain.version_lt ctx.ain (12, 0) || is_in_return_expr
+              in
+              if drop_from_scope then (
+                match Stack.top scopes with
+                | Some scope ->
+                    scope.vars <-
+                      List.filter scope.vars ~f:(fun v ->
+                          not (Int.equal v.index var_no))
+                | None -> ());
+              let elem_ty = self#array_element_type_code ref_expr.ty in
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 DUP;
+              self#compile_CALLHLL "Array" "Free" elem_ty
+                (ASTExpression ref_expr);
+              List.iter elems ~f:(fun elem ->
+                  self#write_instruction0 DUP;
+                  self#compile_expression elem;
+                  (* Per-element A_REF for borrowed-ref / new-T sources:
+                     when the element is `new T()` (wrapped in DummyRef
+                     during variableAlloc) or an HLL ref-returning call
+                     or a struct/member access, the dummy slot or
+                     pushed page-ref must be bumped before PushBack
+                     stores it. Without A_REF, the per-element dummy's
+                     subsequent reuse / cleanup releases the page that
+                     PushBack just handed to the array.
+                     Evidence: orig at CGroupInstance@AddBoxLine /
+                     CLineInstance@GetOBB end-return / TextButton@Init
+                     consistently emits `NEW; ASSIGN; A_REF; CALLHLL
+                     PushBack` per element. Scalars (Int/Float/Bool/
+                     Enum) and S_PUSH literals don't get this. *)
+                  if self#needs_a_ref_for_consume elem then
+                    self#write_instruction0 A_REF;
+                  self#compile_CALLHLL "Array" "PushBack" elem_ty
+                    (ASTExpression ref_expr));
+              self#write_instruction0 A_REF
+          | { node =
+                NullCoalesce
+                  (({ node = Call _; _ } as option_call), { node = Null; _ });
+              _ }
+            when Ain.version_gte ctx.ain (12, 0) -> (
+              match self#ain_call_return_type option_call with
+              | Some (Ain.Type.Option _) ->
+                  self#compile_expression option_call;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let null_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH var_no;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH var_no;
+                  let end_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at null_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH 0;
+                  self#write_address_at end_addr current_address
+              | _ ->
+                  compiler_bug
+                    "DummyRef NullCoalesce expected option-returning call"
+                    (Some (ASTExpression ref_expr)))
+          | { node = Call ({ node = OptionalMember (obj, _, _); _ }, args,
+                            MethodCall (_, method_no)); _ }
+            when Ain.version_gte ctx.ain (12, 0) && dummy_is_iface ->
+              let receiver_is_iface =
+                match obj.ty with
+                | Struct (name, _) | Ref (Struct (name, _)) ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false
+              in
+              let receiver_is_casted_iface =
+                match obj.node with
+                | Cast (Struct (name, _), _) | Cast (Ref (Struct (name, _)), _) ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false
+              in
+              self#compile_lvalue obj;
+              if not receiver_is_casted_iface then
+                self#write_instruction0
+                  (if receiver_is_iface then DUP_U2 else DUP);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#compile_method_call_for_receiver ~prefer_first_duplicate:true
+                obj.ty args method_no;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 DUP_U2;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifnz2_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction1 PUSH 0;
+              let jump_end_inner = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz2_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at jump_end_inner current_address;
+              let jump_end_outer = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              if receiver_is_iface || receiver_is_casted_iface then (
+                self#write_instruction0 POP;
+                self#write_instruction0 POP)
+              else self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at jump_end_outer current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0;
+              self#write_address_at ifz_addr current_address
           | _
             when Ain.version ctx.ain > 8
                  && not
                       (is_ref_scalar ref_expr.ty
-                      || (call_returns_ref && dummy_is_ref_scalar)) ->
+                      || dummy_is_iface
+                      || (call_returns_ref && dummy_is_ref_scalar))
+                 &&
+                 (match ref_expr.ty with
+                 | String | Struct _ | Array _ | Delegate _ | HLLParam
+                 | Ref (String | Struct _ | Array _ | Delegate _ | HLLParam) ->
+                     true
+                 | _ -> false) ->
               (* v11 rvalue-into-dummy (non-scalar): variableAlloc
                  wrapped a non-referenceable rvalue so it can serve as a
                  [ref T] argument. Evaluate the rvalue first, release
@@ -732,15 +1707,31 @@ class jaf_compiler ctx debug_info =
                  check. Original SDK: [.LOCALREF dummy; CHECKUDO;
                  .LOCALASSIGN2 dummy]. *)
               let emit_checkudo_assign () =
+                self#ensure_v12_dummy_slot_initialized var_no;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH var_no;
                 self#write_instruction0 REF;
-                self#write_instruction0 CHECKUDO;
+                self#emit_slot_release;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction0 SWAP;
                 self#write_instruction1 PUSH var_no;
                 self#write_instruction0 SWAP;
                 self#write_instruction0 ASSIGN
+                (* EXPERIMENTAL: the earlier A_REF here (commit d508efa)
+                   was emitted for all [String | Ref String] DummyRef
+                   targets to balance refcount when consumers like
+                   S_ADD decrement. But it OVER-emits for null-coalesce
+                   (??) contexts where the IFZ null-check consumes the
+                   stack copy without decrementing the string heap
+                   refcount. The extra A_REF in [MenuContext@Init]
+                   pumps the local-page refcount to 2 at RETURN
+                   (xsystem4 logs: "RETURN local page still referenced
+                   fno=20505 page_slot=31792 ref=2"), causing
+                   downstream PAGE_COPY -1 when menu opens. Disabling
+                   the A_REF here may re-introduce the boot-lambda
+                   double-free in [ResultArmyCountView@<lambda
+                   InitParts>], but that lambda only runs during the
+                   results screen (later than menu/start). *)
               in
               (match ref_expr.node with
               | Call
@@ -761,7 +1752,8 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 EQUALE;
                   let ifnz_addr = current_address + 2 in
                   self#write_instruction1 IFNZ 0;
-                  self#compile_method_call args method_no;
+                  self#compile_method_call_for_receiver
+                    ~prefer_first_duplicate:true obj.ty args method_no;
                   emit_checkudo_assign ();
                   self#write_instruction0 DUP;
                   self#write_instruction1 PUSH (-1);
@@ -796,16 +1788,19 @@ class jaf_compiler ctx debug_info =
               | _ ->
                   self#compile_expression ref_expr;
                   emit_checkudo_assign ())
-          | _ when Ain.version ctx.ain > 8 ->
+          | _
+            when Ain.version ctx.ain > 8
+                 && (dummy_is_ref_scalar || dummy_is_iface) ->
               (* v11 ref-scalar (2 VM stack slots per ref value):
                  same pattern but with [DUP_X2; POP] in place of [SWAP]
                  to rotate through 2-slot values, and [R_ASSIGN]
                  instead of [ASSIGN]. *)
+              self#ensure_v12_dummy_slot_initialized var_no;
               self#compile_expression ref_expr;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH var_no;
               self#write_instruction0 REF;
-              self#write_instruction0 CHECKUDO;
+              self#emit_slot_release;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction0 DUP_X2;
               self#write_instruction0 POP;
@@ -813,6 +1808,23 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 DUP_X2;
               self#write_instruction0 POP;
               self#write_instruction0 R_ASSIGN
+          | _ when Ain.version ctx.ain > 8 ->
+              (* v12 scalar RvalueRef dummies are ordinary local slots.
+                 Store the value, pop the assignment result, then leave
+                 the dummy lvalue for the by-ref call argument. *)
+              self#compile_expression ref_expr;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 SWAP;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 SWAP;
+              (match ref_expr.ty with
+              | Float -> self#write_instruction0 F_ASSIGN
+              | LongInt -> self#write_instruction0 LI_ASSIGN
+              | String -> self#write_instruction0 S_ASSIGN
+              | _ -> self#write_instruction0 ASSIGN);
+              self#write_instruction0 POP;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH var_no
           | _ ->
               (* Pre-v11 path: PUSH struct id, then 0-arg NEW which
                  reads the id off the stack. *)
@@ -838,6 +1850,24 @@ class jaf_compiler ctx debug_info =
           | Ref t ->
               self#write_instruction1 PUSH (-1);
               if is_numeric t then self#write_instruction1 PUSH 0
+          (* v12 interface NULL as an lvalue (e.g. [obj.IFaceProp =
+             NULL] flowing through the setter param, which
+             [compile_argument] handles via [compile_lvalue] for
+             [IFace _] callee types). Push the two-slot interface
+             null pair. *)
+          | Struct (name, _)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0
+          (* v12 [obj.Prop = NULL] flows NULL through a [ref T] setter
+             param without the type-check NULL→T coercion firing —
+             property setter rewrite happens after check_assign. Push
+             the v11 single-slot null sentinel. *)
+          | Struct _ | Array _ | String | Delegate _ | HLLParam
+            when Ain.version ctx.ain > 8 ->
+              self#write_instruction1 PUSH (-1)
+          | NullType -> self#write_instruction1 PUSH (-1)
           | ty ->
               compiler_bug
                 ("unimplemented: NULL lvalue of type " ^ jaf_type_to_string ty)
@@ -869,6 +1899,53 @@ class jaf_compiler ctx debug_info =
       | Call (_, _, (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _))
         ->
           self#compile_expression e
+      (* v12 cast wrapping an lvalue-shaped expression is a no-op at
+         codegen — recurse into the inner so the page-ref ends up on
+         the stack with the same encoding. *)
+      | Cast (dst_t, inner) ->
+          self#compile_lvalue inner;
+          (match (inner.ty, dst_t) with
+          | (Struct (src_name, src_sno) | Ref (Struct (src_name, src_sno))),
+            (Struct (dst_name, dst_sno) | Ref (Struct (dst_name, dst_sno)))
+            when Ain.version_gte ctx.ain (12, 0)
+                 && not (Int.equal src_sno dst_sno) ->
+              let src_is_iface = Hashtbl.mem ctx.interface_names src_name in
+              let dst_is_iface = Hashtbl.mem ctx.interface_names dst_name in
+              if src_is_iface then (
+                (* X_ICAST already produces the receiver shape expected by
+                   v12 optional-call null checks.  Emitting a second
+                   cast-local NULL normalization here leaves only a
+                   sentinel for the outer CALLMETHOD selector to deref. *)
+                self#write_instruction0 POP;
+                self#write_instruction1 X_ICAST dst_sno)
+              else if dst_is_iface then self#write_instruction1 X_ICAST dst_sno
+          | _ -> ())
+      (* v12 [primary ?? fallback] used as an lvalue (e.g. ref-param
+         argument): collapse to the primary's lvalue. The fallback is
+         a sentinel (-1, [], etc.) that the runtime won't reach when
+         the primary resolves. v12-wip — round-trip drops the
+         fallback. *)
+      | NullCoalesce (a, _) -> self#compile_lvalue a
+      (* v12 user-bodied event used as an lvalue (e.g. receiver for
+         [this.Event.Clear()]). When the class still has an auto-event
+         backing field, use it; otherwise fall back to the sentinel
+         stub used for backing-less user-bodied events. *)
+      | Member (obj, event_name, ClassEvent ev) -> (
+          let backing_name = "<" ^ event_name ^ ">" in
+          match
+            Hashtbl.find ctx.structs ev.event_class
+            |> Option.bind ~f:(fun s -> Hashtbl.find s.members backing_name)
+          with
+          | Some member ->
+              self#compile_lvalue obj;
+              self#write_instruction1 PUSH (Option.value_exn member.index);
+              compile_lvalue_after (jaf_to_ain_type ~ctx member.type_spec.ty)
+          | None -> self#write_instruction1 PUSH (-1))
+      (* v12 generic-receiver member access used as an lvalue
+         (assignment target, etc.). Same sentinel stub as the rvalue
+         path. v12-wip — round-trip drops the assignment. *)
+      | Member (_, _, UnresolvedMember) when Poly.equal e.ty HLLParam ->
+          self#write_instruction1 PUSH (-1)
       | Member (obj, _, ClassMethod (name, no))
         when String.is_suffix name ~suffix:"::get"
              || String.is_suffix name ~suffix:"::set" ->
@@ -891,12 +1968,8 @@ class jaf_compiler ctx debug_info =
       | Void -> ()
       | Ref (String | Struct _ | Array _ | HLLParam)
         when Ain.version_gte ctx.ain (11, 0) ->
-          (* v11 non-scalar refs occupy a single stack slot that holds
-             a page-ref. [POP] would drop the slot without decrementing
-             the refcount, leaking the page. [DELETE] releases the
-             ref properly. *)
           self#write_instruction0 DELETE
-      | Int | Float | Bool | LongInt | FuncType _ | Ref _ | TyFunction _
+      | Int | Float | Bool | LongInt | Enum _ | FuncType _ | Ref _ | TyFunction _
       | TyMethod _ ->
           self#write_instruction0 POP
       | String when Ain.version_gte ctx.ain (11, 0) ->
@@ -936,16 +2009,87 @@ class jaf_compiler ctx debug_info =
                 | _ -> ( match inner.ty with Ref _ -> true | _ -> false))
             | None -> false
           in
+          (* v12: a bare [new T(...)] passed directly to an HLL/method
+             arg needs an A_REF after the NEW; ASSIGN. The callee (e.g.
+             Array.PushBack) stores the page-ref but doesn't incref it;
+             the local dummy holding the NEW result then SH_LOCALDELETEs
+             the only ref and the underlying struct is freed before the
+             array's later read. *)
+          let bare_new_arg =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            let check (e : expression) =
+              match e.node with
+              | New _ | NewCall _ -> true
+              | _ -> false
+            in
+            check expr
+            || (match dummy_ref_inner expr with
+                | Some inner -> check inner
+                | None -> false)
+          in
           match t with
           | (Struct _ | Array _) when Ain.version ctx.ain > 8 ->
               (* v11 struct / array arg: the language-level [Ref] is
                  collapsed by typeAnalysis, but the call site still
-                 needs the page-ref. Push the value and append [A_REF]
-                 when the source is a [DummyRef]'d ref-returning call
-                 so the dummy's [SH_LOCALDELETE] doesn't free the only
-                 owner. *)
+                 needs the page-ref. v12 [CALLHLL] takes ownership of
+                 the arg's refcount (orig emits [A_REF] before every
+                 such call — e.g. [Array.PushBack(arr, val)]). Without
+                 bumping the local's refcount, the local dummy's later
+                 release drops refcount to 0 and frees the page the
+                 HLL just stored → dangling page-id → next DELETE
+                 fires [DeletePage Page=N] (the
+                 PlayerCardSkill/PlayerSkillEffect crash chain).
+                 `needs_a_ref_for_consume` classifies New/NewCall as
+                 Owned and DummyRef-wrapped ref-returning calls as
+                 Borrowed; the OptionalMember-dispatched case is
+                 reported as Stable (the optional path emits its own
+                 null sentinel). *)
               self#compile_expression expr;
-              if dummy_inner_returns_ref then self#write_instruction0 A_REF
+              (* v11+ borrowed-ref pass-through: DummyRef wrapping a
+                 Call whose ain-level return is [Ref _] needs A_REF
+                 before the consuming call, so the dummy's later
+                 SH_LOCALDELETE doesn't drop the only owning ref.
+                 [needs_a_ref_for_consume] handles the v12 cases
+                 (incl. New/NewCall and lvalue-source struct/array);
+                 the OR below restores the v11 case the helper's
+                 version gate would otherwise drop — caught when
+                 Ixseal boot crashed with DeletePage Page=43 after
+                 the v12 helper migration. *)
+              let v11_dummy_call_returns_ref =
+                Ain.version ctx.ain > 8
+                && (not (Ain.version_gte ctx.ain (12, 0)))
+                &&
+                let rec walk (e : expression) =
+                  match e.node with
+                  | DummyRef (_, ({ node = Call _; _ } as inner)) -> (
+                      match self#ain_call_return_type inner with
+                      | Some (Ain.Type.Ref _) -> true
+                      | _ -> (
+                          match inner.ty with
+                          | Ref _ -> true
+                          | _ -> false))
+                  | Cast (_, inner) | RvalueRef inner -> walk inner
+                  | _ -> false
+                in
+                walk expr
+              in
+              if self#needs_a_ref_for_consume expr
+                 || v11_dummy_call_returns_ref
+              then self#write_instruction0 A_REF
+          | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+              (* v12 interface arg: callee declares 2 slots (IFace +
+                 <void>). Interface-typed values already carry both
+                 slots through [compile_lvalue]; concrete struct values
+                 need the implemented interface vtable offset appended. *)
+              self#compile_lvalue expr;
+              (match (expr.ty, t) with
+              | (Struct (_, actual_sno) | Ref (Struct (_, actual_sno))), IFace iface_sno ->
+                  if not (Int.equal actual_sno iface_sno) then
+                    Option.iter
+                      (self#interface_vtable_offset actual_sno iface_sno)
+                      ~f:(fun offset -> self#write_instruction1 PUSH offset)
+              | _ -> ())
           | Ref _ ->
               self#compile_lvalue expr;
               (* v11 [Wrap T] lvalue (foreach loop var, etc.): the
@@ -962,13 +2106,53 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 REFREF;
                   self#write_instruction0 REF
               | _ -> ())
+          | Wrap _ when Ain.version_gte ctx.ain (12, 0) ->
+              (* v12 property event ref parameters are encoded as
+                 Wrap<T> + <void>. The callee wants the raw source
+                 location (page, index), not the value produced by
+                 compile_lvalue's dereference tail. *)
+              if is_variable_ref expr.node then self#compile_variable_ref expr
+              else self#compile_lvalue expr
           | Method ->
               (* XXX: for delegate builtins *)
               self#compile_expression expr
           | Delegate _ -> (
+              let is_null (e : expression) =
+                match e.node with
+                | Null -> true
+                | Cast (_, inner) -> (match inner.node with Null -> true | _ -> false)
+                | _ -> false
+              in
+              let emit_delegate_value (e : expression) =
+                if is_null e then self#write_instruction0 DG_NEW
+                else (
+                  self#compile_expression e;
+                  match e.ty with
+                  | TyMethod _ | TyFunction _ ->
+                      self#write_instruction0 DG_NEW_FROM_METHOD
+                  | _ -> ())
+              in
+              (match expr.node with
+              | Ternary (test, con, alt)
+                when Ain.version_gte ctx.ain (12, 0)
+                     && (is_null con || is_null alt) ->
+                  self#compile_expression test;
+                  (match test.node with
+                  | Member (_, _, ClassVariable _) when Ain.version ctx.ain > 8 -> ()
+                  | _ -> self#maybe_emit_condition_itob test);
+                  let ifz_addr = current_address + 2 in
+                  self#write_instruction1 IFZ 0;
+                  emit_delegate_value con;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifz_addr current_address;
+                  emit_delegate_value alt;
+                  self#write_address_at jump_addr current_address
+              | _ -> emit_delegate_value expr))
+          | Float when Ain.version ctx.ain > 8 ->
               self#compile_expression expr;
-              match expr.ty with
-              | TyMethod _ -> self#write_instruction0 DG_NEW_FROM_METHOD
+              (match expr.ty with
+              | Int | LongInt | Enum _ | Bool -> self#write_instruction0 ITOF
               | _ -> ())
           | Bool when Ain.version ctx.ain > 8 ->
               (* v11 distinguishes [Int] and [Bool] at the value-slot
@@ -1010,8 +2194,23 @@ class jaf_compiler ctx debug_info =
               match expr.node with
               | _ when is_variable_ref expr.node -> (
                   match expr.ty with
-                  | Ref (Struct _ | Array _ | String) ->
-                      self#compile_lvalue expr
+                  | Ref (Array _ | String) ->
+                      self#compile_lvalue expr;
+                      self#write_instruction0 A_REF
+                  | Ref (Struct _) ->
+                      (* v12 [Ref Struct] arg passed to HLL [hll_param]:
+                         needs [A_REF] just like Ref Array / Ref String.
+                         Without it, [CALLHLL] takes ownership of the
+                         page (stores it in the array) but the local
+                         dummy's later release drops refcount to 0,
+                         leaving a dangling page-id in the HLL-managed
+                         data structure. Next access fires
+                         [DeletePage Page=N]. Confirmed against orig
+                         [PlayerSkillEffectCollection::Add] which
+                         emits [A_REF] here. *)
+                      self#compile_lvalue expr;
+                      if Ain.version_gte ctx.ain (12, 0) then
+                        self#write_instruction0 A_REF
                   | _ -> self#compile_expression expr)
               | _ ->
                   self#compile_expression expr;
@@ -1020,11 +2219,25 @@ class jaf_compiler ctx debug_info =
                     | Some { node = Call _; _ } -> true
                     | _ -> false
                   in
-                  if dummy_inner_returns_ref && inner_is_call then
-                    self#write_instruction0 A_REF)
+                  if (dummy_inner_returns_ref && inner_is_call) || bare_new_arg
+                  then self#write_instruction0 A_REF)
+          | String when Ain.version ctx.ain > 8 ->
+              (* Borrow analysis for `string` value-form args.
+                 `needs_a_ref_for_consume` covers the
+                 `Array.At / Array.First / Array.Last` shape
+                 (DummyRef → ref-returning HLL call) while
+                 [expression_ownership] reports `Stable` for the
+                 OptionalMember-dispatched case (obj?.Method()) — that
+                 path emits its own null sentinel and an extra A_REF
+                 would re-deref an already-consumed value. Confirmed
+                 against CEnqueteItemTextBox@SetInfo (positive) and
+                 MenuContext@Init's d508efa regression (excluded). *)
+              self#compile_expression expr;
+              if self#needs_a_ref_for_consume expr then
+                self#write_instruction0 A_REF
           | _ -> self#compile_expression expr)
 
-    (** v11: write [JUMP-over-body; body] for every [Lambda] argument
+    (** v11+: write [JUMP-over-body; body] for every [Lambda] argument
         BEFORE any arg evaluation runs, recording each pre-emitted
         lambda's index in [pre_emitted_lambdas]. The [Lambda]
         expression case consults that set so its inline [JUMP+body]
@@ -1035,18 +2248,160 @@ class jaf_compiler ctx debug_info =
         shifting every downstream address. *)
     method pre_emit_lambda_args args =
       if Ain.version ctx.ain > 8 then
-        let rec find_lambda (e : expression) =
+        let rec emit ?(body_only = false) (f : Jaf.fundecl) =
+          let lambda_idx = Option.value_exn f.index in
+          if not (Hashtbl.mem pre_emitted_lambdas lambda_idx)
+             && not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+          then (
+            let nested =
+              match f.body with
+              | Some body -> collect_optional_call_lambdas_in_stmts body
+              | None -> []
+            in
+            (* Original v12 pre-emits lambdas even when nested inside
+               constructor/call arguments, before the surrounding call
+               starts pushing receiver/value stack. *)
+            let jump_addr =
+              if body_only then None
+              else (
+                let addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                Some addr)
+            in
+            let nested_jump_addr =
+              if List.is_empty nested then None
+              else (
+                let addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                Some addr)
+            in
+            List.iter nested ~f:(emit ~body_only:true);
+            Option.iter nested_jump_addr ~f:(fun addr ->
+                self#write_address_at addr current_address);
+            self#compile_function f;
+            Option.iter jump_addr ~f:(fun addr ->
+                self#write_address_at addr current_address);
+            Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
+        and collect_lambdas (e : expression) =
           match e.node with
-          | Lambda f -> Some f
-          | Cast (_, inner) -> find_lambda inner
-          | _ -> None
+          | Lambda f -> [ f ]
+          | Unary (_, e) | Cast (_, e) | DummyRef (_, e) | RvalueRef e
+          | OptionalMember (e, _, _) | Member (e, _, _) ->
+              collect_lambdas e
+          | Binary (_, a, b) | Assign (_, a, b) | Seq (a, b)
+          | NullCoalesce (a, b) | Subscript (a, b) ->
+              collect_lambdas a @ collect_lambdas b
+          | Ternary (a, b, c) ->
+              collect_lambdas a @ collect_lambdas b @ collect_lambdas c
+          | Call (f, args, _) ->
+              collect_lambdas f
+              @ List.concat_map args ~f:(function
+                  | Some arg -> collect_lambdas arg
+                  | None -> [])
+          | NewCall (_, args) ->
+              List.concat_map args ~f:(function
+                | Some arg -> collect_lambdas arg
+                | None -> [])
+          | ArrayLiteral elems -> List.concat_map elems ~f:collect_lambdas
+          | ConstInt _ | ConstFloat _ | ConstChar _ | ConstString _
+          | Ident _ | FuncAddr _ | MemberAddr _ | New _ | This | Null ->
+              []
+        and callee_contains_optional_member (e : expression) =
+          match e.node with
+          | OptionalMember _ -> true
+          | Member (e, _, _) | Cast (_, e) | DummyRef (_, e) | RvalueRef e ->
+              callee_contains_optional_member e
+          | Call (callee, _, _) -> callee_contains_optional_member callee
+          | _ -> false
+        and collect_optional_call_lambdas (e : expression) =
+          match e.node with
+          | Lambda _ -> []
+          | Unary (_, e) | Cast (_, e) | DummyRef (_, e) | RvalueRef e
+          | OptionalMember (e, _, _) | Member (e, _, _) ->
+              collect_optional_call_lambdas e
+          | Binary (_, a, b) | Assign (_, a, b) | Seq (a, b)
+          | NullCoalesce (a, b) | Subscript (a, b) ->
+              collect_optional_call_lambdas a @ collect_optional_call_lambdas b
+          | Ternary (a, b, c) ->
+              collect_optional_call_lambdas a
+              @ collect_optional_call_lambdas b
+              @ collect_optional_call_lambdas c
+          | Call (callee, args, _) ->
+              collect_optional_call_lambdas callee
+              @ List.concat_map args ~f:(function
+                  | Some arg ->
+                      if callee_contains_optional_member callee then
+                        collect_lambdas arg
+                      else collect_optional_call_lambdas arg
+                  | None -> [])
+          | NewCall (_, args) ->
+              List.concat_map args ~f:(function
+                | Some arg -> collect_optional_call_lambdas arg
+                | None -> [])
+          | ArrayLiteral elems ->
+              List.concat_map elems ~f:collect_optional_call_lambdas
+          | ConstInt _ | ConstFloat _ | ConstChar _ | ConstString _
+          | Ident _ | FuncAddr _ | MemberAddr _ | New _ | This | Null ->
+              []
+        and collect_optional_call_lambdas_in_stmt (s : statement) =
+          match s.node with
+          | EmptyStatement | Label _ | Goto _ | Continue | Break | Default
+          | Jump _ ->
+              []
+          | Declarations ds ->
+              List.concat_map ds.vars ~f:(fun v ->
+                  Option.value_map v.initval ~default:[]
+                    ~f:collect_optional_call_lambdas
+                  @ List.concat_map v.array_dim
+                      ~f:collect_optional_call_lambdas)
+          | Expression e | Case e | Jumps e | Return (Some e) ->
+              collect_optional_call_lambdas e
+          | Return None | Message _ -> []
+          | Compound stmts | Switch (_, stmts) ->
+              collect_optional_call_lambdas_in_stmts stmts
+          | If (c, t, e) ->
+              collect_optional_call_lambdas c
+              @ collect_optional_call_lambdas_in_stmt t
+              @ collect_optional_call_lambdas_in_stmt e
+          | While (c, body) | DoWhile (c, body) ->
+              collect_optional_call_lambdas c
+              @ collect_optional_call_lambdas_in_stmt body
+          | For (init, test, step, body) ->
+              collect_optional_call_lambdas_in_stmt init
+              @ Option.value_map test ~default:[]
+                  ~f:collect_optional_call_lambdas
+              @ Option.value_map step ~default:[]
+                  ~f:collect_optional_call_lambdas
+              @ collect_optional_call_lambdas_in_stmt body
+          | ForEach (_, _, _, container, body) ->
+              collect_optional_call_lambdas container
+              @ collect_optional_call_lambdas_in_stmt body
+          | RefAssign (a, b) | ObjSwap (a, b) ->
+              collect_optional_call_lambdas a @ collect_optional_call_lambdas b
+        and collect_optional_call_lambdas_in_stmts stmts =
+          List.concat_map stmts ~f:collect_optional_call_lambdas_in_stmt
+        and scan (e : expression) =
+          List.iter (collect_lambdas e) ~f:emit
+        in
+        let find_lambda (expr : expression) : Jaf.fundecl option =
+          scan expr;
+          None
         in
         List.iter args ~f:(function
           | Some expr -> (
               match find_lambda expr with
               | Some f ->
                   let lambda_idx = Option.value_exn f.index in
-                  if not (Hashtbl.mem pre_emitted_lambdas lambda_idx) then (
+                  if not (Hashtbl.mem pre_emitted_lambdas lambda_idx)
+                     && not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+                  then (
+                    (* Both v11 and v12: emit JUMP-over-body then inline
+                       lambda body BEFORE any arg evaluation. Original
+                       Rance10 pre-emits the lambda so the runtime
+                       address sequence is contiguous — leaving stack
+                       items pushed before the JUMP causes "file end
+                       reached" because downstream code expects a clean
+                       stack frame. *)
                     let jump_addr = current_address + 2 in
                     self#write_instruction1 JUMP 0;
                     self#compile_function f;
@@ -1055,11 +2410,465 @@ class jaf_compiler ctx debug_info =
               | None -> ())
           | None -> ())
 
-    method compile_function_arguments args (f : Ain.Function.t) =
+    method pre_emit_v12_rhs_lambdas expr =
+      if Ain.version_gte ctx.ain (12, 0) then
+        let emit (f : Jaf.fundecl) =
+          let lambda_idx = Option.value_exn f.index in
+          if not (Hashtbl.mem pre_emitted_lambdas lambda_idx)
+             && not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+          then (
+            let jump_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#compile_function f;
+            self#write_address_at jump_addr current_address;
+            Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
+        in
+        let rec scan (e : expression) =
+          match e.node with
+          | Lambda f -> emit f
+          | Unary (_, e) | Cast (_, e) | DummyRef (_, e) | RvalueRef e
+          | OptionalMember (e, _, _) | Member (e, _, _) ->
+              scan e
+          | Binary (_, a, b) | Assign (_, a, b) | Seq (a, b)
+          | NullCoalesce (a, b) | Subscript (a, b) ->
+              scan a;
+              scan b
+          | Ternary (a, b, c) ->
+              scan a;
+              scan b;
+              scan c
+          | Call (f, args, _) ->
+              scan f;
+              List.iter args ~f:(Option.iter ~f:scan)
+          | NewCall (_, args) -> List.iter args ~f:(Option.iter ~f:scan)
+          | ArrayLiteral elems -> List.iter elems ~f:scan
+          | ConstInt _ | ConstFloat _ | ConstChar _ | ConstString _
+          | Ident _ | FuncAddr _ | MemberAddr _ | New _ | This | Null ->
+              ()
+        in
+        scan expr
+
+    method compile_function_arguments (args : expression option list) (f : Ain.Function.t) =
       let compile_arg arg (var : Ain.Variable.t) =
         self#compile_argument arg var.value_type
       in
-      List.iter2_exn args (Ain.Function.logical_parameters f) ~f:compile_arg
+      let params = Ain.Function.logical_parameters f in
+      (* v12 tolerates arg/param count mismatch (overload resolution
+         picked a stub that doesn't match real signature). Iterate
+         the common prefix instead of erroring. *)
+      let n = min (List.length args) (List.length params) in
+      List.iter2_exn
+        (List.take args n)
+        (List.take params n)
+        ~f:compile_arg
+
+    method compile_hll_function_arguments lib args (f : Ain.Function.t) =
+      let delegate_hint =
+        match args with
+        | Some { ty = Delegate (Some (_, dg_i)); _ } :: _ -> Some dg_i
+        | Some { ty = Ref (Delegate (Some (_, dg_i))); _ } :: _ -> Some dg_i
+        | Some { ty = Delegate None | Ref (Delegate None); _ } :: _ -> Some (-1)
+        | _ -> None
+      in
+      (* v12 [Array.*(value)] where receiver is an iface-typed array and
+         value is a struct (not an iface): the runtime expects a 2-slot
+         IFace [page, vtable_offset] pair. [compile_dereference] for
+         [Wrap (Struct _)] / [Struct _] emits only the page; we need a
+         trailing [PUSH 0] to supply the vtable_offset. orig emits this
+         pad for e.g. [array@ILoadableQuestMapObject.PushBack(qmoView)]
+         where [qmoView] is [Wrap (Struct QuestMapObjectView)]. Without
+         the pad the HLL sees garbage for the offset slot and crashes
+         on the next iface dispatch / DELETE. *)
+      let receiver_is_iface_array =
+        Ain.version_gte ctx.ain (12, 0)
+        && String.equal lib.Ain.Library.name "Array"
+        &&
+        let elem_is_iface : Jaf.jaf_type -> bool = function
+          | Array t | Ref (Array t) -> (
+              match t with
+              | Struct (name, _) -> Hashtbl.mem ctx.interface_names name
+              | _ -> false)
+          | _ -> false
+        in
+        match args with
+        | Some recv :: _ -> elem_is_iface recv.ty
+        | _ -> false
+      in
+      let arg_is_bare_struct (arg : Jaf.expression option) =
+        match arg with
+        | Some { ty; _ } -> (
+            let rec walk : Jaf.jaf_type -> bool = function
+              | Wrap inner -> walk inner
+              | Struct (name, _) ->
+                  not (Hashtbl.mem ctx.interface_names name)
+              | _ -> false
+            in
+            walk ty)
+        | None -> false
+      in
+      let compile_arg ~is_receiver arg (var : Ain.Variable.t) =
+        (match (lib.Ain.Library.name, arg, var.value_type, delegate_hint) with
+        | ( "Delegate",
+            Some ({ ty = String; _ } as expr),
+            (Ain.Type.HLLFunc | Ain.Type.HLLFunc2),
+            Some dg_i ) ->
+            self#compile_expression expr;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 SWAP;
+            self#write_instruction1 DG_STR_TO_METHOD dg_i
+        | _ -> self#compile_argument arg var.value_type);
+        (* IFace 2-slot pad for struct-value args to iface-array HLLs. *)
+        if not is_receiver
+           && receiver_is_iface_array
+           && Poly.equal var.value_type Ain.Type.HLLParam
+           && arg_is_bare_struct arg
+        then self#write_instruction1 PUSH 0
+      in
+      let params = Ain.Function.logical_parameters f in
+      let n = min (List.length args) (List.length params) in
+      List.iteri (List.zip_exn (List.take args n) (List.take params n))
+        ~f:(fun i (arg, var) -> compile_arg ~is_receiver:(i = 0) arg var)
+
+    method interface_vtable_offset actual_sno iface_sno =
+      let s = Ain.get_struct_by_index ctx.ain actual_sno in
+      List.find_map s.interfaces ~f:(fun (iface : Ain.Struct.interface) ->
+          if Int.equal iface.struct_type iface_sno then Some iface.vtable_offset
+          else None)
+
+    method v12_interface_receiver_method_slot ?(direct_getter_rank = false)
+        ?(prefer_first_duplicate = false) (receiver_ty : Jaf.jaf_type)
+        method_no =
+      if not (Ain.version_gte ctx.ain (12, 0)) then None
+      else
+        match receiver_ty with
+        | Jaf.Struct (name, sno)
+        | Ref (Jaf.Struct (name, sno))
+        | Wrap (Jaf.Struct (name, sno))
+        | Wrap (Ref (Jaf.Struct (name, sno)))
+          when Hashtbl.mem ctx.interface_names name ->
+            let iface_s = Ain.get_struct_by_index ctx.ain sno in
+            let method_fn = Ain.get_function_by_index ctx.ain method_no in
+            let short_name (s : Ain.Struct.t) (f : Ain.Function.t) =
+              let prefix = s.name ^ "@" in
+              if String.is_prefix f.name ~prefix then
+                String.chop_prefix_exn f.name ~prefix
+              else f.name
+            in
+            let method_short = short_name iface_s method_fn in
+            let same_shape (f : Ain.Function.t) =
+              String.equal (short_name iface_s f) method_short
+              && Int.equal f.nr_args method_fn.nr_args
+            in
+            let interface_slots =
+              if List.is_empty iface_s.vmethods then
+                let prefix = iface_s.name ^ "@" in
+                let slots = ref [] in
+                Ain.function_iter ctx.ain ~f:(fun f ->
+                    if String.is_prefix f.name ~prefix && f.address < 0 then
+                      slots := !slots @ [ f.index ]);
+                !slots
+              else iface_s.vmethods
+            in
+            let matches =
+              List.filter_mapi interface_slots ~f:(fun i fn_idx ->
+                  let fn = Ain.get_function_by_index ctx.ain fn_idx in
+                  if same_shape fn then Some i else None)
+            in
+            let current_duplicate_rank () =
+              match v12_current_body_dup_rank with
+              | Some _ as rank -> rank
+              | None -> self#current_body_duplicate_rank
+            in
+            if List.length matches > 1 then
+              if
+                String.is_suffix method_short ~suffix:"::get"
+                || String.is_suffix method_short ~suffix:"::set"
+              then
+                match current_duplicate_rank () with
+                | _ when direct_getter_rank -> List.hd matches
+                | Some dup_rank ->
+                    let wanted =
+                      Int.max 0 (List.length matches - 1 - dup_rank)
+                    in
+                    (match List.nth matches wanted with
+                    | Some slot -> Some slot
+                    | None -> List.hd matches)
+                | None ->
+                    List.last matches
+              else
+                if prefer_first_duplicate then List.hd matches
+                else
+                  List.find_mapi interface_slots ~f:(fun i fn_idx ->
+                      if Int.equal fn_idx method_no then Some i else None)
+            else
+            List.find_mapi interface_slots ~f:(fun i fn_idx ->
+                if Int.equal fn_idx method_no then Some i else None)
+        | _ -> None
+
+    method v12_concrete_interface_method_slot ?(direct_getter_rank = false)
+        ?(prefer_first_duplicate = false) (receiver_ty : Jaf.jaf_type)
+        method_no =
+      if not (Ain.version_gte ctx.ain (12, 0)) then None
+      else
+        let method_fn = Ain.get_function_by_index ctx.ain method_no in
+        let receiver_ty_is_true_iface =
+          match receiver_ty with
+          | Jaf.Struct (name, _)
+          | Ref (Jaf.Struct (name, _))
+          | Wrap (Jaf.Struct (name, _))
+          | Wrap (Ref (Jaf.Struct (name, _))) ->
+              Hashtbl.mem ctx.interface_names name
+          | _ -> false
+        in
+        let receiver_struct =
+          match receiver_ty with
+          | Jaf.Struct (_, sno)
+          | Ref (Jaf.Struct (_, sno))
+          | Wrap (Jaf.Struct (_, sno))
+          | Wrap (Ref (Jaf.Struct (_, sno))) ->
+              Some sno
+          | _ -> method_fn.struct_type
+        in
+        match receiver_struct with
+        | None -> None
+        | Some sno ->
+            let receiver = Ain.get_struct_by_index ctx.ain sno in
+            if List.is_empty receiver.interfaces then None
+            else
+              let short_name (s : Ain.Struct.t) (f : Ain.Function.t) =
+                let prefix = s.name ^ "@" in
+                if String.is_prefix f.name ~prefix then
+                  String.chop_prefix_exn f.name ~prefix
+                else f.name
+              in
+              let method_short = short_name receiver method_fn in
+              let same_method_shape (s : Ain.Struct.t) (f : Ain.Function.t) =
+                String.equal (short_name s f) method_short
+                && Int.equal f.nr_args method_fn.nr_args
+              in
+              let concrete_rank =
+                let rank = ref 0 in
+                let found = ref None in
+                List.iter receiver.vmethods ~f:(fun fn_idx ->
+                    if Option.is_none !found then
+                      let f = Ain.get_function_by_index ctx.ain fn_idx in
+                      if same_method_shape receiver f then (
+                        if Int.equal fn_idx method_no then found := Some !rank;
+                        Int.incr rank));
+                !found
+              in
+              List.find_map receiver.interfaces
+                ~f:(fun (iface : Ain.Struct.interface) ->
+                  let iface_s =
+                    Ain.get_struct_by_index ctx.ain iface.struct_type
+                  in
+                  let rank = ref 0 in
+                  let group_count =
+                    List.count iface_s.vmethods ~f:(fun iface_fn_idx ->
+                        let iface_fn =
+                          Ain.get_function_by_index ctx.ain iface_fn_idx
+                        in
+                        same_method_shape iface_s iface_fn)
+                  in
+                  let target_rank =
+                    Option.map concrete_rank ~f:(fun r ->
+                        if
+                          String.is_suffix method_short ~suffix:"::get"
+                          || String.is_suffix method_short ~suffix:"::set"
+                        then
+                          match self#current_body_duplicate_rank with
+                          | Some dup_rank ->
+                              Int.max 0 (group_count - 1 - dup_rank)
+                          | None ->
+                              if direct_getter_rank then r
+                              else Int.max 0 (group_count - 1 - r)
+                        else
+                          if prefer_first_duplicate then 0
+                          else
+                          match (receiver_ty_is_true_iface, v12_current_body_dup_rank) with
+                          | true, None -> 0
+                          | _, Some dup_rank ->
+                              Int.min (group_count - 1) (r + dup_rank)
+                          | _ ->
+                              r)
+                  in
+                  List.find_mapi iface_s.vmethods ~f:(fun i iface_fn_idx ->
+                      let iface_fn =
+                        Ain.get_function_by_index ctx.ain iface_fn_idx
+                      in
+                      if same_method_shape iface_s iface_fn then
+                        match target_rank with
+                        | Some wanted when Int.equal !rank wanted ->
+                            Some (iface.vtable_offset + i)
+                        | _ ->
+                            Int.incr rank;
+                            None
+                      else None))
+
+    method emit_vtable_method_selector slot =
+      self#write_instruction0 DUP_U2;
+      self#write_instruction1 PUSH 0;
+      self#write_instruction0 REF;
+      self#write_instruction0 SWAP;
+      self#write_instruction1 PUSH slot;
+      self#write_instruction0 ADD;
+      self#write_instruction0 REF
+
+    method private current_body_duplicate_rank =
+      match current_function with
+      | None -> None
+      | Some cur ->
+          if
+            String.is_suffix cur.name ~suffix:"@0"
+            || String.is_suffix cur.name ~suffix:"@2"
+            || String.is_substring cur.name ~substring:"@0("
+            || String.is_substring cur.name ~substring:"@2("
+          then None
+          else
+          let same = ref [] in
+          Ain.function_iter ctx.ain ~f:(fun f ->
+              if String.equal f.name cur.name && Int.equal f.nr_args cur.nr_args
+              then same := !same @ [ f.index ]);
+          if List.length !same > 1 then
+            List.findi !same ~f:(fun _ idx -> Int.equal idx cur.index)
+            |> Option.map ~f:fst
+          else None
+
+    method private v12_concrete_receiver_has_interfaces receiver_ty =
+      if not (Ain.version_gte ctx.ain (12, 0)) then false
+      else
+        let receiver_struct =
+          match receiver_ty with
+          | Jaf.Struct (_, sno)
+          | Ref (Jaf.Struct (_, sno))
+          | Wrap (Jaf.Struct (_, sno))
+          | Wrap (Ref (Jaf.Struct (_, sno))) ->
+              Some sno
+          | _ -> None
+        in
+        match receiver_struct with
+        | Some sno ->
+            not (List.is_empty (Ain.get_struct_by_index ctx.ain sno).interfaces)
+        | None -> false
+
+    method compile_method_selector ?(concrete = false)
+        ?(direct_getter_rank = false) ?(prefer_first_duplicate = false)
+        receiver_ty method_no =
+      match
+        self#v12_interface_receiver_method_slot
+          ~direct_getter_rank ~prefer_first_duplicate receiver_ty method_no
+      with
+      | Some slot -> self#emit_vtable_method_selector slot
+      | None -> (
+          match
+            if concrete || self#v12_concrete_receiver_has_interfaces receiver_ty
+            then
+              self#v12_concrete_interface_method_slot ~direct_getter_rank
+                ~prefer_first_duplicate receiver_ty method_no
+            else None
+          with
+          | Some slot ->
+              self#write_instruction1 PUSH 0;
+              self#emit_vtable_method_selector slot
+          | None -> self#write_instruction1 PUSH method_no)
+
+    method private same_lvalue_shape (a : expression) (b : expression) =
+      match (a.node, b.node) with
+      | This, This -> true
+      | Ident (_, ia), Ident (_, ib) -> Poly.equal ia ib
+      | Member (ao, _, ClassVariable ai), Member (bo, _, ClassVariable bi)
+        ->
+          Int.equal ai bi && self#same_lvalue_shape ao bo
+      | Subscript (ao, ai), Subscript (bo, bi) ->
+          self#same_lvalue_shape ao bo && Poly.equal ai.node bi.node
+      | _ -> false
+
+    method private emit_reused_receiver_binary_op (ty : jaf_type)
+        (op : binary_op) =
+      match (ty, op) with
+      | (Int | Enum _), Plus ->
+          self#write_instruction0 ADD;
+          true
+      | (Int | Enum _), Minus ->
+          self#write_instruction0 SUB;
+          true
+      | LongInt, Plus ->
+          self#write_instruction0 LI_ADD;
+          true
+      | LongInt, Minus ->
+          self#write_instruction0 LI_SUB;
+          true
+      | Float, Plus ->
+          self#write_instruction0 F_ADD;
+          true
+      | Float, Minus ->
+          self#write_instruction0 F_SUB;
+          true
+      | _ -> false
+
+    method constructor_match struct_name nargs =
+      let ctor_name = struct_name ^ "@0" in
+      let primary = Hashtbl.find ctx.functions ctor_name in
+      let overloads =
+        Option.value (Hashtbl.find ctx.overloads ctor_name) ~default:[]
+      in
+      let all = match primary with Some f -> f :: overloads | None -> overloads in
+      List.find all ~f:(fun (f : fundecl) -> List.length f.params = nargs)
+
+    method private bare_new_ctor s_no =
+      if Ain.version_gte ctx.ain (12, 0) then -1
+      else (Ain.get_struct_by_index ctx.ain s_no).constructor
+
+    method private receiver_new_ctor s_no =
+      if
+        Ain.version_gte ctx.ain (12, 0)
+        && bare_new_receiver_uses_default_ctor
+      then (Ain.get_struct_by_index ctx.ain s_no).constructor
+      else self#bare_new_ctor s_no
+
+    method private with_bare_new_receiver_default_ctor f =
+      let prev = bare_new_receiver_uses_default_ctor in
+      Exn.protect
+        ~f:(fun () ->
+          bare_new_receiver_uses_default_ctor <- true;
+          f ())
+        ~finally:(fun () -> bare_new_receiver_uses_default_ctor <- prev)
+
+    method compile_newcall struct_name s_no args =
+      let nargs = List.length args in
+      let default_ctor = (Ain.get_struct_by_index ctx.ain s_no).constructor in
+      let matching_ctor = self#constructor_match struct_name nargs in
+      let ctor_idx =
+        match matching_ctor with
+        | Some f -> Option.value f.index ~default:default_ctor
+        | None -> default_ctor
+      in
+      (match matching_ctor with
+      | Some f -> (
+          match f.index with
+          | Some fno ->
+              let ctor = Ain.get_function_by_index ctx.ain fno in
+              let params = Ain.Function.logical_parameters ctor in
+              let n = min (List.length args) (List.length params) in
+              List.iter2_exn
+                (List.take args n)
+                (List.take params n)
+                ~f:(fun arg (var : Ain.Variable.t) ->
+                  match var.value_type with
+                  | Ain.Type.Delegate _ | Ain.Type.Method | Ain.Type.IFace _ ->
+                      self#compile_argument arg var.value_type
+                  | Ain.Type.Ref _ | Ain.Type.Wrap _ -> (
+                      match arg with
+                      | Some expr when is_variable_ref expr.node ->
+                          self#compile_argument arg var.value_type
+                      | _ -> Option.iter arg ~f:self#compile_expression)
+                  | _ -> self#compile_argument arg var.value_type)
+          | None ->
+              List.iter args ~f:(fun arg ->
+                  Option.iter arg ~f:self#compile_expression))
+      | None ->
+          List.iter args ~f:(fun arg -> Option.iter arg ~f:self#compile_expression));
+      self#write_instruction2 NEW s_no ctor_idx
 
     (** Emit the code to call a method. The object upon which the method is to
         be called should already be on the stack before this code is executed.
@@ -1079,6 +2888,89 @@ class jaf_compiler ctx debug_info =
       else (
         self#compile_function_arguments args f;
         self#write_instruction1 CALLMETHOD method_no)
+
+    method compile_method_call_for_receiver ?(concrete = false)
+        ?(direct_getter_rank = false) ?(prefer_first_duplicate = false)
+        receiver_ty args method_no =
+      let f = Ain.get_function_by_index ctx.ain method_no in
+      let emitted_self_event_accessor_update =
+        Ain.version_gte ctx.ain (12, 0)
+        &&
+        match (current_function, args) with
+        | Some current, [ Some rhs ] when current.index = method_no -> (
+            let event_name_and_op =
+              match String.chop_suffix f.name ~suffix:"::add" with
+              | Some prefix -> Some (prefix, DG_PLUSA)
+              | None -> (
+                  match String.chop_suffix f.name ~suffix:"::remove" with
+                  | Some prefix -> Some (prefix, DG_MINUSA)
+                  | None -> None)
+            in
+            let owner_struct =
+              match f.struct_type with
+              | Some sno -> Some (Ain.get_struct_by_index ctx.ain sno)
+              | None -> (
+                  match String.lsplit2 f.name ~on:'@' with
+                  | Some (struct_name, _) -> Ain.get_struct ctx.ain struct_name
+                  | None -> None)
+            in
+            match (owner_struct, event_name_and_op) with
+            | Some s, Some (prefix, op) -> (
+                let event_name =
+                  match String.rsplit2 prefix ~on:'@' with
+                  | Some (_, name) -> name
+                  | None -> prefix
+                in
+                let backing_name = "<" ^ event_name ^ ">" in
+                match
+                  List.find s.members ~f:(fun (m : Ain.Variable.t) ->
+                      String.equal m.name backing_name)
+                with
+                | Some member ->
+                    self#write_instruction1 PUSH member.index;
+                    self#write_instruction0 REF;
+                    self#compile_lvalue rhs;
+                    self#write_instruction0 op;
+                    self#write_instruction0 POP;
+                    true
+                | None -> false)
+            | _ -> false)
+        | _ -> false
+      in
+      if emitted_self_event_accessor_update then ()
+      else if Ain.version ctx.ain > 8 then (
+        self#compile_method_selector ~concrete ~direct_getter_rank receiver_ty
+          ~prefer_first_duplicate method_no;
+        self#compile_function_arguments args f;
+        self#write_instruction1 CALLMETHOD f.nr_args)
+      else (
+        self#compile_function_arguments args f;
+        self#write_instruction1 CALLMETHOD method_no)
+
+    method lvalue_storage_is_v12_iface (e : expression) =
+      (* Recognize both bare [IFace _] storage (e.g. param/local) and
+         [Wrap (IFace _)] storage (e.g. foreach-bound iface var). The
+         comparison handler at line ~2880 emits an extra [POP] for
+         iface-vs-NULL comparisons; without recognizing Wrap, the POP
+         is skipped and stack discipline is off. *)
+      let rec is_iface_ty = function
+        | Ain.Type.IFace _ -> true
+        | Ain.Type.Wrap inner -> is_iface_ty inner
+        | _ -> false
+      in
+      Ain.version_gte ctx.ain (12, 0)
+      &&
+      match e.node with
+      | Ident (_, LocalVariable (i, _)) ->
+          is_iface_ty (self#get_local i).value_type
+      | Ident (_, GlobalVariable i) ->
+          is_iface_ty (Ain.get_global_by_index ctx.ain i).value_type
+      | Member (_, _, ClassVariable _) ->
+          is_iface_ty (self#member_type e)
+      | DummyRef (var_no, _) ->
+          is_iface_ty (self#get_local var_no).value_type
+      | Cast (_, inner) -> self#lvalue_storage_is_v12_iface inner
+      | _ -> false
 
     (** Emit the code to compute an expression. Computing an expression produces
         a value (of the expression's value type) on the stack. *)
@@ -1117,13 +3009,26 @@ class jaf_compiler ctx debug_info =
       | Ident (_, CapturedVariable (i, level)) ->
           (* v11 captured-variable rvalue: PUSHLOCALPAGE + level *
              X_GETENV walks frames up to the enclosing scope, then
-             read the var by index using the lambda-side type. *)
+             read the var by index. Dereference using the PARENT slot's
+             ain type (not [expr.ty]) — foreach iteration vars are
+             stored as [Wrap String], which needs [REFREF; REF; A_REF],
+             whereas [expr.ty] from the lambda body just sees [String]
+             and would emit a plain [REF] that loads the ref-handle
+             instead of the underlying string. *)
           self#write_instruction0 PUSHLOCALPAGE;
           for _ = 1 to level do
             self#write_instruction0 X_GETENV
           done;
           self#write_instruction1 PUSH i;
-          self#compile_dereference (jaf_to_ain_type expr.ty)
+          let ty =
+            match List.nth enclosing_functions (level - 1) with
+            | Some parent ->
+                (match List.nth parent.vars i with
+                | Some (v : Ain.Variable.t) -> v.value_type
+                | None -> jaf_to_ain_type expr.ty)
+            | None -> jaf_to_ain_type expr.ty
+          in
+          self#compile_dereference ty
       | FuncAddr (_, Some no) ->
           (* v11 method-refs are 2-slot values (object_page +
              func_index). Free functions use [-1] as the null
@@ -1167,7 +3072,11 @@ class jaf_compiler ctx debug_info =
       | Unary (LogNot, e) ->
           self#compile_expression e;
           self#write_instruction0 NOT;
-          if Ain.version ctx.ain > 8 then self#write_instruction0 ITOB
+          (* v11 NOT leaves non-bool input as-is; ITOB normalises to 0/1.
+             v12: original never emits ITOB after NOT — NOT already
+             produces 0/1 in v12 semantics. *)
+          if Ain.version ctx.ain > 8 && Ain.version_lt ctx.ain (12, 0) then
+            self#write_instruction0 ITOB
       | Unary (BitNot, e) ->
           self#compile_expression e;
           self#write_instruction0 COMPL
@@ -1223,6 +3132,35 @@ class jaf_compiler ctx debug_info =
           self#write_address_at rhs_false_addr current_address;
           self#write_instruction1 PUSH 0;
           self#write_address_at true_addr current_address
+      | Binary
+          ( ((RefEqual | RefNEqual) as op),
+            ( { node =
+                  DummyRef
+                    ( _,
+                      { node =
+                          NullCoalesce
+                            (({ node = Call _; _ } as option_call),
+                             { node = Null; _ });
+                        _ } );
+                _ } as a ),
+            { node = Null; _ } )
+        when Ain.version_gte ctx.ain (12, 0) -> (
+          match self#ain_call_return_type option_call with
+          | Some (Ain.Type.Option _) ->
+              self#compile_lvalue a;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0;
+              let cmp =
+                match op with
+                | RefEqual -> R_EQUALE
+                | RefNEqual -> R_NOTE
+                | _ -> assert false
+              in
+              self#write_instruction0 cmp
+          | _ ->
+              compiler_bug
+                "option-null DummyRef compare expected option-returning call"
+                (Some (ASTExpression expr)))
       | Binary (op, a, b) -> (
           (match op with
           (* v11 ref/wrap === / !== handling. See the operator case
@@ -1230,12 +3168,27 @@ class jaf_compiler ctx debug_info =
              match alice.exe's emission. *)
           | RefEqual | RefNEqual ->
               self#compile_lvalue a;
+              (match (a.ty, b.node) with
+              | (Struct (name, _) | Ref (Struct (name, _))), Null
+                when Ain.version_gte ctx.ain (12, 0)
+                     && Hashtbl.mem ctx.interface_names name ->
+                  self#write_instruction0 POP
+              | _ -> ());
               let lhs_is_call_or_dummy =
                 match a.node with
                 | Call _ | DummyRef _ -> true
                 | _ -> false
               in
               (match a.ty with
+              | Wrap (Struct (name, _) | Ref (Struct (name, _)))
+                when Ain.version_gte ctx.ain (12, 0)
+                     && Hashtbl.mem ctx.interface_names name ->
+                  (* v12 [Wrap (IFace _)] storage: [compile_lvalue_after]
+                     emitted a single [REFREF] leaving the 2-slot iface
+                     fat-ref on the stack. For comparison vs NULL we
+                     want just the page (1 slot) — add a [REF] to
+                     collapse the fat-ref to the page value. *)
+                  self#write_instruction0 REF
               | Wrap (Struct _ | Array _ | HLLParam | Delegate _)
                 when Ain.version ctx.ain > 8 ->
                   (* foreach loop var (typed [Wrap HLLParam] by the
@@ -1264,25 +3217,49 @@ class jaf_compiler ctx debug_info =
               | _ -> self#compile_expression b)
           | _ ->
               self#compile_expression a;
+              (match (op, b.node) with
+              | (Equal | NEqual), Null
+                when Ain.version_gte ctx.ain (12, 0)
+                     && self#lvalue_storage_is_v12_iface a ->
+                  self#write_instruction0 POP;
+                  (* iface→concrete X_ICAST leaves [page, vofs, validator]
+                     on stack; the standard POP above drops the validator
+                     (matching the Wrap<IFace>/IFace fat-ref case). For a
+                     concrete-struct cast result we want only page for the
+                     NULL compare, so drop vofs too. Match original's
+                     `X_ICAST struct(N); POP; POP; PUSH -1; NOTE` pattern
+                     used in boolean compare context (e.g. LoadActivity's
+                     `T(field) != NULL`). Doing this here rather than
+                     inside Cast preserves the stack shape for the
+                     assignment path (R_ASSIGN with NULL guard at e.g.
+                     SceneBattle@OnSkillEffectPostProcess). *)
+                  (match a.node with
+                  | Cast ((Struct (n, _) | Ref (Struct (n, _))), _)
+                    when not (Hashtbl.mem ctx.interface_names n) ->
+                      self#write_instruction0 POP
+                  | _ -> ())
+              | _ -> ());
               self#compile_expression b);
           match (a.ty, op) with
-          | (Int | LongInt | Bool), Equal -> self#write_instruction0 EQUALE
-          | (Int | LongInt | Bool), NEqual -> self#write_instruction0 NOTE
-          | Int, Plus -> self#write_instruction0 ADD
-          | Int, Minus -> self#write_instruction0 SUB
-          | Int, Times -> self#write_instruction0 MUL
-          | Int, Divide -> self#write_instruction0 DIV
-          | Int, Modulo -> self#write_instruction0 MOD
-          | (Int | LongInt), LT -> self#write_instruction0 LT
-          | (Int | LongInt), GT -> self#write_instruction0 GT
-          | (Int | LongInt), LTE -> self#write_instruction0 LTE
-          | (Int | LongInt), GTE -> self#write_instruction0 GTE
-          | (Int | Bool), BitOr -> self#write_instruction0 OR
-          | (Int | Bool), BitXor -> self#write_instruction0 XOR
-          | (Int | Bool), BitAnd -> self#write_instruction0 AND
-          | (Int | Bool), LShift -> self#write_instruction0 LSHIFT
-          | (Int | Bool), RShift -> self#write_instruction0 RSHIFT
-          | Int, (LogOr | LogAnd) ->
+          | (Int | LongInt | Bool | Enum _), Equal ->
+              self#write_instruction0 EQUALE
+          | (Int | LongInt | Bool | Enum _), NEqual ->
+              self#write_instruction0 NOTE
+          | (Int | Enum _), Plus -> self#write_instruction0 ADD
+          | (Int | Enum _), Minus -> self#write_instruction0 SUB
+          | (Int | Enum _), Times -> self#write_instruction0 MUL
+          | (Int | Enum _), Divide -> self#write_instruction0 DIV
+          | (Int | Enum _), Modulo -> self#write_instruction0 MOD
+          | (Int | LongInt | Enum _), LT -> self#write_instruction0 LT
+          | (Int | LongInt | Enum _), GT -> self#write_instruction0 GT
+          | (Int | LongInt | Enum _), LTE -> self#write_instruction0 LTE
+          | (Int | LongInt | Enum _), GTE -> self#write_instruction0 GTE
+          | (Int | Bool | Enum _), BitOr -> self#write_instruction0 OR
+          | (Int | Bool | Enum _), BitXor -> self#write_instruction0 XOR
+          | (Int | Bool | Enum _), BitAnd -> self#write_instruction0 AND
+          | (Int | Bool | Enum _), LShift -> self#write_instruction0 LSHIFT
+          | (Int | Bool | Enum _), RShift -> self#write_instruction0 RSHIFT
+          | (Int | Enum _), (LogOr | LogAnd) ->
               compiler_bug "invalid integer operator"
                 (Some (ASTExpression expr))
           | LongInt, Plus -> self#write_instruction0 LI_ADD
@@ -1313,13 +3290,18 @@ class jaf_compiler ctx debug_info =
           | String, LTE -> self#write_instruction0 S_LTE
           | String, GTE -> self#write_instruction0 S_GTE
           | String, Modulo ->
-              let int_of_t (t : Ain.Type.t) =
+              let rec int_of_t (t : Ain.Type.t) =
                 match t with
                 | Int -> 2
+                | Enum _ -> 2
                 | Float -> 3
                 | String -> 4
                 | Bool -> 48
                 | LongInt -> 56
+                (* v12 [string % wrap_or_hll_param]: format-arg whose
+                   compile-time type is unknown. Best guess [Int]. *)
+                | HLLParam -> 2
+                | Wrap inner -> int_of_t inner
                 | _ ->
                     compiler_bug "invalid type for string formatting"
                       (Some (ASTExpression expr))
@@ -1329,6 +3311,19 @@ class jaf_compiler ctx debug_info =
               ( Minus | Times | Divide | BitOr | BitXor | BitAnd | LShift
               | RShift | LogOr | LogAnd ) ) ->
               compiler_bug "invalid string operator" (Some (ASTExpression expr))
+          (* v12 [p === NULL] / [p === q] where p is a plain Struct
+             (interface or class slot, not [Ref Struct]). Both sides
+             are page-ids on the stack — plain EQUALE / NOTE. Also
+             cover scalar / enum cases where the lhs is an int / null
+             sentinel (e.g. [Parse() ?? NULL] of an enum). *)
+          | ( ( Struct _ | Array _ | String | Delegate _ | Int | Bool
+              | Enum _ | LongInt | NullType | HLLParam ),
+              RefEqual ) ->
+              self#write_instruction0 EQUALE
+          | ( ( Struct _ | Array _ | String | Delegate _ | Int | Bool
+              | Enum _ | LongInt | NullType | HLLParam ),
+              RefNEqual ) ->
+              self#write_instruction0 NOTE
           | (Ref t | Wrap t), RefEqual ->
               (* For [ref_var === NULL]/[ref_var === other_ref], both
                  sides are 2-slot fat-ref pairs and R_EQUALE compares
@@ -1354,15 +3349,205 @@ class jaf_compiler ctx debug_info =
               else self#write_instruction0 NOTE
           | FuncType _, Equal -> self#write_instruction0 EQUALE
           | FuncType _, NEqual -> self#write_instruction0 NOTE
+          (* v12 struct/array/delegate page-ref identity compare against
+             NULL ([-1]) or another page-ref: both sides reduce to a
+             single int (the page id), so plain EQUALE/NOTE works. *)
+          | (Struct _ | Array _ | Delegate _ | HLLParam), Equal ->
+              self#write_instruction0 EQUALE
+          | (Struct _ | Array _ | Delegate _ | HLLParam), NEqual ->
+              self#write_instruction0 NOTE
           | _ ->
               compiler_bug "invalid binary expression"
                 (Some (ASTExpression expr)))
       | Assign (op, lhs, rhs) -> (
-          self#compile_lvalue lhs;
+          let lhs_is_v12_iface =
+            Ain.version_gte ctx.ain (12, 0)
+            && is_variable_ref lhs.node
+            &&
+            match lhs.node with
+            | Ident (_, LocalVariable (i, _)) -> (
+                match (self#get_local i).value_type with
+                | Ain.Type.IFace _ -> true
+                | Ain.Type.Struct s ->
+                    let name =
+                      (Ain.get_struct_by_index ctx.ain s).name
+                    in
+                    Hashtbl.mem ctx.interface_names name
+                | Ain.Type.Ref (Ain.Type.Struct s) ->
+                    let name =
+                      (Ain.get_struct_by_index ctx.ain s).name
+                    in
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false)
+            | Ident (_, GlobalVariable i) -> (
+                match (Ain.get_global_by_index ctx.ain i).value_type with
+                | Ain.Type.IFace _ -> true
+                | Ain.Type.Struct s ->
+                    let name =
+                      (Ain.get_struct_by_index ctx.ain s).name
+                    in
+                    Hashtbl.mem ctx.interface_names name
+                | Ain.Type.Ref (Ain.Type.Struct s) ->
+                    let name =
+                      (Ain.get_struct_by_index ctx.ain s).name
+                    in
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false)
+            | Member (_, _, ClassVariable _) -> (
+                match self#member_type lhs with
+                | Ain.Type.IFace _ -> true
+                | _ -> false)
+            | _ -> (
+                match lhs.ty with
+                | Struct (name, _) | Ref (Struct (name, _)) | Unresolved name
+                  ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false)
+          in
+          let pre_emit_v12_delegate_assignment_lambda () =
+            if Ain.version_gte ctx.ain (12, 0) then
+              let rec find_lambda (e : expression) =
+                match e.node with
+                | Lambda f -> Some f
+                | Cast (_, inner) -> find_lambda inner
+                | _ -> None
+              in
+              match (op, lhs.ty, find_lambda rhs) with
+              | EqAssign, Delegate _, Some f
+                when not (Hashtbl.mem v12_assignment_lambdas
+                            (Option.value_exn f.index)) ->
+                  let lambda_idx = Option.value_exn f.index in
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#compile_function f;
+                  self#write_address_at jump_addr current_address;
+                  Hashtbl.set v12_assignment_lambdas ~key:lambda_idx ~data:()
+              | _ -> ()
+          in
+          pre_emit_v12_delegate_assignment_lambda ();
+          self#pre_emit_v12_rhs_lambdas rhs;
+          let emitted_v12_iface_cast_rhs_first_assign =
+            match (op, lhs.node, rhs.node) with
+            | ( EqAssign,
+                Ident (_, LocalVariable (lhs_i, _)),
+                Cast
+                  ( (Struct (dst_name, dst_sno) | Ref (Struct (dst_name, dst_sno))),
+                    ({ ty =
+                         (Struct (src_name, _src_sno)
+                         | Ref (Struct (src_name, _src_sno)));
+                       _ } as inner) ) )
+              when lhs_is_v12_iface
+                   && Hashtbl.mem ctx.interface_names dst_name ->
+                self#compile_expression inner;
+                if Hashtbl.mem ctx.interface_names src_name then
+                  self#write_instruction0 POP;
+                self#write_instruction1 X_ICAST dst_sno;
+                self#write_instruction0 POP;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 DUP_X2;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH lhs_i;
+                self#write_instruction0 DUP_X2;
+                self#write_instruction0 POP;
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 DUP;
+                self#write_instruction0 SP_INC;
+                true
+            | _ -> false
+          in
+          if not emitted_v12_iface_cast_rhs_first_assign then (
+          let emitted_v12_iface_cast_assign =
+            match (op, lhs.node, rhs.node) with
+            | ( EqAssign,
+                Ident (_, LocalVariable (lhs_i, _)),
+                Cast
+                  ( (Struct (_, dst_sno) | Ref (Struct (_, dst_sno))),
+                    ({ ty =
+                         (Struct (src_name, _) | Ref (Struct (src_name, _)));
+                       _ } as inner) ) )
+              when lhs_is_v12_iface
+                   && is_variable_ref inner.node
+                   && Hashtbl.mem ctx.interface_names src_name ->
+                self#compile_variable_ref inner;
+                self#write_instruction0 REF;
+                self#write_instruction1 X_ICAST dst_sno;
+                self#write_instruction0 POP;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 DUP_X2;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH lhs_i;
+                self#write_instruction0 DUP_X2;
+                self#write_instruction0 POP;
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 DUP;
+                self#write_instruction0 SP_INC;
+                true
+            | _ -> false
+          in
+          if not emitted_v12_iface_cast_assign then (
+          let emitted_v12_ref_struct_direct_assign =
+            let lhs_storage_is_ref_struct =
+              match lhs.node with
+              | Ident (_, LocalVariable (i, _)) -> (
+                  match (self#get_local i).value_type with
+                  | Ain.Type.Ref (Struct _) -> true
+                  | _ -> false)
+              | Ident (_, GlobalVariable i) -> (
+                  match (Ain.get_global_by_index ctx.ain i).value_type with
+                  | Ain.Type.Ref (Struct _) -> true
+                  | _ -> false)
+              | Member (_, _, ClassVariable _) -> (
+                  match self#member_type lhs with
+                  | Ain.Type.Ref (Struct _) -> true
+                  | _ -> false)
+              | _ -> false
+            in
+            Ain.version_gte ctx.ain (12, 0)
+            && (not lhs_is_v12_iface)
+            && lhs_storage_is_ref_struct
+            &&
+            match (op, rhs.node, rhs.ty, lhs.node) with
+            | ( EqAssign,
+                (Null | Cast ((Struct _ | Ref (Struct _)), _)),
+                _,
+                (Ident _ | Member (_, _, ClassVariable _)) )
+            | ( EqAssign,
+                _,
+                (Struct _ | Ref (Struct _)),
+                (Ident _ | Member (_, _, ClassVariable _)) ) ->
+                self#compile_variable_ref lhs;
+                self#compile_expression rhs;
+                self#write_instruction0 ASSIGN;
+                self#write_instruction0 SP_INC;
+                true
+            | _ -> false
+          in
+          if not emitted_v12_ref_struct_direct_assign then (
+          if lhs_is_v12_iface then self#compile_variable_ref lhs
+          else self#compile_lvalue lhs;
           self#compile_expression rhs;
           match (op, rhs.ty) with
+          | EqAssign, NullType when lhs_is_v12_iface ->
+              self#write_instruction1 PUSH 0;
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 DUP;
+              self#write_instruction0 SP_INC
+          | EqAssign, _ when lhs_is_v12_iface ->
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 DUP;
+              self#write_instruction0 SP_INC
           | EqAssign, _ when Poly.(lhs.ty = Bool) ->
-              (if Ain.version ctx.ain > 8 then
+              (* v11 ASSIGN-to-bool normalises non-bool rhs via ITOB.
+                 v12 ASSIGN tolerates any int value in a bool slot —
+                 original Rance10 emits ITOB only after [PUSH N; REF]
+                 (reading an int slot as bool), never after constants
+                 or expressions. Skip ITOB for v12. *)
+              (if Ain.version_gte ctx.ain (11, 0)
+                  && Ain.version_lt ctx.ain (12, 0) then
                  match rhs.node with
                  | ConstInt _ -> self#write_instruction0 ITOB
                  | _
@@ -1371,18 +3556,18 @@ class jaf_compiler ctx debug_info =
                      self#write_instruction0 ITOB
                  | _ -> ());
               self#write_instruction0 ASSIGN
-          | EqAssign, (Int | Bool | TyFunction _ | FuncType _) ->
+          | EqAssign, (Int | Bool | Enum _ | TyFunction _ | FuncType _) ->
               self#write_instruction0 ASSIGN
-          | PlusAssign, (Int | Bool) -> self#write_instruction0 PLUSA
-          | MinusAssign, (Int | Bool) -> self#write_instruction0 MINUSA
-          | TimesAssign, (Int | Bool) -> self#write_instruction0 MULA
-          | DivideAssign, (Int | Bool) -> self#write_instruction0 DIVA
-          | ModuloAssign, (Int | Bool) -> self#write_instruction0 MODA
-          | OrAssign, (Int | Bool) -> self#write_instruction0 ORA
-          | XorAssign, (Int | Bool) -> self#write_instruction0 XORA
-          | AndAssign, (Int | Bool) -> self#write_instruction0 ANDA
-          | LShiftAssign, (Int | Bool) -> self#write_instruction0 LSHIFTA
-          | RShiftAssign, (Int | Bool) -> self#write_instruction0 RSHIFTA
+          | PlusAssign, (Int | Bool | Enum _) -> self#write_instruction0 PLUSA
+          | MinusAssign, (Int | Bool | Enum _) -> self#write_instruction0 MINUSA
+          | TimesAssign, (Int | Bool | Enum _) -> self#write_instruction0 MULA
+          | DivideAssign, (Int | Bool | Enum _) -> self#write_instruction0 DIVA
+          | ModuloAssign, (Int | Bool | Enum _) -> self#write_instruction0 MODA
+          | OrAssign, (Int | Bool | Enum _) -> self#write_instruction0 ORA
+          | XorAssign, (Int | Bool | Enum _) -> self#write_instruction0 XORA
+          | AndAssign, (Int | Bool | Enum _) -> self#write_instruction0 ANDA
+          | LShiftAssign, (Int | Bool | Enum _) -> self#write_instruction0 LSHIFTA
+          | RShiftAssign, (Int | Bool | Enum _) -> self#write_instruction0 RSHIFTA
           | CharAssign, Int -> self#write_instruction0 C_ASSIGN
           | EqAssign, LongInt -> self#write_instruction0 LI_ASSIGN
           | PlusAssign, LongInt -> self#write_instruction0 LI_PLUSA
@@ -1405,7 +3590,10 @@ class jaf_compiler ctx debug_info =
               | FuncType (Some (_, ft_i)) ->
                   self#write_instruction1 PUSH ft_i;
                   self#write_instruction0 FT_ASSIGNS
-              | Delegate (Some (_, dg_i)) ->
+              | Delegate dg ->
+                  let dg_i =
+                    match dg with Some (_, dg_i) -> dg_i | None -> -1
+                  in
                   self#write_instruction1 PUSH (-1);
                   self#write_instruction0 SWAP;
                   (* v11 [DG_STR_TO_METHOD] takes the delegate type as
@@ -1443,7 +3631,10 @@ class jaf_compiler ctx debug_info =
                     (Some (ASTExpression expr)))
           | PlusAssign, String -> (
               match lhs.ty with
-              | Delegate (Some (_, dg_i)) ->
+              | Delegate dg ->
+                  let dg_i =
+                    match dg with Some (_, dg_i) -> dg_i | None -> -1
+                  in
                   self#write_instruction1 PUSH (-1);
                   self#write_instruction0 SWAP;
                   if Ain.version ctx.ain > 8 then (
@@ -1481,6 +3672,20 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 DELETE)
               else self#write_instruction0 DG_SET
           | EqAssign, Delegate _ -> self#write_instruction0 DG_ASSIGN
+          (* v12 [delegate += &Function]: the [&] operator types as
+             [TyFunction], same dispatch shape as [TyMethod]. Wrap with
+             [DG_NEW_FROM_METHOD] then [DG_PLUSA; DELETE]. *)
+          | PlusAssign, TyFunction _ when Ain.version ctx.ain > 8 ->
+              (match rhs.node with
+              | FuncAddr _
+              | Cast (_, { node = FuncAddr _; _ })
+              | Cast (_, { node = Member (_, _, ClassMethod _); _ })
+              | Cast (_, { node = Lambda _; _ })
+              | Lambda _ ->
+                  self#write_instruction0 DG_NEW_FROM_METHOD
+              | _ -> ());
+              self#write_instruction0 DG_PLUSA;
+              self#write_instruction0 DELETE
           | PlusAssign, TyMethod _ ->
               if Ain.version ctx.ain > 8 then (
                 (match rhs.node with
@@ -1495,8 +3700,54 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 DELETE)
               else self#write_instruction0 DG_ADD
           | PlusAssign, Delegate _ -> self#write_instruction0 DG_PLUSA
-          | MinusAssign, TyMethod _ -> self#write_instruction0 DG_ERASE
+          | MinusAssign, TyMethod _ ->
+              if Ain.version ctx.ain > 8 then (
+                (* v12 [event -= method]: the lhs already pushed
+                   [pageref, method_idx]; wrap to a one-entry delegate
+                   via [DG_NEW_FROM_METHOD], then subtract with
+                   [DG_MINUSA; DELETE].  The pre-v12 [DG_ERASE]
+                   shorthand expands with a spurious [PUSH -1; SWAP]
+                   that overrides the receiver page. *)
+                (match rhs.node with
+                | Member (_, _, ClassMethod _)
+                | Cast (_, { node = Member (_, _, ClassMethod _); _ })
+                | Lambda _ | FuncAddr _
+                | Cast (_, { node = FuncAddr _; _ })
+                | Cast (_, { node = Lambda _; _ }) ->
+                    self#write_instruction0 DG_NEW_FROM_METHOD
+                | _ -> ());
+                self#write_instruction0 DG_MINUSA;
+                self#write_instruction0 DELETE)
+              else self#write_instruction0 DG_ERASE
           | MinusAssign, Delegate _ -> self#write_instruction0 DG_MINUSA
+          | EqAssign, (Struct _ | Ref (Struct _))
+            when Ain.version_gte ctx.ain (12, 0)
+                 &&
+                 (match lhs.node with
+                 | Ident (_, LocalVariable (i, _)) -> (
+                     match (self#get_local i).value_type with
+                     | Ain.Type.IFace _ -> true
+                     | _ -> false)
+                 | Ident (_, GlobalVariable i) -> (
+                     match (Ain.get_global_by_index ctx.ain i).value_type with
+                     | Ain.Type.IFace _ -> true
+                     | _ -> false)
+                 | Member (_, _, ClassVariable _) -> (
+                     match self#member_type lhs with
+                     | Ain.Type.IFace _ -> true
+                     | _ -> false)
+                 | _ -> (
+                     match lhs.ty with
+                     | Struct (name, _) | Ref (Struct (name, _)) ->
+                         Hashtbl.mem ctx.interface_names name
+                     | _ -> false)) ->
+              (* v12 interface values are encoded as a two-slot ref-like
+                 pair. Assigning a cast/concrete struct expression into an
+                 interface local must transfer that pair with R_ASSIGN;
+                 SR_ASSIGN treats the first slot as a struct page and asks
+                 the VM to deep-copy it, which can fail as PAGE_COPY page 0
+                 when the source is NULL. *)
+              self#write_instruction0 R_ASSIGN
           | EqAssign, Struct (_, sno) | EqAssign, Ref (Struct (_, sno)) ->
               (* Pre-v11 [SR_ASSIGN] reads the struct type id from a
                  prior [PUSH]; ain v0/v1 and v11 have no such operand.
@@ -1513,7 +3764,13 @@ class jaf_compiler ctx debug_info =
               else (
                 ignore sno;
                 match rhs.node with
-                | DummyRef (_, { node = Call _; _ }) ->
+                | DummyRef
+                    ( _,
+                      { node =
+                          ( Call _ | New { ty = Struct _; _ }
+                          | NewCall ({ ty = Struct _; _ }, _) );
+                        _ } )
+                | New { ty = Struct _; _ } ->
                     self#write_instruction0 A_REF
                 | _ -> ());
               self#write_instruction0 SR_ASSIGN
@@ -1528,8 +3785,27 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 A_REF
               | _ -> ());
               self#write_instruction0 X_SET
+          (* v12 [delegate_var = NULL]: nullify by assigning the
+             [-1]-pair already pushed by compile_expression on a
+             NullType rhs. Dispatch on the lhs page-type. *)
+          | EqAssign, NullType -> (
+              match lhs.ty with
+              | Delegate _ ->
+                  if Ain.version ctx.ain > 8 then (
+                    self#write_instruction0 DG_ASSIGN;
+                    self#write_instruction0 DELETE)
+                  else self#write_instruction0 DG_SET
+              | Struct _ | Ref (Struct _) ->
+                  self#write_instruction0 SR_ASSIGN
+              | Array _ | Ref (Array _) ->
+                  self#write_instruction0 X_SET
+              | String -> self#write_instruction0 S_ASSIGN
+              | _ ->
+                  compiler_bug "NULL assignment to unsupported type"
+                    (Some (ASTExpression expr)))
           | _, _ ->
               compiler_bug "invalid assignment" (Some (ASTExpression expr)))
+          )))
       | Seq (a, b) ->
           self#compile_expr_and_pop a;
           self#compile_expression b
@@ -1548,16 +3824,82 @@ class jaf_compiler ctx debug_info =
           self#write_address_at jump_addr current_address
       | Cast (dst_t, e) -> (
           let src_t = e.ty in
-          self#compile_expression e;
+          let emitted_v12_iface_var_cast =
+            match (src_t, dst_t) with
+            | (Struct (src_name, src_sno) | Ref (Struct (src_name, src_sno))),
+              (Struct (dst_name, dst_sno) | Ref (Struct (dst_name, dst_sno)))
+              when Ain.version_gte ctx.ain (12, 0)
+                   && not (Int.equal src_sno dst_sno)
+                   && is_variable_ref e.node
+                   && Hashtbl.mem ctx.interface_names src_name ->
+                self#compile_variable_ref e;
+                self#write_instruction0 REF;
+                self#write_instruction1 X_ICAST dst_sno;
+                if Hashtbl.mem ctx.interface_names dst_name then (
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH 0;
+                  self#write_address_at jump_addr current_address)
+                else
+                  (* iface→concrete X_ICAST leaves [page, vofs, validator]
+                     on stack. We deliberately leave all three: the
+                     parent context decides whether to drop down to just
+                     [page] (boolean compare via the consumer-side POP at
+                     the BinaryOp `!= NULL` site) or to consume all three
+                     under a NULL guard for ref assignment (R_ASSIGN
+                     pattern: `PUSH -1; EQUALE; IFZ skip; POP POP; PUSH
+                     -1; PUSH 0; skip:; R_ASSIGN`). Emitting POP POP here
+                     unconditionally was the 7dbcbaf approach and broke
+                     the assignment path — the NULL guard then misfires
+                     against [page] instead of [validator], the
+                     subsequent R_ASSIGN reads stack garbage and crashes
+                     with `Page=0,Index=<big>` (close-collection
+                     teardown). *)
+                  ();
+                true
+            | _ -> false
+          in
+          if not emitted_v12_iface_var_cast then (
+          (* v12 [IfaceName(this)] cast: compile_expression This for a
+             Struct-typed receiver emits [PUSHSTRUCTPAGE; A_REF]. The
+             extra A_REF bumps the struct page's refcount, but X_ICAST
+             below consumes the page without taking that ownership, so
+             the leftover ref leaks and the runtime's DeletePage
+             eventually fails (refcount never reaches 0). Original
+             Rance10 emits a plain PUSHSTRUCTPAGE here. Bypass the
+             auto-A_REF wrapper by emitting PUSHSTRUCTPAGE directly when
+             the inner is bare This destined for a struct/iface X_ICAST. *)
+          let is_v12_this_to_struct_cast =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match (e.node, src_t, dst_t) with
+            | This, Struct _, (Struct _ | Ref (Struct _)) -> true
+            | _ -> false
+          in
+          if is_v12_this_to_struct_cast then
+            self#write_instruction0 PUSHSTRUCTPAGE
+          else
+            self#compile_expression e;
           match (src_t, dst_t) with
           | Int, Int -> ()
+          | Enum _, (Int | Enum _) -> ()
+          | Int, Enum _ -> ()
           | LongInt, LongInt -> ()
-          | (Int | LongInt), Bool -> self#write_instruction0 ITOB
-          | (Int | LongInt), Float -> self#write_instruction0 ITOF
-          | (Bool | Int), LongInt -> self#write_instruction0 ITOLI
-          | LongInt, Int -> ()
-          | (Bool | Int | LongInt), String -> self#write_instruction0 I_STRING
-          | Bool, (Bool | Int) -> ()
+          | (Int | LongInt | Enum _), Bool -> self#write_instruction0 ITOB
+          | (Int | LongInt | Enum _), Float -> self#write_instruction0 ITOF
+          | (Bool | Int | Enum _), LongInt -> self#write_instruction0 ITOLI
+          | LongInt, (Int | Enum _) -> ()
+          | (Bool | Int | LongInt | Enum _), String ->
+              self#write_instruction0 I_STRING
+          | Bool, (Bool | Int | Enum _) -> ()
           | Float, Float -> ()
           | Float, Int -> self#write_instruction0 FTOI
           | Float, LongInt ->
@@ -1568,7 +3910,10 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 FTOS
           | String, String -> ()
           | String, Int -> self#write_instruction0 STOI
-          | String, Delegate (Some (_, dg_i)) ->
+          | String, Delegate dg ->
+              let dg_i =
+                match dg with Some (_, dg_i) -> dg_i | None -> -1
+              in
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 SWAP;
               if Ain.version ctx.ain > 8 then (
@@ -1595,14 +3940,107 @@ class jaf_compiler ctx debug_info =
               else (
                 self#write_instruction1 PUSH (-1);
                 self#write_instruction0 SWAP)
+          (* v12 originals emit X_ICAST for checked interface casts
+             between distinct struct ids. *)
+          | (Struct (src_name, src_sno) | Ref (Struct (src_name, src_sno))),
+            (Struct (dst_name, dst_sno) | Ref (Struct (dst_name, dst_sno))) ->
+              if
+                Ain.version_gte ctx.ain (12, 0)
+                && not (Int.equal src_sno dst_sno)
+              then (
+                let src_is_iface = Hashtbl.mem ctx.interface_names src_name in
+                let dst_is_iface = Hashtbl.mem ctx.interface_names dst_name in
+                if src_is_iface then
+                  self#write_instruction0 POP;
+                self#write_instruction1 X_ICAST dst_sno;
+                if
+                  src_is_iface && dst_is_iface
+                  && not v12_iface_local_init_owns_cast_guard
+                then (
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH 0;
+                  self#write_address_at jump_addr current_address)
+                else if
+                  src_is_iface && not v12_iface_local_init_owns_cast_guard
+                then (
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction0 POP;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_address_at jump_addr current_address)
+                else if
+                  dst_is_iface && not v12_iface_local_init_owns_cast_guard
+                then (
+                  (* Struct -> Iface cast (src not iface): X_ICAST pushes
+                     3 items [validator (top); vofs_for_dst; original_page].
+                     The downstream consumer (e.g. IFace RETURN) reads the
+                     2-item pair [vofs (top); obj]. Without the null check
+                     pattern, the trailing validator stays on top and the
+                     consumer misreads (vofs=validator, obj=vofs). Emit the
+                     same pattern as the iface->iface arm above so success
+                     collapses to [vofs; original_page] and failure to
+                     [-1; 0]. *)
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let ifnz_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifnz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH 0;
+                  self#write_address_at jump_addr current_address))
+          (* v12 [Wrap T] is the v11 fat-ref encoding. Cast to a
+             concrete struct discards the wrap — both representations
+             share the underlying page-ref at the VM level. *)
+          | Wrap (Struct _ | HLLParam), Struct _ -> ()
+          | Struct _, Wrap (Struct _ | HLLParam) -> ()
+          (* v12 wildcard sink/source: typed value flowing through an
+             [hll_param] sentinel slot. No conversion needed. *)
+          | HLLParam, _ | _, HLLParam -> ()
           | _ ->
               compiler_bug
                 (Printf.sprintf "invalid cast from %s to %s"
                    (jaf_type_to_string src_t) (jaf_type_to_string dst_t))
-                (Some (ASTExpression expr)))
+                (Some (ASTExpression expr))))
       | Subscript (obj, index) -> (
           self#compile_lvalue obj;
           self#compile_expression index;
+          (* v12: array of interface elements stores each entry as a
+             (page, vtable_offset) pair occupying 2 slots. Scale the
+             index by 2 and use REFREF to load the pair. The default
+             path below uses [REF; A_REF] which reads a single slot. *)
+          let element_is_v12_iface =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match expr.ty with
+            | Struct (name, _) | Wrap (Struct (name, _)) ->
+                Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          if element_is_v12_iface then (
+            self#write_instruction1 PUSH 2;
+            self#write_instruction0 MUL;
+            self#write_instruction0 REFREF)
+          else
           match obj.ty with
           | String -> self#write_instruction0 C_REF
           | _ -> self#compile_dereference (jaf_to_ain_type expr.ty))
@@ -1637,6 +4075,13 @@ class jaf_compiler ctx debug_info =
       | Member (_, _, (BuiltinMethod _ | BuiltinHLL _)) ->
           compiler_bug "tried to compile built-in method member expression"
             (Some (ASTExpression expr))
+      | Member (_, _, UnresolvedMember) when Poly.equal expr.ty HLLParam ->
+          (* v12 generic-receiver member access: type was widened to
+             [HLLParam] because the receiver type couldn't be resolved
+             (foreach loop var over a generic container, etc.). Push
+             a [-1] sentinel as a stub — round-trip is intentionally
+             broken on v12-wip. *)
+          self#write_instruction1 PUSH (-1)
       | Member (_, _, UnresolvedMember) ->
           compiler_bug "member expression has no member_type"
             (Some (ASTExpression expr))
@@ -1646,15 +4091,15 @@ class jaf_compiler ctx debug_info =
           compiler_bug "property member expression not rewritten"
             (Some (ASTExpression expr))
       | Member (_, _, ClassEvent _) ->
-          (* Type analysis rewrites [obj.E += h] / [-= h] for user-bodied
-             events into explicit add/remove method calls before codegen
-             runs. A bare [obj.E] read on a user-bodied event has no
-             defined semantics. *)
-          compiler_bug "event member expression not rewritten"
-            (Some (ASTExpression expr))
+          (* v12 user-bodied event read as a value (e.g.
+             [this.E.Empty()] or [bool b = e.IsBound]). The underlying
+             delegate has no exposed slot; push a [-1] sentinel as a
+             stub — v12-wip, round-trip intentionally broken. *)
+          self#write_instruction1 PUSH (-1)
       (* regular function call *)
       | Call (_, args, FunctionCall function_no) ->
           let f = Ain.get_function_by_index ctx.ain function_no in
+          self#pre_emit_lambda_args args;
           self#compile_function_arguments args f;
           self#write_instruction1 CALLFUNC function_no
       (* method call *)
@@ -1684,34 +4129,103 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 PUSH (-1);
                 self#write_instruction1 PUSH (-1)
           in
-          let is_dummyref =
-            match e.node with DummyRef _ -> true | _ -> false
+          let rec is_dummyref_shape (e : expression) =
+            match e.node with
+            | DummyRef _ -> true
+            (* v12 [Call(...)?.Method(...)] where the call returns a
+               plain struct (not a ref). [variableAlloc] only wraps
+               Calls whose ain-level return is [Ref]; plain-struct
+               returns reach here as bare [Call]. [compile_lvalue]
+               handles them like a single-slot page-ref, matching the
+               [DummyRef] path. *)
+            | Call (_, _, (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _))
+              -> true
+            (* v12 cast-receiver: [(Iface)expr?.Method(...)]. The cast
+               is a no-op at codegen (Struct↔Struct), so the receiver's
+               shape is whatever's inside. *)
+            | Cast (_, inner) -> is_dummyref_shape inner
+            | _ -> false
+          in
+          let is_dummyref = is_dummyref_shape e in
+          (* v12: walk through [Wrap T] to reach the underlying iface
+             type. foreach over `ref array@IFace` or `ref array@ref T`
+             binds the loop var as [Wrap (IFace _)] / [Wrap (Ref Struct)]
+             — the receiver shape decisions (DUP_U2 vs DUP, REFREF vs
+             REF) must look past the Wrap so dispatch sees the iface
+             fat-ref instead of the Wrap handle. Mirrors v12_iface_type
+             in the NullCoalesce path (codegen.ml:4932). Without this,
+             `Item?.Release()` inside `foreach (Item : this.ItemList)`
+             over an iface-array crashes at dispatch with garbage
+             vtable offset → REF Page=N elem_count=-1 (observed at
+             CEnqueteItemManager@Release during survey close). *)
+          let rec v12_iface_walk (ty : jaf_type) =
+            match ty with
+            | Struct (name, _) | Ref (Struct (name, _)) ->
+                Hashtbl.mem ctx.interface_names name
+            | Wrap inner when Ain.version_gte ctx.ain (12, 0) ->
+                v12_iface_walk inner
+            | _ -> false
+          in
+          let receiver_is_iface =
+            Ain.version_gte ctx.ain (12, 0) && v12_iface_walk e.ty
+          in
+          let receiver_is_casted_iface =
+            match e.node with
+            | Cast (Struct (name, _), _) | Cast (Ref (Struct (name, _)), _) ->
+                Ain.version_gte ctx.ain (12, 0)
+                && Hashtbl.mem ctx.interface_names name
+            | _ -> false
           in
           if is_dummyref then (
             self#compile_lvalue e;
-            self#write_instruction0 DUP;
+            if not receiver_is_casted_iface then
+              self#write_instruction0
+                (if receiver_is_iface then DUP_U2 else DUP);
             self#write_instruction1 PUSH (-1);
             self#write_instruction0 EQUALE;
             let ifnz_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
-            self#compile_method_call args method_no;
+            self#compile_method_call_for_receiver ~prefer_first_duplicate:true
+              e.ty args method_no;
             self#write_instruction1 PUSH 0;
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
             self#write_address_at ifnz_addr current_address;
-            self#write_instruction0 POP;
+            if receiver_is_iface then (
+              self#write_instruction0 POP;
+              self#write_instruction0 POP)
+            else self#write_instruction0 POP;
             push_null_sentinel ();
             self#write_address_at jump_addr current_address)
           else (
             self#compile_variable_ref e;
+            (if Ain.version ctx.ain > 8 then
+               match e.node with
+               | Ident (_, LocalVariable (i, _)) -> (
+                   match (self#get_local i).value_type with
+                   | Ain.Type.Wrap (Ain.Type.Ref _) ->
+                       self#write_instruction0 REFREF
+                   (* v12 foreach-bound iface var has storage type
+                      [Wrap (IFace _)]. Without [REFREF] before
+                      [DUP2; REF], the null-check reads the Wrap
+                      page-handle and the post-check dispatch uses
+                      it as a fat-ref → vtable indexed at garbage
+                      offset. Mirrors NullCoalesce path's
+                      is_wrap_ref_local block (codegen.ml:5002). *)
+                   | Ain.Type.Wrap (Ain.Type.IFace _)
+                     when Ain.version_gte ctx.ain (12, 0) ->
+                       self#write_instruction0 REFREF
+                   | _ -> ())
+               | _ -> ());
             self#write_instruction0 DUP2;
             self#write_instruction0 REF;
             self#write_instruction1 PUSH (-1);
             self#write_instruction0 EQUALE;
             let ifnz_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
-            self#write_instruction0 REF;
-            self#compile_method_call args method_no;
+            self#write_instruction0 (if receiver_is_iface then REFREF else REF);
+            self#compile_method_call_for_receiver ~prefer_first_duplicate:true
+              e.ty args method_no;
             self#write_instruction1 PUSH 0;
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
@@ -1724,16 +4238,94 @@ class jaf_compiler ctx debug_info =
           ( { node = Member (e, mname, _); _ },
             args,
             MethodCall (_, method_no) ) ->
+          let emitted_self_event_accessor_update =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match (current_function, e.node, args) with
+            | ( Some f,
+                This,
+                [ Some rhs ] )
+              when f.index = method_no -> (
+                let event_name_and_op =
+                  match String.chop_suffix mname ~suffix:"::add" with
+                  | Some event_name -> Some (event_name, DG_PLUSA)
+                  | None -> (
+                      match String.chop_suffix mname ~suffix:"::remove" with
+                      | Some event_name -> Some (event_name, DG_MINUSA)
+                      | None -> None)
+                in
+                let is_current_accessor =
+                  String.equal f.name mname
+                  ||
+                  match f.struct_type with
+                  | Some sno ->
+                      let s = Ain.get_struct_by_index ctx.ain sno in
+                      String.equal f.name (s.name ^ "@" ^ mname)
+                  | None -> false
+                in
+                match (is_current_accessor, f.struct_type, event_name_and_op) with
+                | true, Some sno, Some (event_name, op) -> (
+                    let s = Ain.get_struct_by_index ctx.ain sno in
+                    let short_event_name =
+                      match String.rsplit2 event_name ~on:'@' with
+                      | Some (_, name) -> name
+                      | None -> event_name
+                    in
+                    let backing_name = "<" ^ short_event_name ^ ">" in
+                    match
+                      List.find s.members ~f:(fun (m : Ain.Variable.t) ->
+                          String.equal m.name backing_name)
+                    with
+                    | Some member ->
+                        self#write_instruction0 PUSHSTRUCTPAGE;
+                        self#write_instruction1 PUSH member.index;
+                        self#write_instruction0 REF;
+                        self#compile_lvalue rhs;
+                        self#write_instruction0 op;
+                        self#write_instruction0 POP;
+                        true
+                    | None -> false)
+                | _ -> false)
+            | _ -> false
+          in
+          if not emitted_self_event_accessor_update then (
           self#pre_emit_lambda_args args;
-          self#compile_lvalue e;
+          let bare_new_receiver_default_ctor =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            let f = Ain.get_function_by_index ctx.ain method_no in
+            String.is_suffix f.name ~suffix:"@ToString"
+          in
+          if bare_new_receiver_default_ctor then
+            self#with_bare_new_receiver_default_ctor (fun () ->
+                self#compile_lvalue e)
+          else self#compile_lvalue e;
           (* v11 Wrap receiver: unwrap the fat-ref before CALLMETHOD
              so the method dispatches on the wrapped struct, not the
              wrapper slot. *)
           (match e.ty with
+          | Wrap (Struct (name, _) | Ref (Struct (name, _)))
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              (* v12 [Wrap (IFace _)] receiver: [compile_lvalue_after]
+                 emitted a single [REFREF] giving the wrap target's
+                 (page, idx) — where the iface fat-ref is stored. For
+                 dispatch we need a second [REFREF] to read the actual
+                 iface fat-ref's 2 slots (page, offset). *)
+              self#write_instruction0 REFREF
+          | Wrap (Struct (_, sno)) when Ain.version_gte ctx.ain (12, 0) ->
+              let s = Ain.get_struct_by_index ctx.ain sno in
+              if not (String.is_prefix s.name ~prefix:"I") then (
+                self#write_instruction0 REFREF;
+                self#write_instruction0 REF)
           | Wrap _ when Ain.version ctx.ain > 8 ->
               self#write_instruction0 REFREF;
               self#write_instruction0 REF
           | _ -> ());
+          if self#lvalue_storage_is_v12_iface e
+             && Option.is_none
+                  (self#v12_interface_receiver_method_slot e.ty method_no)
+          then self#write_instruction0 POP;
           (* v11 property-setter idiom: every [this.X = value] /
              [obj.X = value] property write expands to a
              [Name::set(value)] call that the original compiler emits
@@ -1750,16 +4342,132 @@ class jaf_compiler ctx debug_info =
             &&
             let f = Ain.get_function_by_index ctx.ain method_no in
             Poly.equal f.return_type Ain.Type.Void
+            &&
+            let param_ty =
+              match List.hd (Ain.Function.logical_parameters f) with
+              | Some { value_type; _ } -> Some value_type
+              | None -> None
+            in
+            (* v12 [obj.RefStructProp = new T()] / [= NULL]: orig
+               emits a plain [CALLMETHOD] (no [A_REF; DUP_X2; ...;
+               DELETE] idiom). The idiom's [A_REF] on a fresh NEW
+               struct page corrupts the refcount the setter claims
+               via [SP_INC]; on a [-1] NULL page it trips [PAGE_COPY].
+               For other rhs shapes (e.g. [obj.X = other.Y] where Y is
+               a ref-getter), the idiom is needed. *)
+            let rhs_skips_prop_setter =
+              match args with
+              | [ Some { node = Null; _ } ] -> true
+              | [ Some { node = New _ | NewCall _; _ } ] -> true
+              | [ Some { node = DummyRef (_, { node = New _ | NewCall _; _ }); _ } ] -> true
+              | _ -> false
+            in
+            match param_ty with
+            | Some (IFace _ | Wrap _) -> false
+            | Some (Ref (Struct _)) when Ain.version_gte ctx.ain (12, 0) ->
+                not rhs_skips_prop_setter
+            | Some (Ref _) -> false
+            | _ -> true
+          in
+          let concrete_receiver =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match e.node with
+            | This -> true
+            | _ -> false
+          in
+          let direct_getter_rank =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match (current_function, e.node) with
+            | Some f, Ident (_, LocalVariable (i, _)) -> i < f.nr_args
+            | _ -> false
           in
           if is_prop_setter then (
             let f = Ain.get_function_by_index ctx.ain method_no in
-            self#write_instruction1 PUSH method_no;
-            let prev = in_prop_setter_arg in
-            Exn.protect
-              ~f:(fun () ->
-                in_prop_setter_arg <- true;
-                self#compile_function_arguments args f)
-              ~finally:(fun () -> in_prop_setter_arg <- prev);
+            let param_ty =
+              match List.hd (Ain.Function.logical_parameters f) with
+              | Some { value_type; _ } -> Some value_type
+              | None -> None
+            in
+            let reused_receiver_binary_arg =
+              match (String.chop_suffix mname ~suffix:"::set", args) with
+              | ( Some prop_base,
+                  [ Some
+                      { node =
+                          Binary
+                            ( op,
+                              { node =
+                                  Call
+                                    ( { node =
+                                          Member
+                                            (getter_recv, getter_name, _);
+                                        _ },
+                                      [],
+                                      MethodCall (_, getter_no) );
+                                ty = getter_ty;
+                                _ },
+                              rhs );
+                        _ } ] )
+                when Ain.version_gte ctx.ain (12, 0)
+                     && String.equal getter_name (prop_base ^ "::get")
+                     && self#same_lvalue_shape e getter_recv
+                     &&
+                     (match (getter_ty, op) with
+                     | (Int | Enum _ | LongInt | Float), (Plus | Minus) ->
+                         true
+                     | _ -> false)
+                     &&
+                     Option.value_map param_ty ~default:false ~f:(fun t ->
+                         Poly.equal t (jaf_to_ain_type getter_ty)) ->
+                  Some (op, getter_no, getter_ty, rhs)
+              | _ -> None
+            in
+            let emitted_reused_receiver_arg =
+              match reused_receiver_binary_arg with
+              | Some (op, getter_no, getter_ty, rhs) ->
+                  (* v12 original reuses the already-pushed setter receiver
+                     as the getter receiver for [x.Prop = x.Prop + rhs].
+                     This keeps the page-ref ownership pattern aligned with
+                     the SDK output. *)
+                  let interface_receiver =
+                    Option.is_some
+                      (self#v12_interface_receiver_method_slot
+                         ~direct_getter_rank:false e.ty method_no)
+                  in
+                  if interface_receiver then self#write_instruction0 DUP2
+                  else (
+                    self#write_instruction1 PUSH 0;
+                    self#write_instruction0 DUP2;
+                    self#write_instruction0 POP);
+                  self#compile_method_selector ~concrete:concrete_receiver
+                    ~direct_getter_rank e.ty method_no;
+                  self#write_instruction0 DUP_X2;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 SWAP;
+                  if not interface_receiver then self#write_instruction0 POP;
+                  if interface_receiver then
+                    self#compile_method_selector ~direct_getter_rank e.ty
+                      getter_no
+                  else self#write_instruction1 PUSH getter_no;
+                  self#write_instruction1 CALLMETHOD 0;
+                  self#compile_expression rhs;
+                  self#emit_reused_receiver_binary_op getter_ty op
+              | None -> false
+            in
+            if not emitted_reused_receiver_arg then (
+              self#compile_method_selector ~concrete:concrete_receiver e.ty
+                ~direct_getter_rank method_no;
+              let prev = in_prop_setter_arg in
+              Exn.protect
+                ~f:(fun () ->
+                  in_prop_setter_arg <- true;
+                  self#compile_function_arguments args f)
+                ~finally:(fun () -> in_prop_setter_arg <- prev));
+            let is_ref_struct_new_setter =
+              match param_ty with Some (Ref (Struct _)) -> true | _ -> false
+            in
+            if is_ref_struct_new_setter then self#write_instruction0 A_REF;
             self#write_instruction0 DUP_X2;
             (* String setters need an extra [A_REF] before [CALLMETHOD]
                so the trailing [DELETE] correctly releases the
@@ -1768,15 +4476,24 @@ class jaf_compiler ctx debug_info =
                carry no refcount and Struct comes through a DummyRef
                whose [SH_LOCALDELETE] handles cleanup. *)
             let is_string_setter =
-              match List.hd (Ain.Function.logical_parameters f) with
-              | Some { value_type = String; _ } -> true
-              | _ -> false
+              match param_ty with Some String -> true | _ -> false
             in
             if is_string_setter then self#write_instruction0 A_REF;
             self#write_instruction1 CALLMETHOD f.nr_args;
-            if is_string_setter then self#write_instruction0 DELETE
+            if is_string_setter || is_ref_struct_new_setter then
+              self#write_instruction0 DELETE
             else self#write_instruction0 POP)
-          else self#compile_method_call args method_no
+          else
+            let rec prefer_first_duplicate_receiver (e : expression) =
+              match e.node with
+              | Call _ | DummyRef _ -> true
+              | Cast (_, inner) -> prefer_first_duplicate_receiver inner
+              | _ -> false
+            in
+            self#compile_method_call_for_receiver
+              ~concrete:concrete_receiver ~direct_getter_rank
+              ~prefer_first_duplicate:(prefer_first_duplicate_receiver e)
+              e.ty args method_no)
       (* v11 optional HLL/method call: [array?.Duplicate(x)] etc. lower
          to [CALLHLL] rather than [CALLMETHOD], so the OptionalMember
          method-call arm above doesn't catch them. *)
@@ -1796,56 +4513,102 @@ class jaf_compiler ctx debug_info =
               let rest_params =
                 match params with _ :: tl -> tl | [] -> []
               in
-              self#compile_variable_ref e;
-              self#write_instruction0 DUP2;
-              self#write_instruction0 REF;
-              self#write_instruction1 PUSH (-1);
-              self#write_instruction0 EQUALE;
-              let ifnz_addr = current_address + 2 in
-              self#write_instruction1 IFNZ 0;
-              self#write_instruction0 REF;
-              List.iter2_exn rest_args rest_params ~f:(fun arg var ->
-                  self#compile_argument arg var.value_type);
-              let lib = Ain.get_library_by_index ctx.ain lib_no in
-              let type_id =
-                if String.equal lib.name "Array" then
-                  match e.ty with
-                  | Array t | Ref (Array t) ->
-                      Ain.Type.int_of_data_type (Ain.version ctx.ain)
-                        (jaf_to_ain_type t)
-                  | _ -> -1
-                else -1
+              (* v12: the receiver may be a [Call] / [DummyRef] / [Cast]
+                 (e.g. [this.GetItemList()?.Any(...)]) rather than a
+                 plain variable ref. Use [compile_lvalue] for those —
+                 it leaves a single-slot page-ref on the stack matching
+                 what [compile_variable_ref + DUP2 + REF] would have
+                 produced for a variable. *)
+              let rec is_dummyref_shape (e : expression) =
+                match e.node with
+                | DummyRef _ -> true
+                | Call (_, _, (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _))
+                  -> true
+                | Cast (_, inner) -> is_dummyref_shape inner
+                | _ -> false
               in
-              self#write_instruction3 CALLHLL lib_no fun_no type_id;
-              self#write_instruction1 PUSH 0;
-              let jump_addr = current_address + 2 in
-              self#write_instruction1 JUMP 0;
-              self#write_address_at ifnz_addr current_address;
-              self#write_instruction0 POP;
-              self#write_instruction0 POP;
-              (match f.return_type with
-              | Ain.Type.Void -> self#write_instruction1 PUSH (-1)
-              | _ ->
-                  self#write_instruction1 PUSH (-1);
-                  self#write_instruction1 PUSH (-1));
-              self#write_address_at jump_addr current_address)
+              let is_dummyref = is_dummyref_shape e in
+              if is_dummyref then (
+                self#compile_lvalue e;
+                self#write_instruction0 DUP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifnz_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                List.iter2_exn rest_args rest_params ~f:(fun arg var ->
+                    self#compile_argument arg var.value_type);
+                let lib = Ain.get_library_by_index ctx.ain lib_no in
+                let type_id =
+                  if String.equal lib.name "Array" then
+                    match e.ty with
+                    | Array t | Ref (Array t) ->
+                        Ain.Type.int_of_data_type (Ain.version ctx.ain)
+                          (jaf_to_ain_type t)
+                    | _ -> -1
+                  else -1
+                in
+                self#write_instruction3 CALLHLL lib_no fun_no type_id;
+                self#write_instruction1 PUSH 0;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifnz_addr current_address;
+                self#write_instruction0 POP;
+                (match f.return_type with
+                | Ain.Type.Void -> self#write_instruction1 PUSH (-1)
+                | _ ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH (-1));
+                self#write_address_at jump_addr current_address)
+              else (
+                self#compile_variable_ref e;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifnz_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#write_instruction0 REF;
+                List.iter2_exn rest_args rest_params ~f:(fun arg var ->
+                    self#compile_argument arg var.value_type);
+                let lib = Ain.get_library_by_index ctx.ain lib_no in
+                let type_id =
+                  if String.equal lib.name "Array" then
+                    match e.ty with
+                    | Array t | Ref (Array t) ->
+                        Ain.Type.int_of_data_type (Ain.version ctx.ain)
+                          (jaf_to_ain_type t)
+                    | _ -> -1
+                  else -1
+                in
+                self#write_instruction3 CALLHLL lib_no fun_no type_id;
+                self#write_instruction1 PUSH 0;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifnz_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                (match f.return_type with
+                | Ain.Type.Void -> self#write_instruction1 PUSH (-1)
+                | _ ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH (-1));
+                self#write_address_at jump_addr current_address))
       (* HLL function call *)
       | Call (_, args, HLLCall (lib_no, fun_no)) ->
           self#pre_emit_lambda_args args;
           let f = Ain.function_of_hll_function_index ctx.ain lib_no fun_no in
-          self#compile_function_arguments args f;
+          let lib = Ain.get_library_by_index ctx.ain lib_no in
+          self#compile_hll_function_arguments lib args f;
           if Ain.version ctx.ain > 8 then
             (* v11 [CALLHLL] carries an extra type-id operand. For Array
                library methods it's the element type of the receiver;
                for everything else the runtime ignores it and -1 is
                fine. *)
-            let lib = Ain.get_library_by_index ctx.ain lib_no in
             let type_id =
               if String.equal lib.name "Array" then
                 match args with
-                | Some { ty = Array t | Ref (Array t); _ } :: _ ->
-                    Ain.Type.int_of_data_type (Ain.version ctx.ain)
-                      (jaf_to_ain_type t)
+                | Some receiver :: _ ->
+                    self#array_element_type_code_for_expr receiver
                 | _ -> -1
               else -1
             in
@@ -1924,14 +4687,14 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 PUSH (-1)
               done;
               self#compile_CALLHLL "Array" "Alloc"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayAlloc ->
               self#write_instruction1 PUSH (List.length args);
               self#write_instruction0 A_ALLOC
           | ArrayRealloc when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Realloc"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayRealloc ->
               (* FIXME: this built-in should be variadic *)
@@ -1939,67 +4702,67 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 A_REALLOC
           | ArrayFree when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Free"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayFree -> self#write_instruction0 A_FREE
           | ArrayNumof when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Numof"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayNumof -> self#write_instruction0 A_NUMOF
           | ArrayCopy when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Copy"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayCopy -> self#write_instruction0 A_COPY
           | ArrayFill when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Fill"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayFill -> self#write_instruction0 A_FILL
           | ArrayPushBack when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "PushBack"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayPushBack -> self#write_instruction0 A_PUSHBACK
           | ArrayPopBack when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "PopBack"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayPopBack -> self#write_instruction0 A_POPBACK
           | ArrayEmpty when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Empty"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayEmpty -> self#write_instruction0 A_EMPTY
           | ArrayErase when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Erase"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayErase -> self#write_instruction0 A_ERASE
           | ArrayInsert when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Insert"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayInsert -> self#write_instruction0 A_INSERT
           | ArraySort when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Sort"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArraySort -> self#write_instruction0 A_SORT
           | ArraySortBy when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "SortMem"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArraySortBy -> self#write_instruction0 A_SORT_MEM
           | ArrayReverse when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Reverse"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayReverse -> self#write_instruction0 A_REVERSE
           | ArrayFind when Ain.version ctx.ain > 8 ->
               self#compile_CALLHLL "Array" "Find"
-                (self#array_element_type_code !receiver_ty)
+                (self#array_element_type_code_for_expr e)
                 (ASTExpression expr)
           | ArrayFind -> self#write_instruction0 A_FIND
           | DelegateNumof -> self#write_instruction0 DG_NUMOF
@@ -2044,17 +4807,36 @@ class jaf_compiler ctx debug_info =
           self#write_instruction2 DG_CALL no 0;
           self#write_instruction1 JUMP loop_addr;
           self#write_address_at (loop_addr + 6) current_address
-      | Call (e, _args, UnresolvedCall) when Poly.(e.ty = HLLParam) ->
+      | Call (e, _args, UnresolvedCall)
+        when Poly.(e.ty = HLLParam) || Poly.(expr.ty = HLLParam) ->
           (* v11 [hll_param] call — the callee type stays unresolved
              through typeAnalysis because [hll_param] is a runtime-
              polymorphic slot. Compile the callee and push a zero
              placeholder so downstream stack shape is correct; the
-             actual dispatch happens via the HLL bridge at runtime. *)
+             actual dispatch happens via the HLL bridge at runtime.
+             v12 also reaches here through unknown_delegate / generic-
+             property callees where only [expr.ty] (the call result)
+             got widened to [HLLParam]. *)
           self#compile_expression e;
           self#write_instruction1 PUSH 0
       | Call (_, _, _) ->
           compiler_bug "invalid call expression" (Some (ASTExpression expr))
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression expr))
+      | NewCall ({ ty = Struct (struct_name, s_no); _ }, args) ->
+          (* v12 `new T(args)`: original Rance10 pushes args BEFORE the
+             NEW opcode, then NEW with the ctor function index that
+             matches the arg count.
+             Example: new CASColor(0, 0, 0, 255) emits:
+               PUSH 0; PUSH 0; PUSH 0; PUSH 255
+               NEW struct(455), 18568:CASColor@0  (the 4-arg ctor)
+             not the default-ctor index from struct.constructor. *)
+          self#compile_newcall struct_name s_no args
+      | NewCall _ ->
+          compiler_bug "NewCall on non-struct type"
+            (Some (ASTExpression expr))
+      | ArrayLiteral _ ->
+          compiler_bug "bare array literal expression"
+            (Some (ASTExpression expr))
       | RvalueRef _ ->
           compiler_bug "RvalueRef in rvalue context" (Some (ASTExpression expr))
       | DummyRef _ ->
@@ -2112,6 +4894,24 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 PUSH 0
           | Int | Bool | Float | LongInt | NullType ->
               self#write_instruction1 PUSH 0
+          (* v12 NULL flowing through a [ternary ? meth : NULL] where
+             the other branch is a method ref. Push the v11 method-
+             ref null-pair. *)
+          | TyMethod _ | TyFunction _ when Ain.version ctx.ain > 8 ->
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0
+          (* v12 interface NULL: interface values are two-slot
+             [page, slot] pairs. [this.Activity = NULL] / passing
+             [NULL] as an interface argument needs both slots pushed
+             so the setter / function reads the right arity.
+             Interfaces are represented in [jaf_type] as
+             [Struct (name, _)] where [name] is in
+             [ctx.interface_names]. *)
+          | Struct (name, _)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH 0
           | ty ->
               compiler_bug
                 ("unimplemented: NULL rvalue of type " ^ jaf_type_to_string ty)
@@ -2126,54 +4926,154 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 PUSHSTRUCTPAGE
             | _ -> self#write_instruction1 PUSH (-1)
           in
-          (* v11 pre-emit: if the enclosing call has already written
-             the lambda body via [pre_emit_lambda_args], don't emit it
-             again — re-registering would shift downstream addresses
-             and double the function-table entry. Just push the
-             receiver+index. *)
-          if Hashtbl.mem pre_emitted_lambdas lambda_idx then
+          if
+            Hashtbl.mem v12_assignment_lambdas lambda_idx
+            || Hashtbl.mem pre_emitted_lambdas lambda_idx
+          then
+            (* pre_emit_lambda_args writes the body; second encounter
+               just pushes the receiver+index. *)
             emit_lambda_receiver ()
           else (
+            (* Inline the lambda body inside the outer function, between
+               a JUMP-over and the receiver push. Each lambda decl in
+               source produces an inline FUNC...ENDFUNC block at that
+               point in the outer's bytecode. v12 original Rance10 has
+               ~21k inline FUNC opcodes vs our ~400 under dedup — letting
+               each use re-emit a fresh body matches the original layout. *)
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
             self#compile_function f;
             self#write_address_at jump_addr current_address;
+            Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:();
             emit_lambda_receiver ());
           self#write_instruction1 PUSH lambda_idx
       | OptionalMember (obj, name, mt) ->
           (* [a?.b] rvalue: evaluate [a]; if the result is the [-1]
              null sentinel, push the type-appropriate default; else
              access [.b] on [a]. *)
-          self#compile_expression obj;
-          self#write_instruction0 DUP;
-          self#write_instruction1 PUSH (-1);
-          self#write_instruction0 EQUALE;
-          let ifnz_addr = current_address + 2 in
-          self#write_instruction1 IFNZ 0;
-          (match mt with
-          | ClassMethod (_, no) -> self#write_instruction1 PUSH no
-          | ClassVariable var_no ->
-              self#write_instruction1 PUSH var_no;
-              self#write_instruction0 REF
-          | _ ->
-              let member_expr = { expr with node = Member (obj, name, mt) } in
-              self#compile_expression member_expr);
-          let jump_addr = current_address + 2 in
-          self#write_instruction1 JUMP 0;
-          self#write_address_at ifnz_addr current_address;
-          self#write_instruction0 POP;
-          (match expr.ty with
-           | Ref _ | Struct _ | Delegate _ -> self#write_instruction1 PUSH (-1)
-           | String -> self#write_instruction1 S_PUSH 0
-           | Float -> self#write_instruction1_float F_PUSH 0.0
-           | _ -> self#write_instruction1 PUSH 0);
-          self#write_address_at jump_addr current_address
+          let optional_iface_member =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match (mt, expr.ty) with
+            | ClassVariable _, (Struct (name, _) | Ref (Struct (name, _))) ->
+                Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          if optional_iface_member then (
+            match mt with
+            | ClassVariable var_no ->
+                self#compile_expression obj;
+                self#write_instruction0 DUP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let outer_null_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#write_instruction1 PUSH var_no;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let inner_null_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#write_instruction0 REFREF;
+                self#write_instruction1 PUSH 0;
+                let inner_end_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at inner_null_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_address_at inner_end_addr current_address;
+                let outer_end_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at outer_null_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_address_at outer_end_addr current_address;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let final_null_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                let final_end_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at final_null_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH 0;
+                self#write_address_at final_end_addr current_address
+            | _ -> compiler_bug "optional interface member expected field"
+                     (Some (ASTExpression expr)))
+          else (
+            (* v11+: [compile_expression] on a [Ref T] obj emits
+               [REF; A_REF] (the deref pattern). When [obj] is NULL
+               (-1), the A_REF bump triggers a [PAGE_COPY page=-1]
+               crash because the VM tries to incref a non-existent
+               page. Use [compile_lvalue]+[REF] (no A_REF) for the
+               null-check so we only attempt to bump after we've
+               confirmed the value isn't NULL. The A_REF (if needed)
+               is implicit in the subsequent member access path. *)
+            let obj_needs_aref_skip =
+              Ain.version ctx.ain > 8
+              && match obj.ty with
+                 | Ref (Struct _ | Array _ | String | Delegate _)
+                 | Struct _ | Array _ | Delegate _ -> true
+                 | _ -> false
+            in
+            if obj_needs_aref_skip && is_variable_ref obj.node then
+              (* [compile_lvalue] for a [Ref Struct] global/local
+                 emits [PUSHxPAGE; PUSH i; REF] — the REF already
+                 reads the slot value (the ref/page-id). No A_REF
+                 needed for the null check. *)
+              self#compile_lvalue obj
+            else self#compile_expression obj;
+            self#write_instruction0 DUP;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifnz_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            (match mt with
+            | ClassMethod (_, no) -> self#write_instruction1 PUSH no
+            | ClassVariable var_no ->
+                self#write_instruction1 PUSH var_no;
+                self#write_instruction0 REF
+            | _ ->
+                let member_expr = { expr with node = Member (obj, name, mt) } in
+                self#compile_expression member_expr);
+            let jump_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#write_address_at ifnz_addr current_address;
+            self#write_instruction0 POP;
+            (match expr.ty with
+             | Ref _ | Struct _ | Delegate _ -> self#write_instruction1 PUSH (-1)
+             | String -> self#write_instruction1 S_PUSH 0
+             | Float -> self#write_instruction1_float F_PUSH 0.0
+             | _ -> self#write_instruction1 PUSH 0);
+            self#write_address_at jump_addr current_address)
       | NullCoalesce (a, b) ->
           let a_inner =
             match a.node with DummyRef (_, inner) -> inner | _ -> a
           in
           let unwrap_dummy (e : expression) =
             match e.node with DummyRef (_, inner) -> inner | _ -> e
+          in
+          let v12_iface_type (ty : jaf_type) =
+            let rec walk (t : jaf_type) =
+              match t with
+              | Struct (name, _) | Ref (Struct (name, _)) ->
+                  Hashtbl.mem ctx.interface_names name
+              (* v12 foreach-bound iface var: storage is [Wrap T] where
+                 T is the iface. Treat as iface for receiver-shape
+                 decisions so the not-null branch emits the second
+                 REFREF to materialize the fat-ref before dispatch. *)
+              | Wrap inner -> walk inner
+              | _ -> false
+            in
+            Ain.version_gte ctx.ain (12, 0) && walk ty
           in
           let is_optional_result e =
             match (unwrap_dummy e).node with
@@ -2185,6 +5085,424 @@ class jaf_compiler ctx debug_info =
             | Call ({ node = OptionalMember _; _ }, _, _) -> true
             | _ -> false
           in
+          match a_inner.node with
+          | OptionalMember (receiver, _, ClassMethod (_, method_no))
+            when Ain.version ctx.ain > 8 ->
+              (* v12 [receiver?.Property ?? fallback].  Like optional
+                 method calls, defer the getter until after the ?? null
+                 check.  Foreach locals over arrays of refs are stored as
+                 Wrap(Ref Struct); the original unwraps that wrapper with
+                 REFREF before checking the referenced page. *)
+              let receiver_is_iface = v12_iface_type receiver.ty in
+              let rec is_dummyref_shape (e : expression) =
+                match e.node with
+                | DummyRef _ -> true
+                | Call
+                    ( _,
+                      _,
+                      ( HLLCall _ | FunctionCall _ | MethodCall _
+                      | BuiltinCall _ ) ) ->
+                    true
+                | Cast (_, inner) -> is_dummyref_shape inner
+                | _ -> false
+              in
+              let is_dummyref = is_dummyref_shape receiver in
+              let receiver_is_casted_from_iface =
+                match receiver.node with
+                | Cast
+                    ( _,
+                      {
+                        ty = Struct (name, _) | Ref (Struct (name, _));
+                        _;
+                      } ) ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false
+              in
+              let is_wrap_ref_local =
+                match receiver.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.Wrap (Ain.Type.Ref _) -> true
+                    (* v12 foreach-bound iface var has storage type
+                       [Wrap (IFace _)] (e.g. [Item] in
+                       [foreach (Item : this.ItemList) Item?.SetInfo(...)]).
+                       Same as [Wrap (Ref _)] it needs a [REFREF] unwrap
+                       before [DUP2; REF] so the null check reads the
+                       underlying iface fat-ref, not the Wrap handle.
+                       Without this, dispatch sees a garbage offset and
+                       [REF vtable[offset+method_no]] crashes OOB. *)
+                    | Ain.Type.Wrap (Ain.Type.IFace _)
+                      when Ain.version_gte ctx.ain (12, 0) ->
+                        true
+                    | _ -> false)
+                | _ -> false
+              in
+              if is_dummyref then (
+                self#compile_lvalue receiver;
+                if not receiver_is_casted_from_iface then
+                  self#write_instruction0
+                    (if receiver_is_iface then DUP_U2 else DUP);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE)
+              else (
+                self#compile_variable_ref receiver;
+                if is_wrap_ref_local then self#write_instruction0 REFREF;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE);
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              if not is_dummyref then
+                self#write_instruction0
+                  (if receiver_is_iface then REFREF else REF);
+              self#write_instruction1 PUSH 0;
+              let optional_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              if is_dummyref then (
+                self#write_instruction0 POP;
+                if receiver_is_iface || receiver_is_casted_from_iface then
+                  self#write_instruction0 POP)
+              else (
+                self#write_instruction0 POP;
+                self#write_instruction0 POP);
+              self#write_instruction1 PUSH (-1);
+              if receiver_is_iface then self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at optional_jump_addr current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              if receiver_is_iface then self#write_instruction0 POP;
+              self#compile_expression b;
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifz_addr current_address;
+              self#compile_method_call_for_receiver receiver.ty [] method_no;
+              self#write_address_at jump_addr current_address
+          | Call
+              ( { node = OptionalMember (receiver, _, _); _ },
+                args,
+                MethodCall (_, method_no) )
+            when Ain.version ctx.ain > 8 ->
+              (* v12 [receiver?.Method() ?? fallback].  Keep the
+                 receiver live across the optional-status check and
+                 call the method only in the non-null branch.  Emitting
+                 the call before the [??] check can vtable-deref a
+                 [-1] receiver for chained property reads like
+                 [this.Parts?.Parent ?? 0]. *)
+              self#pre_emit_lambda_args args;
+              let receiver_is_iface = v12_iface_type receiver.ty in
+              let rec is_dummyref_shape (e : expression) =
+                match e.node with
+                | DummyRef _ -> true
+                | Call
+                    ( _,
+                      _,
+                      ( HLLCall _ | FunctionCall _ | MethodCall _
+                      | BuiltinCall _ ) ) ->
+                    true
+                | Cast (_, inner) -> is_dummyref_shape inner
+                | _ -> false
+              in
+              let is_dummyref = is_dummyref_shape receiver in
+              let receiver_is_casted_from_iface =
+                match receiver.node with
+                | Cast
+                    ( _,
+                      {
+                        ty = Struct (name, _) | Ref (Struct (name, _));
+                        _;
+                      } ) ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false
+              in
+              let is_wrap_ref_local =
+                match receiver.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.Wrap (Ain.Type.Ref _) -> true
+                    (* v12 foreach-bound iface var has storage type
+                       [Wrap (IFace _)] (e.g. [Item] in
+                       [foreach (Item : this.ItemList) Item?.SetInfo(...)]).
+                       Same as [Wrap (Ref _)] it needs a [REFREF] unwrap
+                       before [DUP2; REF] so the null check reads the
+                       underlying iface fat-ref, not the Wrap handle.
+                       Without this, dispatch sees a garbage offset and
+                       [REF vtable[offset+method_no]] crashes OOB. *)
+                    | Ain.Type.Wrap (Ain.Type.IFace _)
+                      when Ain.version_gte ctx.ain (12, 0) ->
+                        true
+                    | _ -> false)
+                | _ -> false
+              in
+              if is_dummyref then (
+                self#compile_lvalue receiver;
+                if not receiver_is_casted_from_iface then
+                  self#write_instruction0
+                    (if receiver_is_iface then DUP_U2 else DUP);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE)
+              else (
+                self#compile_variable_ref receiver;
+                if is_wrap_ref_local then self#write_instruction0 REFREF;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE);
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              if not is_dummyref then
+                self#write_instruction0
+                  (if receiver_is_iface then REFREF else REF);
+              self#write_instruction1 PUSH 0;
+              let optional_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              if is_dummyref then (
+                self#write_instruction0 POP;
+                if receiver_is_iface || receiver_is_casted_from_iface then
+                  self#write_instruction0 POP)
+              else (
+                self#write_instruction0 POP;
+                self#write_instruction0 POP);
+              self#write_instruction1 PUSH (-1);
+              if receiver_is_iface then self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at optional_jump_addr current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              if receiver_is_iface then self#write_instruction0 POP;
+              self#compile_expression b;
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifz_addr current_address;
+              let is_value_prop_setter =
+                Ain.version ctx.ain > 8
+                &&
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                String.is_suffix f.name ~suffix:"::set"
+                && List.length args = 1
+                && Poly.equal f.return_type Ain.Type.Void
+                &&
+                match List.hd (Ain.Function.logical_parameters f) with
+                | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
+                | _ -> true
+              in
+              if is_value_prop_setter then (
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                self#compile_method_selector receiver.ty method_no;
+                let prev = in_prop_setter_arg in
+                Exn.protect
+                  ~f:(fun () ->
+                    in_prop_setter_arg <- true;
+                    self#compile_function_arguments args f)
+                  ~finally:(fun () -> in_prop_setter_arg <- prev);
+                self#write_instruction0 DUP_X2;
+                (match List.hd (Ain.Function.logical_parameters f) with
+                | Some { value_type = String; _ } -> self#write_instruction0 A_REF
+                | _ -> ());
+                self#write_instruction1 CALLMETHOD f.nr_args)
+              else
+                self#compile_method_call_for_receiver receiver.ty args
+                  method_no;
+              self#write_address_at jump_addr current_address
+          | Call
+              ( {
+                  node =
+                    Member
+                      ( ({
+                           node =
+                             DummyRef
+                               ( dummy_idx,
+                                 {
+                                   node =
+                                     Call
+                                       ( { node = OptionalMember (obj, _, _); _ },
+                                         opt_args,
+                                         MethodCall (_, opt_method_no) );
+                                   _;
+                                 } );
+                           _;
+                         } as receiver),
+                        _,
+                        _ );
+                  _;
+                },
+                args,
+                MethodCall (_, method_no) )
+            when Ain.version_gte ctx.ain (12, 0)
+                 && v12_iface_type receiver.ty ->
+              (* v12 [obj?.IfaceProp.Value ?? fallback].  The optional
+                 receiver must be checked before compiling [.Value];
+                 otherwise the outer member access dereferences the
+                 [-1] receiver that the optional branch produced. *)
+              self#pre_emit_lambda_args args;
+              let rec is_dummyref_shape (e : expression) =
+                match e.node with
+                | DummyRef _ -> true
+                | Call
+                    ( _,
+                      _,
+                      ( HLLCall _ | FunctionCall _ | MethodCall _
+                      | BuiltinCall _ ) ) ->
+                    true
+                | Cast (_, inner) -> is_dummyref_shape inner
+                | _ -> false
+              in
+              let obj_is_dummyref = is_dummyref_shape obj in
+              let obj_is_iface = v12_iface_type obj.ty in
+              if obj_is_dummyref then (
+                self#compile_lvalue obj;
+                self#write_instruction0 (if obj_is_iface then DUP_U2 else DUP);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE)
+              else (
+                self#compile_variable_ref obj;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE);
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              if not obj_is_dummyref then
+                self#write_instruction0 (if obj_is_iface then REFREF else REF);
+              self#compile_method_call_for_receiver obj.ty opt_args
+                opt_method_no;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 DUP_X2;
+              self#write_instruction0 POP;
+              self#write_instruction0 R_ASSIGN;
+              self#write_instruction1 PUSH 0;
+              let optional_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              if obj_is_dummyref then (
+                self#write_instruction0 POP;
+                if obj_is_iface then self#write_instruction0 POP)
+              else (
+                self#write_instruction0 POP;
+                self#write_instruction0 POP);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at optional_jump_addr current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifz_addr current_address;
+              self#compile_method_call_for_receiver receiver.ty args method_no;
+              self#write_address_at jump_addr current_address
+          | Call
+              ( {
+                  node =
+                    Member
+                      ( ({
+                           node =
+                             DummyRef
+                               ( dummy_idx,
+                                 {
+                                   node =
+                                     Call
+                                       ( { node = OptionalMember (obj, _, _); _ },
+                                         opt_args,
+                                         MethodCall (_, opt_method_no) );
+                                   _;
+                                 } );
+                           _;
+                         } as receiver),
+                        _,
+                        _ );
+                  _;
+                },
+                args,
+                MethodCall (_, method_no) )
+            when Ain.version_gte ctx.ain (12, 0)
+                 && not (v12_iface_type receiver.ty) ->
+              (* v12 [obj?.Property1.Property2 ?? fallback] for non-iface
+                 receivers (e.g. [leader?.Status.Atk ?? 0]).  Matches
+                 orig's pattern: store the inner getter result in the
+                 dummy slot only on the non-null path, push a (0, 0)
+                 marker pair vs a (-1, -1, -1) triple to discriminate,
+                 then either call the outer getter on the dummy slot or
+                 emit the fallback.  The existing
+                 [Member.DummyRef.Call.OptionalMember] iface variant
+                 above uses 2-slot ops (R_ASSIGN, DUP_X2); this case
+                 uses 1-slot ops for plain struct dummies. *)
+              self#pre_emit_lambda_args args;
+              self#compile_lvalue obj;
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifnz_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              (* non-null: call the inner getter (e.g. Status::get) on
+                 [obj], store the result in [dummy_idx] via the
+                 standard [SWAP; ASSIGN] dance, then push the (0, 0)
+                 non-null marker pair. *)
+              self#compile_method_call_for_receiver obj.ty opt_args opt_method_no;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 REF;
+              self#emit_slot_release;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 SWAP;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 SWAP;
+              self#write_instruction0 ASSIGN;
+              self#write_instruction1 PUSH 0;
+              self#write_instruction1 PUSH 0;
+              let optional_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifnz_addr current_address;
+              (* null branch: drop the dup'd [obj], push the
+                 (-1, -1, -1) null-marker triple. *)
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at optional_jump_addr current_address;
+              (* common: discriminate via [PUSH -1; EQUALE] on the top
+                 marker.  IFZ jumps when the marker was [0] (non-null),
+                 falls through when it was [-1] (null). *)
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              (* null finalize: drop the remaining two markers, emit
+                 the fallback. *)
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              let jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at ifz_addr current_address;
+              (* non-null finalize: drop the discriminator, call the
+                 outer getter (e.g. Atk::get) on the dummy-slot value
+                 still on stack. *)
+              self#write_instruction0 POP;
+              self#compile_method_call_for_receiver receiver.ty args method_no;
+              self#write_address_at jump_addr current_address
+          | _ ->
           if
             Ain.version ctx.ain > 8
             && (not is_optional)
@@ -2224,6 +5542,12 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 POP;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH dummy_idx
+            (* v12 scalar fallback: when b is a literal (or any
+               non-lvalue), evaluate it as a value and push a dummy
+               slot pair so the surrounding REF works. *)
+            | true, (ConstInt _ | ConstFloat _ | ConstChar _ | Null
+                    | Unary _ | Binary _) ->
+                self#compile_expression b
             | _ -> self#compile_lvalue b);
             self#write_address_at ifz_addr current_address;
             match expr.ty with
@@ -2252,6 +5576,18 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 PUSH 0;
                 self#write_address_at jump_addr current_address)
               else self#write_address_at ifz_addr current_address)
+            else if
+              match self#ain_call_return_type a_inner with
+              | Some (Ain.Type.Option _) -> true
+              | _ -> false
+            then (
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              self#write_address_at ifz_addr current_address)
             else
               let b =
                 match b.node with
@@ -2281,6 +5617,206 @@ class jaf_compiler ctx debug_info =
       | Assign
           ( EqAssign,
             ( {
+                node = Member (_, member_name, ClassVariable _);
+                _;
+              } as lhs ),
+            { node = Null; _ } )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match self#member_type lhs with
+                | Ref (Struct _) -> true
+                | _ -> false)
+             && (match current_function with
+                | Some f ->
+                    String.is_suffix f.name ~suffix:"@0"
+                    || String.is_suffix f.name ~suffix:"@2"
+                | None -> false) ->
+          self#compile_variable_ref lhs;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP
+      | Assign
+          ( EqAssign,
+            ( {
+                node = Member (_, member_name, ClassVariable _);
+                _;
+              } as lhs ),
+            rhs )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match self#member_type lhs with
+                | Ref (Struct _) -> true
+                | _ -> false)
+             && (match current_function with
+                | Some f ->
+                    String.is_suffix f.name ~suffix:"@0"
+                    || String.is_suffix f.name ~suffix:"@2"
+                | None -> false)
+             && (match rhs.node with
+                | New _ | NewCall _ | DummyRef (_, { node = New _ | NewCall _; _ }) ->
+                    true
+                | _ -> false) ->
+          self#compile_variable_ref lhs;
+          (match rhs.node with
+          | DummyRef (dummy_idx, { node = New { ty = Struct (_, s_no); _ }; _ }) ->
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              let ctor = self#receiver_new_ctor s_no in
+              self#write_instruction2 NEW s_no ctor;
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 ASSIGN;
+              before_pop ();
+              self#write_instruction0 SP_INC;
+              self#write_instruction1 SH_LOCALDELETE dummy_idx
+          | DummyRef
+              ( dummy_idx,
+                {
+                  node = NewCall ({ ty = Struct (struct_name, s_no); _ }, args);
+                  _;
+                } ) ->
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH dummy_idx;
+              self#compile_newcall struct_name s_no args;
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 ASSIGN;
+              before_pop ();
+              self#write_instruction0 SP_INC;
+              self#write_instruction1 SH_LOCALDELETE dummy_idx
+          | New { ty = Struct (_, s_no); _ } ->
+              let ctor = self#bare_new_ctor s_no in
+              self#write_instruction2 NEW s_no ctor;
+              self#write_instruction0 ASSIGN;
+              before_pop ();
+              self#write_instruction0 SP_INC
+          | NewCall ({ ty = Struct (struct_name, s_no); _ }, args) ->
+              self#compile_newcall struct_name s_no args;
+              self#write_instruction0 ASSIGN;
+              before_pop ();
+              self#write_instruction0 SP_INC
+          | _ -> compiler_bug "invalid ref-struct backing initializer"
+                   (Some (ASTExpression rhs)))
+      | Assign
+          ( EqAssign,
+            ({ ty = Struct (_, lhs_sno); _ } as lhs),
+            { node = New { ty = Struct (_, rhs_sno); _ }; _ } )
+        when Ain.version_gte ctx.ain (12, 0)
+             && Int.equal lhs_sno rhs_sno
+             && is_variable_ref lhs.node ->
+          self#compile_variable_ref lhs;
+          self#write_instruction2 NEW rhs_sno (-1);
+          self#write_instruction0 ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP
+      | Assign (EqAssign, lhs, { node = Null; _ })
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match lhs.ty with
+                | Struct (name, _) | Ref (Struct (name, _)) | Unresolved name ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false)
+             && (match current_function with
+                | Some f ->
+                    String.is_suffix f.name ~suffix:"@0"
+                    || String.is_suffix f.name ~suffix:"@2"
+                | None -> false)
+             && is_variable_ref lhs.node
+        ->
+          (* Constructor/default member init starts from a zeroed slot.
+             Original v12 writes the interface null pair directly; deleting
+             the old value first feeds page 0 to DELETE. *)
+          self#compile_variable_ref lhs;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction1 PUSH 0;
+          self#write_instruction0 R_ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP;
+          self#write_instruction0 SP_INC
+      | Assign (EqAssign, lhs, { node = Null; _ })
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match lhs.ty with
+                | Struct (name, _) | Ref (Struct (name, _)) | Unresolved name ->
+                    Hashtbl.mem ctx.interface_names name
+                | _ -> false)
+        ->
+          (* v12 interface refs are two-slot values. Nulling one uses
+             R_ASSIGN after deleting the previous interface page-ref;
+             SR_ASSIGN treats the first slot as a struct page and fails
+             when that slot is 0. *)
+          self#compile_variable_ref lhs;
+          (* Foreach-bound iface var has slot storage [Wrap (IFace _)]
+             — compile_variable_ref only pushes the wrap-handle location.
+             Unwrap with REFREF so DUP2;REF;...;R_ASSIGN operates on
+             the underlying iface fat-ref pair instead of corrupting
+             the wrap-handle (which the foreach desugar reuses on the
+             next iteration → REF-on-freed-page crash at survey close,
+             unmasked after the OptionalMember REFREF fix in 3a64b94). *)
+          (match lhs.node with
+          | Ident (_, LocalVariable (i, _)) -> (
+              match (self#get_local i).value_type with
+              | Ain.Type.Wrap (Ain.Type.IFace _) ->
+                  self#write_instruction0 REFREF
+              | _ -> ())
+          | _ -> ());
+          self#write_instruction0 DUP2;
+          self#write_instruction0 REF;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction1 PUSH 0;
+          self#write_instruction0 DUP_X2;
+          self#write_instruction0 POP;
+          self#write_instruction0 DUP_X2;
+          self#write_instruction0 POP;
+          self#write_instruction0 DELETE;
+          self#write_instruction0 R_ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP;
+          self#write_instruction0 SP_INC
+      | Assign
+          ( EqAssign,
+            ( {
+                node =
+                  Member
+                    ( _,
+                      member_name,
+                      ClassVariable _
+                    );
+                _;
+              } as lhs ),
+            ({ node = Ident ("value", LocalVariable _); _ } as rhs)
+          )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match current_function with
+                | Some f -> String.is_suffix f.name ~suffix:"::set"
+                | None -> false)
+             && (match self#member_type lhs with IFace _ -> true | _ -> false)
+        ->
+          (* v12 auto interface-property setters transfer the backing
+             two-slot interface ref directly. Treating it as a struct page
+             ref stores only half of the pair and later dispatch can use the
+             vtable offset as a page id. *)
+          self#compile_variable_ref lhs;
+          self#write_instruction0 DUP2;
+          self#write_instruction0 REF;
+          self#write_instruction0 DELETE;
+          self#compile_lvalue rhs;
+          self#write_instruction0 R_ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP;
+          self#write_instruction0 SP_INC
+      | Assign
+          ( EqAssign,
+            ( {
                 node =
                   Member
                     ( _,
@@ -2306,6 +5842,69 @@ class jaf_compiler ctx debug_info =
           self#write_instruction0 S_ASSIGN;
           before_pop ();
           self#write_instruction0 POP
+      | Assign
+          ( EqAssign,
+            ( {
+                node =
+                  Member
+                    ( _,
+                      member_name,
+                      ClassVariable _
+                    );
+                _; 
+              } as lhs ),
+            ({ node = Ident ("value", LocalVariable _); _ } as rhs)
+          )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match current_function with
+                | Some f -> String.is_suffix f.name ~suffix:"::set"
+                | None -> false)
+             && (match self#member_type lhs with Struct _ -> true | _ -> false)
+        ->
+          (* v12 auto setters whose backing storage is a value struct
+             copy the incoming ref-struct value directly into the backing
+             page. The generic assignment path adds a DummyRef A_REF/DELETE
+             pair that original setters do not emit. *)
+          self#compile_lvalue lhs;
+          self#compile_lvalue rhs;
+          self#write_instruction0 SR_ASSIGN;
+          before_pop ();
+          self#write_instruction0 POP
+      | Assign
+          ( EqAssign,
+            ( {
+                node =
+                  Member
+                    ( _,
+                      member_name,
+                      ClassVariable _
+                    );
+                _;
+              } as lhs ),
+            ({ node = Ident ("value", LocalVariable _); _ } as rhs)
+          )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_prefix member_name ~prefix:"<"
+             && String.is_suffix member_name ~suffix:">"
+             && (match current_function with
+                | Some f -> String.is_suffix f.name ~suffix:"::set"
+                | None -> false)
+             && (match self#member_type lhs with Ref (Struct _) -> true | _ -> false)
+        ->
+          (* v12 auto setters for ref-struct backings (kept as ref when
+             the target has no default constructor) assign the page-ref
+             directly. Using SR_ASSIGN treats the slot as a struct page
+             and can trip page-0 errors on uninitialized backings. *)
+          self#compile_variable_ref lhs;
+          self#write_instruction0 DUP2;
+          self#write_instruction0 REF;
+          self#write_instruction0 DELETE;
+          self#compile_lvalue rhs;
+          self#write_instruction0 ASSIGN;
+          before_pop ();
+          self#write_instruction0 SP_INC
       | Assign
           ( EqAssign,
             { node = Ident (_, LocalVariable (i, _)); _ },
@@ -2342,6 +5941,103 @@ class jaf_compiler ctx debug_info =
       | Seq (a, b) ->
           self#compile_expr_and_pop a;
           self#compile_expr_and_pop ~before_pop b
+      | Call
+          ( {
+              node =
+                Member
+                  ( ({
+                       node =
+                         DummyRef
+                           ( dummy_idx,
+                             ({
+                                node =
+                                  Call
+                                    ( { node = OptionalMember (obj, _, _); _ },
+                                      opt_args,
+                                      MethodCall (_, opt_method_no) );
+                                _;
+                              } as opt_call) );
+                       _;
+                     } as receiver),
+                    _,
+                    _ );
+              _;
+            },
+            args,
+            MethodCall (_, method_no) )
+        when Ain.version ctx.ain > 8 && Poly.equal expr.ty Void -> (
+          (* v12 [obj?.Prop.Method()] used as a statement.  The
+             optional receiver must guard the entire outer method call:
+             if [obj] is NULL, alice skips [.Method()] and leaves only
+             the optional-chain status sentinel for the statement POP.
+             Letting [DummyRef] materialize [-1] first makes the outer
+             CALLMETHOD dereference a null receiver (REF page=-1). *)
+          self#pre_emit_lambda_args args;
+          let receiver_is_iface =
+            match receiver.ty with
+            | Struct (name, _) | Ref (Struct (name, _)) ->
+                Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          let rec is_dummyref_shape (e : expression) =
+            match e.node with
+            | DummyRef _ -> true
+            | Call
+                ( _,
+                  _,
+                  (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _)
+                  ) ->
+                true
+            | Cast (_, inner) -> is_dummyref_shape inner
+            | _ -> false
+          in
+          let obj_is_dummyref = is_dummyref_shape obj in
+          if obj_is_dummyref then (
+            self#compile_lvalue obj;
+            self#write_instruction0
+              (if receiver_is_iface then DUP_U2 else DUP);
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE)
+          else (
+            self#compile_variable_ref obj;
+            self#write_instruction0 DUP2;
+            self#write_instruction0 REF;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE);
+          let ifnz_addr = current_address + 2 in
+          self#write_instruction1 IFNZ 0;
+          if not obj_is_dummyref then
+            self#write_instruction0
+              (if receiver_is_iface then REFREF else REF);
+          self#compile_method_call_for_receiver obj.ty opt_args opt_method_no;
+          self#write_instruction0 PUSHLOCALPAGE;
+          self#write_instruction1 PUSH dummy_idx;
+          self#write_instruction0 REF;
+          self#write_instruction0 DELETE;
+          self#write_instruction0 PUSHLOCALPAGE;
+          self#write_instruction0 DUP_X2;
+          self#write_instruction0 POP;
+          self#write_instruction1 PUSH dummy_idx;
+          self#write_instruction0 DUP_X2;
+          self#write_instruction0 POP;
+          self#write_instruction0
+            (if receiver_is_iface || is_ref_scalar opt_call.ty then R_ASSIGN
+             else ASSIGN);
+          self#compile_method_call_for_receiver receiver.ty args method_no;
+          self#write_instruction1 PUSH 0;
+          let jump_addr = current_address + 2 in
+          self#write_instruction1 JUMP 0;
+          self#write_address_at ifnz_addr current_address;
+          if obj_is_dummyref then (
+            self#write_instruction0 POP;
+            if receiver_is_iface then self#write_instruction0 POP)
+          else (
+            self#write_instruction0 POP;
+            self#write_instruction0 POP);
+          self#write_instruction1 PUSH (-1);
+          self#write_address_at jump_addr current_address;
+          before_pop ();
+          self#write_instruction0 POP)
       (* v11 [obj?.Method()] / [obj?.HllCall()] used as a statement: the
          optional chain leaves a fat-null sentinel int on the stack
          (0 for success, -1 for null) that must be discarded. The
@@ -2349,6 +6045,20 @@ class jaf_compiler ctx debug_info =
          and the default [compile_pop Void] is a no-op — emit an
          explicit [POP] so the stack stays balanced. *)
       | Call ({ node = OptionalMember _; _ }, _, (MethodCall _ | HLLCall _))
+        when Ain.version ctx.ain > 8 && Poly.equal expr.ty Void ->
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP
+      | NullCoalesce
+          ( {
+              node =
+                Call
+                  ( { node = OptionalMember _; _ },
+                    _,
+                    (MethodCall _ | HLLCall _) );
+              _;
+            },
+            _ )
         when Ain.version ctx.ain > 8 && Poly.equal expr.ty Void ->
           self#compile_expression expr;
           before_pop ();
@@ -2361,6 +6071,112 @@ class jaf_compiler ctx debug_info =
             when Ain.version_gte ctx.ain (11, 0) ->
               self#write_instruction0 POP
           | _ -> self#compile_pop expr.ty (ASTExpression expr))
+      | Assign (EqAssign, lhs, { node = Null; _ })
+        when Ain.version_gte ctx.ain (12, 0)
+             &&
+             (match lhs.node with
+             | Ident (_, LocalVariable (i, _)) -> (
+                 match (self#get_local i).value_type with
+                 | Ain.Type.Ref (Struct _) -> true
+                 | _ -> false)
+             | Ident (_, GlobalVariable i) -> (
+                 match (Ain.get_global_by_index ctx.ain i).value_type with
+                 | Ain.Type.Ref (Struct _) -> true
+                 | _ -> false)
+             | Member (_, _, ClassVariable _) -> (
+                 match self#member_type lhs with
+                 | Ain.Type.Ref (Struct _) -> true
+                 | _ -> false)
+             | _ -> false) ->
+          self#compile_variable_ref lhs;
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 ASSIGN;
+          self#write_instruction0 SP_INC;
+          before_pop ()
+      | Assign (EqAssign, lhs, rhs)
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match lhs.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.IFace _ -> true
+                    | _ -> false)
+                | Ident (_, GlobalVariable i) -> (
+                    match (Ain.get_global_by_index ctx.ain i).value_type with
+                    | Ain.Type.IFace _ -> true
+                    | _ -> false)
+                | Member (_, _, ClassVariable _) -> (
+                    match self#member_type lhs with
+                    | Ain.Type.IFace _ -> true
+                    | _ -> false)
+                | _ -> (
+                    match lhs.ty with
+                    | Struct (name, _) | Ref (Struct (name, _)) ->
+                        Hashtbl.mem ctx.interface_names name
+                    | _ -> false))
+             && (match rhs.node with
+                | Null -> false  (* let the existing Null special-cases handle it *)
+                | _ -> true) ->
+          (* v12 IFace lhs assignment as expression statement.
+             Two sub-cases based on rhs shape:
+
+             1. DummyRef(Call): rhs's R_ASSIGN stores into dummy slot,
+                then we need stack juggle + second R_ASSIGN to assign
+                to lhs. Match alice's pattern with DUP2; REF prefix.
+
+             2. Simple rhs (Ident, Member, etc.): rhs emits 2 stack
+                items (src_p, src_i). R_ASSIGN consumes 4, leaves 2.
+                POP; SP_INC drops idx + refcount-bumps page.
+
+             Original Rance10's pattern (DummyRef case):
+             Original Rance10's pattern:
+               <lhs lvalue: PUSHSTRUCTPAGE; PUSH N>
+               DUP2; REF                  ; push old lhs value for later DELETE
+               <rhs DummyRef path: stores call result in dummy slot via R_ASSIGN>
+               DUP_X2; POP; DUP_X2; POP   ; stack juggle to bring old to top
+               DELETE                     ; release old lhs value
+               R_ASSIGN                   ; assign new value to lhs
+               POP; SP_INC                ; cleanup, refcount-bump
+
+             Our default codegen emits the two R_ASSIGNs back-to-back
+             with no juggling, leaving stack imbalanced; the trailing
+             compile_pop's DELETE then hits page=0. *)
+          (match rhs.node with
+           | DummyRef (_, { node = Call _; _ }) ->
+             self#compile_variable_ref lhs;
+             self#write_instruction0 DUP2;
+             self#write_instruction0 REF;
+             self#compile_expression rhs;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DELETE;
+             self#write_instruction0 R_ASSIGN;
+             self#write_instruction0 POP;
+             self#write_instruction0 SP_INC
+           | _ ->
+             (* Simple rhs (Ident, Member, etc.): match alice's pattern
+                that releases the OLD lhs value before R_ASSIGN.
+                  lhs lvalue                  ; [page, slot]
+                  DUP2; REF                   ; [page, slot, old]
+                  rhs (REFREF leaves 2)       ; [page, slot, old, src_p, src_i]
+                  DUP_X2; POP; DUP_X2; POP    ; rearrange to [page, slot, src_p, src_i, old]
+                  DELETE                       ; release old
+                  R_ASSIGN                     ; consume 4, leave 2
+                  POP; SP_INC                  ; drop idx, ref page *)
+             self#compile_variable_ref lhs;
+             self#write_instruction0 DUP2;
+             self#write_instruction0 REF;
+             self#compile_expression rhs;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DELETE;
+             self#write_instruction0 R_ASSIGN;
+             self#write_instruction0 POP;
+             self#write_instruction0 SP_INC);
+          before_pop ()
       | _ ->
           self#compile_expression expr;
           before_pop ();
@@ -2438,6 +6254,10 @@ class jaf_compiler ctx debug_info =
                shaped values), [compile_pop] emits a [DELETE]-style
                release that needs to fire BEFORE the slot's
                [SH_LOCALDELETE], otherwise the strong ref leaks.
+             - Struct/ref-struct assignment temporaries are different:
+               original v12 releases the DummyRef slot first, then the
+               assignment expression result. Reversing those can drop
+               the page backing the dummy before its local cleanup runs.
              - For everything else, [compile_pop] emits a plain [POP]
                which doesn't touch refcounts; alice releases the slot
                BEFORE the [POP] so the dummy is gone while the value
@@ -2446,8 +6266,26 @@ class jaf_compiler ctx debug_info =
             Ain.version ctx.ain > 8
             &&
             match e.ty with
-            | String | Delegate _ | HLLParam | Array _ -> true
-            | _ -> false
+            | String | Delegate _ | HLLParam | Array _
+            | Ref (String | Array _ | HLLParam) ->
+                true
+            | _ -> (
+                match e.node with
+                | Assign (EqAssign, { node = DummyRef _; _ }, _) -> true
+                (* v12 [obj.OptMethod(...)] / [obj?.Method(...)] / chained
+                   optional access producing a plain scalar result (Int /
+                   Bool / Float / Enum) at statement level: orig pops the
+                   call's return value BEFORE the optional-chain dummy
+                   cleanup. The default [before_pop = cleanup] ordering
+                   leaves the return value buried under the cleanup ops
+                   and POPs the wrong slot. *)
+                | Call (_, _, MethodCall _) when
+                    Ain.version_gte ctx.ain (12, 0)
+                    && (match e.ty with
+                        | Int | Bool | Float | LongInt | Enum _ -> true
+                        | _ -> false) ->
+                    true
+                | _ -> false)
           in
           if cleanup_after_pop then (
             self#compile_expr_and_pop e;
@@ -2469,27 +6307,142 @@ class jaf_compiler ctx debug_info =
             | Some scope -> List.length scope.vars
             | None -> 0
           in
+          let empty_statement stmt =
+            match stmt.node with EmptyStatement -> true | _ -> false
+          in
+          let branch_exit_statement stmt =
+            match stmt.node with
+            | Return _ | Continue | Break -> true
+            | Compound [ { node = (Return _ | Continue | Break); _ } ] -> true
+            | _ -> false
+          in
+          let inverted_null_test =
+            match test.node with
+            | Binary ((Equal | NEqual as op), a, ({ node = Null; _ } as b)) ->
+                let op = match op with Equal -> NEqual | NEqual -> Equal | _ -> op in
+                Some { test with node = Binary (op, a, b) }
+            | Binary ((Equal | NEqual as op), ({ node = Null; _ } as a), b) ->
+                let op = match op with Equal -> NEqual | NEqual -> Equal | _ -> op in
+                Some { test with node = Binary (op, a, b) }
+            | _ -> None
+          in
+          if
+            Ain.version_gte ctx.ain (12, 0)
+            && empty_statement alt
+            && branch_exit_statement con
+            && Option.is_some inverted_null_test
+          then (
+            (* v12 [if (x == null) return false] / [if (x != null) ...]
+               fast-path. The [inverted_null_test] helper returns the
+               inner expression with the comparison sense flipped so a
+               single IFNZ skips the branch-exit body when condition is
+               originally [== null]. Restored from pre-workflow state —
+               dropping this broke delegate-typed null comparisons,
+               which the general path lowers via DG_EQUAL or similar. *)
+            let test = Option.value_exn inverted_null_test in
+            self#compile_expression test;
+            self#cleanup_condition_dummyrefs vars_before;
+            self#maybe_emit_condition_itob test;
+            let after_return_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            self#compile_statement con;
+            self#write_address_at after_return_addr current_address)
+          else (
+          let _ = empty_statement in
+          let _ = branch_exit_statement in
+          (* v12 peephole: [LogNot e] in test position becomes [e] with
+             IFZ↔IFNZ swapped, eliminating a [NOT] before the branch.
+             Matches original Rance10 [NOT;IFZ] → [IFNZ] / [NOT;IFNZ] →
+             [IFZ] shape. *)
+          let test, peeled_lognot =
+            if Ain.version_gte ctx.ain (12, 0) then
+              match test.node with
+              | Unary (LogNot, inner) -> (inner, true)
+              | _ -> (test, false)
+            else (test, false)
+          in
           self#compile_expression test;
           (* v11: release condition-local dummies before the IFZ so
              both the taken and not-taken branch see them cleaned up. *)
           self#cleanup_condition_dummyrefs vars_before;
           self#maybe_emit_condition_itob test;
-          let ifz_addr = current_address + 2 in
-          self#write_instruction1 IFZ 0;
-          self#compile_statement con;
-          (match alt.node with
-          | EmptyStatement when Ain.version ctx.ain > 8 ->
-              (* v11 omits the trailing JUMP-over-alt when there's no
-                 else branch. Pre-v11 always emits the JUMP — keep
-                 that layout for pre-v11 since some pre-v11 expected
-                 bytecode/address tests rely on it. *)
-              self#write_address_at ifz_addr current_address
-          | _ ->
-              let jump_addr = current_address + 2 in
+          if Ain.version_gte ctx.ain (12, 0) then (
+            (* Capture the per-if cleanup slot list now; nested ifs in con
+               will clobber [last_condition_deleted_dummies]. *)
+            let saved_last = last_condition_deleted_dummies in
+            if List.is_empty saved_last then (
+              (* No condition-local dummies released. Original v12
+                 if-without-cleanup layout:
+                   cond
+                   IFNZ body_label     (or IFZ if peeled LogNot)
+                   JUMP alt_label
+                   body_label: con
+                   [if alt: JUMP end_label]
+                   alt_label: alt
+                   end_label: *)
+              let branch_op = if peeled_lognot then IFZ else IFNZ in
+              let if_addr = current_address + 2 in
+              self#write_instruction1 branch_op 0;
+              let alt_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
-              self#write_address_at ifz_addr current_address;
-              self#compile_statement alt;
-              self#write_address_at jump_addr current_address)
+              self#write_address_at if_addr current_address;
+              self#compile_statement con;
+              match alt.node with
+              | EmptyStatement ->
+                  self#write_address_at alt_jump_addr current_address
+              | _ ->
+                  let end_jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at alt_jump_addr current_address;
+                  self#compile_statement alt;
+                  self#write_address_at end_jump_addr current_address)
+            else (
+              (* Original v12 if-with-cleanup layout (per dasm of original
+                 Rance10):
+                   cond
+                   [pre-IFZ replay]   (already emitted above)
+                   IFZ con_label      (or IFNZ if peeled LogNot)
+                   [post-IFZ replay]  (saved_last)
+                   JUMP cont_label
+                   con_label: con
+                   [post-RETURN replay] (dead code; only if con is a
+                                         branch-exit statement —
+                                         emitting it unconditionally
+                                         breaks if con falls through,
+                                         e.g. the cleanup runs as live
+                                         code and corrupts slot state.) *)
+              let con_is_branch_exit = branch_exit_statement con in
+              let branch_op = if peeled_lognot then IFZ else IFNZ in
+              let if_addr = current_address + 2 in
+              self#write_instruction1 branch_op 0;
+              List.iter saved_last ~f:(fun idx ->
+                  self#write_instruction1 SH_LOCALDELETE idx);
+              let cont_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at if_addr current_address;
+              self#compile_statement con;
+              if con_is_branch_exit then
+                List.iter saved_last ~f:(fun idx ->
+                    self#write_instruction1 SH_LOCALDELETE idx);
+              (match alt.node with
+              | EmptyStatement -> ()
+              | _ -> self#compile_statement alt);
+              self#write_address_at cont_jump_addr current_address))
+          else (
+            let ifz_addr = current_address + 2 in
+            self#write_instruction1 IFZ 0;
+            self#compile_statement con;
+            match alt.node with
+            | EmptyStatement when Ain.version ctx.ain > 8 ->
+                (* v11 omits the trailing JUMP-over-alt when there's no
+                   else branch. *)
+                self#write_address_at ifz_addr current_address
+            | _ ->
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#compile_statement alt;
+                self#write_address_at jump_addr current_address))
       | While (test, body) ->
           (* loop test *)
           let loop_addr = current_address in
@@ -2580,6 +6533,7 @@ class jaf_compiler ctx debug_info =
           compiler_bug "ForEach not desugared before codegen"
             (Some (ASTStatement stmt))
       | Goto name ->
+          self#emit_inline_deleted_dummy_cleanup;
           self#crc_push_word 0x407;
           self#crc_push_label_name name;
           (* The 0x407 marker replaces the JUMP, so don't hash the JUMP. *)
@@ -2595,6 +6549,7 @@ class jaf_compiler ctx debug_info =
           self#add_continue (ASTStatement stmt)
       | Break ->
           self#emit_loop_exit_cleanup;
+          self#record_switch_break_deleted_vars stmt.delete_vars;
           self#push_break_addr (current_address + 2) (ASTStatement stmt);
           self#write_instruction1 JUMP 0
       | Switch (expr, stmts) ->
@@ -2608,13 +6563,17 @@ class jaf_compiler ctx debug_info =
       | Default -> self#set_switch_default (ASTStatement stmt)
       | Return None -> self#write_instruction0 RETURN
       | Return (Some e) ->
+          let prev_in_return = is_in_return_expr in
+          is_in_return_expr <- true;
+          Exn.protect ~finally:(fun () -> is_in_return_expr <- prev_in_return)
+            ~f:(fun () ->
           (match ((Option.value_exn current_function).return_type, e.node) with
           | Ref _, Null -> self#compile_lvalue e
           | Ref (Int | Float | Bool | LongInt | FuncType _), _ ->
               self#compile_lvalue e;
               self#write_instruction0 DUP_U2;
               self#write_instruction0 SP_INC
-          | Ref (String | Struct _ | Array _), _ ->
+          | Ref (String | Struct _ | Array _ | Delegate _), _ ->
               self#compile_lvalue e;
               (match e.ty with
               | Wrap _ when Ain.version ctx.ain > 8 ->
@@ -2622,12 +6581,79 @@ class jaf_compiler ctx debug_info =
                      underlying page-ref before [DUP; SP_INC]. *)
                   self#write_instruction0 REFREF;
                   self#write_instruction0 REF
+              | Struct _ | Ref (Struct _)
+                when Ain.version_gte ctx.ain (12, 0) -> (
+                  match e.node with
+                  | Cast
+                      ( (Struct (_, dst_sno) | Ref (Struct (_, dst_sno))),
+                        { ty =
+                            (Struct (_, src_sno) | Ref (Struct (_, src_sno)));
+                          _;
+                        } )
+                    when not (Int.equal src_sno dst_sno) ->
+                      (* Original v12 normalizes failed X_ICAST returns to
+                         NULL before the return-value SP_INC. *)
+                      self#write_instruction1 PUSH (-1);
+                      self#write_instruction0 EQUALE;
+                      let ifnz_addr = current_address + 2 in
+                      self#write_instruction1 IFNZ 0;
+                      self#write_instruction0 POP;
+                      let jump_addr = current_address + 2 in
+                      self#write_instruction1 JUMP 0;
+                      self#write_address_at ifnz_addr current_address;
+                      self#write_instruction0 POP;
+                      self#write_instruction0 POP;
+                      self#write_instruction1 PUSH (-1);
+                      self#write_address_at jump_addr current_address
+                  | _ -> ())
               | _ -> ());
               self#write_instruction0 DUP;
               self#write_instruction0 SP_INC
           | Ref _, _ ->
               compile_error "return statement not implemented for ref type"
                 (ASTStatement stmt)
+          | IFace iface_sno, _
+            when Ain.version_gte ctx.ain (12, 0) -> (
+              let rec is_null_expr (e : expression) =
+                match e.node with
+                | Null -> true
+                | Cast (_, inner) -> is_null_expr inner
+                | _ -> false
+              in
+              if is_null_expr e then (
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH 0)
+              else (
+                (* v12 IFace return of [ref Struct] LOCAL: emit
+                   PUSHLOCALPAGE; PUSH slot; REF (lvalue page-ref).
+                   [compile_expression] appends [A_REF] via
+                   [compile_dereference] for [Ref (Struct _)], one
+                   deref too many — the returned fat-ref's page slot
+                   then contains the struct's vtable slot 0 (a function
+                   index) instead of the page-id, and the caller's
+                   REFREF on the stored iface crashes with
+                   Page=<func_idx>. Match original Rance10
+                   [CreateRadioButton] tail. Restrict to
+                   Ident+LocalVariable to avoid affecting member-
+                   access / captured-var / call-result returns whose
+                   A_REF emission is conditionally correct. *)
+                let rec peel_cast (x : expression) =
+                  match x.node with Cast (_, inner) -> peel_cast inner | _ -> x
+                in
+                let inner = peel_cast e in
+                (match (inner.node, inner.ty) with
+                | Ident (_, LocalVariable _), (Struct _ | Ref (Struct _)) ->
+                    self#compile_lvalue inner
+                | _ -> self#compile_expression e);
+                match e.ty with
+                | Struct (_, actual_sno) | Ref (Struct (_, actual_sno)) ->
+                    if not (Int.equal actual_sno iface_sno) then
+                      Option.iter
+                        (self#interface_vtable_offset actual_sno iface_sno)
+                        ~f:(fun offset -> self#write_instruction1 PUSH offset);
+                    self#write_instruction0 DUP_U2;
+                    self#write_instruction0 SP_INC
+                | _ -> ()))
           | _ ->
               self#compile_expression e;
               (* v11: when returning a [String]/[Struct]/[Array]
@@ -2641,17 +6667,25 @@ class jaf_compiler ctx debug_info =
                  it — there's no [SH_LOCALDELETE] between the dummy
                  and the consuming [CALLMETHOD]. *)
               if Ain.version ctx.ain > 8 then (
-                let rec inner_expr (e : expression) =
-                  match e.node with
-                  | DummyRef (_, inner) -> inner_expr inner
-                  | _ -> e
-                in
-                let inner = inner_expr e in
+                (* v11+ borrowed-ref early-return: when returning a
+                   DummyRef-wrapped Call whose ain-level return is
+                   [Ref _] (or [New _] / [NewCall _] in v12), bump the
+                   page's refcount before [RETURN] so the caller
+                   receives an owning ref and the local dummy's
+                   subsequent [SH_LOCALDELETE] doesn't free it. The
+                   [needs_a_ref_for_consume] helper bakes in a v12
+                   version gate, which would skip this for v11 — but
+                   v11 [parts::detail::CalcPartsRect]-style code paths
+                   rely on the A_REF too. Match the original pre-helper
+                   behavior here: emit A_REF whenever the DummyRef
+                   inner is a Call returning [Ref _] OR (v12 only) a
+                   bare [New]/[NewCall]. *)
                 let needs_a_ref =
                   match e.node with
-                  | DummyRef _ -> (
+                  | DummyRef (_, inner) -> (
                       match inner.node with
-                      | New _ -> true
+                      | New _ | NewCall _ ->
+                          Ain.version_gte ctx.ain (12, 0)
                       | Call _ -> (
                           match self#ain_call_return_type inner with
                           | Some (Ain.Type.Ref _) -> true
@@ -2664,7 +6698,7 @@ class jaf_compiler ctx debug_info =
                   | String | Struct _ | Array _ ->
                       self#write_instruction0 A_REF
                   | _ -> ()));
-          self#write_instruction0 RETURN
+          self#write_instruction0 RETURN)
       | Jump funcname ->
           let no = Ain.add_string ctx.ain funcname in
           self#write_instruction1 S_PUSH no;
@@ -2678,6 +6712,7 @@ class jaf_compiler ctx debug_info =
           let msg_no = Ain.add_message ctx.ain msg in
           self#write_instruction1 MSG msg_no
       | RefAssign (lhs, rhs) ->
+          self#pre_emit_v12_rhs_lambdas rhs;
           self#compile_lock_peek;
           self#compile_variable_ref lhs;
           (match lhs.ty with
@@ -2718,6 +6753,35 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction1 PUSH (-1);
                   self#write_instruction0 ASSIGN;
                   self#write_instruction0 POP
+              | _
+                when Ain.version_gte ctx.ain (12, 0)
+                     &&
+                     (match lhs.ty with
+                     | Wrap (Ref (String | Struct _ | Array _ | HLLParam)) ->
+                         true
+                     | Wrap (String | Struct _ | Array _ | HLLParam) -> true
+                     | _ -> false) ->
+                  let vars_before =
+                    match Stack.top scopes with
+                    | Some scope -> List.length scope.vars
+                    | None -> 0
+                  in
+                  self#write_instruction0 REFREF;
+                  self#write_instruction0 DUP2;
+                  self#write_instruction0 REF;
+                  self#compile_lvalue rhs;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 DELETE;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 SP_INC;
+                  (match Stack.top scopes with
+                  | Some scope ->
+                      let n_new = List.length scope.vars - vars_before in
+                      if n_new > 0 then
+                        List.iter
+                          (List.rev (List.take scope.vars n_new))
+                          ~f:self#compile_delete_var
+                  | None -> ())
               | _ ->
                   self#write_instruction0 R_ASSIGN;
                   self#write_instruction0 POP;
@@ -2737,6 +6801,11 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 R_ASSIGN;
                   self#write_instruction0 POP;
                   self#write_instruction0 POP
+              | DummyRef (dummy_idx, { node = Call _; _ }) ->
+                  self#write_instruction0 R_ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 SP_INC;
+                  self#write_instruction1 SH_LOCALDELETE dummy_idx
               | _ ->
                   self#write_instruction0 DUP_U2;
                   self#write_instruction0 SP_INC;
@@ -2758,6 +6827,34 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 POP;
                   self#write_instruction0 REF;
                   self#write_instruction0 SP_INC)
+          | Ref (String | Struct _ | Array _ | HLLParam)
+            when Ain.version_gte ctx.ain (12, 0) ->
+              (* v12 ref-object rebinding matches the original order:
+                 read the old page, push the new page, then delete old.
+                 Deleting before the rhs is in place trips page-0 deletes
+                 for freshly zeroed member slots during @0 initialization. *)
+              let vars_before =
+                match Stack.top scopes with
+                | Some scope -> List.length scope.vars
+                | None -> 0
+              in
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF;
+              (match rhs.node with
+              | Null -> self#write_instruction1 PUSH (-1)
+              | _ -> self#compile_lvalue rhs);
+              self#write_instruction0 SWAP;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 SP_INC;
+              (match Stack.top scopes with
+              | Some scope ->
+                  let n_new = List.length scope.vars - vars_before in
+                  if n_new > 0 then
+                    List.iter
+                      (List.rev (List.take scope.vars n_new))
+                      ~f:self#compile_delete_var
+              | None -> ())
           | Ref (String | Struct _ | Array _ | HLLParam)
             when Ain.version ctx.ain > 8 ->
               (* v11 [ref X = rvalue]: rhs has been wrapped in a
@@ -2865,6 +6962,34 @@ class jaf_compiler ctx debug_info =
         | Ref _ when Ain.version ctx.ain > 8 -> (
             (* v11 ref-init paths. Each handles a specific shape; the
                final fallback rewrites to a [RefAssign] like pre-v11. *)
+            let emit_v12_ref_null_init () =
+              if Ain.version_gte ctx.ain (12, 0) then (
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                match ain_to_jaf_type ctx.ain v.value_type with
+                | Ref (Int | Bool | LongInt | FuncType _) ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH 0;
+                    self#write_instruction0 R_ASSIGN;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP
+                | Ref Float ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1_float F_PUSH 0.0;
+                    self#write_instruction0 R_ASSIGN;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP
+                | Ref (String | Struct _ | Array _ | HLLParam | Delegate _) ->
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 ASSIGN;
+                    self#write_instruction0 POP
+                | _ -> ())
+            in
+            (* Foreach-desugar dummies (is_private=true) get their value
+               from the foreach loop's source expression — original Rance10
+               doesn't emit the null-init prefix for them. Across 526
+               functions in Rance10 this saves 5 instructions each. *)
+            if false && not decl.is_private then emit_v12_ref_null_init ();
             let vars_before () =
               match Stack.top scopes with
               | Some scope -> List.length scope.vars
@@ -2909,7 +7034,7 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH v.index;
                 self#write_instruction0 REF;
-                self#write_instruction0 CHECKUDO;
+                self#emit_slot_release;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction0 SWAP;
                 self#write_instruction1 PUSH v.index;
@@ -2922,13 +7047,31 @@ class jaf_compiler ctx debug_info =
                    | Ref (Array _) -> true
                    | _ -> false ->
                 (* Array-ref init: push raw ref via [compile_lvalue]
-                   into the freshly-declared slot using ASSIGN; SP_INC. *)
+                   into the freshly-declared slot using ASSIGN; SP_INC.
+                   For foreach containers (v12), [compile_lvalue] descends
+                   into a [DummyRef] wrapping the [::get()] call result
+                   and registers the result-dummy slot in [scope.vars].
+                   Without an inline cleanup here that dummy survives
+                   until end_scope, leaving its slot pointing at the
+                   container array while the loop body emits other
+                   dummies and breaks/continues. Mirrors the sibling
+                   [is_private] branch above.
+
+                   Also skip [compile_delete_ref] (DUP2;REF;DELETE) for
+                   is_private vars — their slots are freshly allocated
+                   with uninitialized memory; the VM's page lookup
+                   ([FUN_00622720]) rejects non-allocated page-ids →
+                   [DeletePage Page=N] crash (confirmed via Ghidra:
+                   the page-table flag at offset +4 must equal 1). *)
+                let vb = vars_before () in
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH v.index;
-                self#compile_delete_ref decl.type_spec.ty;
+                if not decl.is_private then
+                  self#compile_delete_ref decl.type_spec.ty;
                 self#compile_lvalue e;
                 self#write_instruction0 ASSIGN;
-                self#write_instruction0 SP_INC
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vb
             | Some e
               when is_ref_scalar (ain_to_jaf_type ctx.ain v.value_type)
                    && (match e.node with DummyRef _ -> false | _ -> true) ->
@@ -2969,7 +7112,7 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH v.index;
                 self#write_instruction0 REF;
-                self#write_instruction0 CHECKUDO;
+                self#emit_slot_release;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction0 SWAP;
                 self#write_instruction1 PUSH v.index;
@@ -3028,9 +7171,13 @@ class jaf_compiler ctx debug_info =
               | Some e -> e
               | None -> make_expr ~ty:decl.type_spec.ty Null
             in
-            self#compile_ref_assign ~is_init:true ~parent:(ASTVariable decl) lhs
-              rhs
-        | Int | Bool | LongInt | Float | FuncType _ | String ->
+            self#compile_statement
+              {
+                node = RefAssign (lhs, rhs);
+                delete_vars = [];
+                loc = decl.location;
+              }
+        | Int | Bool | LongInt | Float | Enum _ | FuncType _ | String ->
             let lhs =
               {
                 node = Ident (decl.name, LocalVariable (v.index, decl.location));
@@ -3044,7 +7191,7 @@ class jaf_compiler ctx debug_info =
               | None ->
                   let value =
                     match v.value_type with
-                    | Int | Bool | LongInt -> ConstInt 0
+                    | Int | Bool | LongInt | Enum _ -> ConstInt 0
                     | Float -> ConstFloat 0.0
                     | FuncType _ | String -> Null
                     | _ -> failwith "unreachable"
@@ -3059,17 +7206,24 @@ class jaf_compiler ctx debug_info =
             self#compile_expr_and_pop
               ~before_pop:(fun () ->
                 if Ain.version ctx.ain > 8 then
-                  self#cleanup_condition_dummyrefs vars_before)
-              {
-                node = Assign (EqAssign, lhs, rhs);
-                ty = rhs.ty;
-                loc = decl.location;
-              }
+                    self#cleanup_condition_dummyrefs vars_before)
+                {
+                  node = Assign (EqAssign, lhs, rhs);
+                  ty = rhs.ty;
+                  loc = decl.location;
+                }
         | Struct sno -> (
             (* FIXME: use verbose versions *)
-            self#write_instruction1 SH_LOCALDELETE v.index;
+            if not (Ain.version_gte ctx.ain (12, 0)) then
+              self#write_instruction1 SH_LOCALDELETE v.index;
             self#write_instruction2 SH_LOCALCREATE v.index sno;
             match decl.initval with
+            | Some { node = New { ty = Struct (_, init_sno); _ }; _ }
+              when Ain.version_gte ctx.ain (12, 0) && Int.equal init_sno sno ->
+                ()
+            | Some { node = NewCall ({ ty = Struct (_, init_sno); _ }, []); _ }
+              when Ain.version_gte ctx.ain (12, 0) && Int.equal init_sno sno ->
+                ()
             | Some e ->
                 self#compile_lvalue
                   {
@@ -3086,18 +7240,33 @@ class jaf_compiler ctx debug_info =
             | None -> ())
         | Array _ ->
             let has_dims = List.length decl.array_dim > 0 in
+            let elem_ty =
+              match v.value_type with
+              | Array t ->
+                  Ain.Type.int_of_data_type (Ain.version ctx.ain) t
+              | _ -> self#array_element_type_code decl.type_spec.ty
+            in
             self#compile_local_ref v.index;
             if Ain.version ctx.ain > 8 then (
               self#write_instruction0 REF;
               match decl.initval with
+              | Some { node = ArrayLiteral elems; _ } ->
+                  self#write_instruction0 DUP;
+                  self#compile_CALLHLL "Array" "Free" elem_ty
+                    (ASTVariable decl);
+                  List.iter elems ~f:(fun elem ->
+                      self#write_instruction0 DUP;
+                      self#compile_expression elem;
+                      if self#needs_a_ref_for_consume elem then
+                        self#write_instruction0 A_REF;
+                      self#compile_CALLHLL "Array" "PushBack" elem_ty
+                        (ASTVariable decl));
+                  self#write_instruction0 POP
               | Some e ->
                   self#compile_expression e;
                   self#write_instruction0 X_SET;
                   self#write_instruction0 DELETE
               | None ->
-                  let elem_ty =
-                    self#array_element_type_code decl.type_spec.ty
-                  in
                   if has_dims then (
                     List.iter decl.array_dim ~f:self#compile_expression;
                     for _ = 1 to 4 - List.length decl.array_dim do
@@ -3114,6 +7283,27 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 A_ALLOC)
             else self#write_instruction0 A_FREE
         | Delegate _ -> (
+            (match decl.initval with
+            | Some e when Ain.version_gte ctx.ain (12, 0) ->
+                let rec find_lambda (e : expression) =
+                  match e.node with
+                  | Lambda f -> Some f
+                  | Cast (_, inner) -> find_lambda inner
+                  | _ -> None
+                in
+                (match find_lambda e with
+                | Some f ->
+                    let lambda_idx = Option.value_exn f.index in
+                    if not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+                    then (
+                      let jump_addr = current_address + 2 in
+                      self#write_instruction1 JUMP 0;
+                      self#compile_function f;
+                      self#write_address_at jump_addr current_address;
+                      Hashtbl.set v12_assignment_lambdas ~key:lambda_idx
+                        ~data:())
+                | None -> ())
+            | _ -> ());
             self#compile_local_ref v.index;
             self#write_instruction0 REF;
             match decl.initval with
@@ -3138,8 +7328,84 @@ class jaf_compiler ctx debug_info =
            itself is a no-op. *)
         | Wrap _ when Ain.version ctx.ain > 8 -> ()
         | Void -> ()
+        | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+            let lhs =
+              {
+                node = Ident (decl.name, LocalVariable (v.index, decl.location));
+                ty = decl.type_spec.ty;
+                loc = decl.location;
+              }
+            in
+            (match decl.initval with
+            | None when not (Hashtbl.mem v12_skip_iface_init v.index) ->
+                (* v12 IFace local without initval (e.g. [IEnqueteItem
+                   Item;] in CEnqueteItemManager@Add): emit NULL init
+                   for the 2-slot fat-ref so subsequent partial stores
+                   leave the offset slot at 0 (not stale function-index
+                   data). Skip when the next stmt unconditionally
+                   assigns this var (e.g. [Type v; if ((v = ...) ==
+                   NULL)]) — original Rance10 omits the init there too.
+                   *)
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH v.index;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF;
+                self#write_instruction0 DELETE;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH 0;
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 SP_INC
+            | None -> ()
+            | Some rhs ->
+                let vars_before =
+                  match Stack.top scopes with
+                  | Some scope -> List.length scope.vars
+                  | None -> 0
+                in
+                self#compile_variable_ref lhs;
+                self#compile_delete_ref decl.type_spec.ty;
+                (match rhs.node with
+                | New { ty = Struct (_, s_no); _ } ->
+                    self#write_instruction2 NEW s_no (self#bare_new_ctor s_no)
+                | _ ->
+                    let prev = v12_iface_local_init_owns_cast_guard in
+                    v12_iface_local_init_owns_cast_guard <- true;
+                    Exn.protect
+                      ~f:(fun () -> self#compile_expression rhs)
+                      ~finally:(fun () ->
+                        v12_iface_local_init_owns_cast_guard <- prev));
+                (match rhs.node with
+                | Cast
+                    ( (Struct (_, dst_sno) | Ref (Struct (_, dst_sno))),
+                      { ty =
+                          (Struct (_, src_sno) | Ref (Struct (_, src_sno)));
+                        _;
+                      } )
+                  when not (Int.equal src_sno dst_sno) ->
+                    (* Original v12 guards X_ICAST immediately before
+                       storing into an interface local: a failed cast is
+                       normalized to the IFace null pair before R_ASSIGN. *)
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 EQUALE;
+                    let ifz_addr = current_address + 2 in
+                    self#write_instruction1 IFZ 0;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH 0;
+                    self#write_address_at ifz_addr current_address
+                | _ -> ());
+                self#write_instruction0 R_ASSIGN;
+                self#write_instruction0 POP;
+                self#write_instruction0 SP_INC;
+                self#cleanup_condition_dummyrefs vars_before)
+        (* v11+ IFace locals/params don't need explicit init — the
+           value is provided by the caller (params) or is a NULL ref
+           (locals). *)
+        | IFace _ when Ain.version ctx.ain > 8 -> ()
         | IMainSystem | HLLFunc2 | HLLParam | Wrap _ | Option _
-        | Unknown87 _ | IFace _ | Enum2 _ | Enum _ | HLLFunc | Unknown98
+        | Unknown87 _ | IFace _ | Enum2 _ | HLLFunc | Unknown98
         | IFaceWrap _ | Function | Method | NullType ->
             compile_error
               (Printf.sprintf "Unimplemented variable type: %s for `%s`"
@@ -3149,22 +7415,90 @@ class jaf_compiler ctx debug_info =
 
     (** Emit the code for a block of statements. *)
     method compile_block (stmts : statement list) =
+      let top_level = Int.equal block_depth 0 in
+      block_depth <- block_depth + 1;
       self#start_scope;
-      List.iter stmts ~f:self#compile_statement;
-      self#end_scope
+      (* v12 iface-init suppression: for [Type var; <next stmt that
+         unconditionally assigns var>;] patterns, original Rance10
+         skips the NULL-init prefix. Detect via a rec walker on the
+         next stmt's expression tree. *)
+      let rec expr_assigns_var (e : expression) var_no =
+        match e.node with
+        | Assign (EqAssign, lhs, _) -> (
+            match lhs.node with
+            | Ident (_, LocalVariable (i, _)) -> Int.equal i var_no
+            | _ -> false)
+        | Binary (_, a, b) ->
+            expr_assigns_var a var_no || expr_assigns_var b var_no
+        | Ternary (a, b, c) ->
+            expr_assigns_var a var_no || expr_assigns_var b var_no
+            || expr_assigns_var c var_no
+        | Cast (_, inner) | Unary (_, inner) -> expr_assigns_var inner var_no
+        | _ -> false
+      in
+      let stmt_assigns_var (stmt : statement) var_no =
+        match stmt.node with
+        | Expression e -> expr_assigns_var e var_no
+        | If (cond, _, _) -> expr_assigns_var cond var_no
+        | While (cond, _) -> expr_assigns_var cond var_no
+        | _ -> false
+      in
+      let rec loop = function
+        | [] -> ()
+        | stmt :: rest ->
+            (* Populate skip-set for Declarations whose next stmt
+               unconditionally assigns the var. *)
+            (if Ain.version_gte ctx.ain (12, 0) then
+               match (stmt.node, rest) with
+               | Declarations decls, next :: _ ->
+                   List.iter decls.vars ~f:(fun (v : variable) ->
+                       match v.index with
+                       | Some i when stmt_assigns_var next i ->
+                           Hashtbl.set v12_skip_iface_init ~key:i ~data:()
+                       | _ -> ())
+               | _ -> ());
+            self#compile_statement stmt;
+            if Ain.version_gte ctx.ain (12, 0) then
+              self#emit_v12_last_use_cleanup stmt rest;
+            ignore top_level;
+            loop rest
+      in
+      loop stmts;
+      self#end_scope;
+      block_depth <- block_depth - 1
+
+    method private statement_guaranteed_returns (stmt : statement) =
+      match stmt.node with
+      | Return _ | Jump _ | Jumps _ -> true
+      | Compound stmts -> self#statements_guaranteed_return stmts
+      | If (_, con, alt) ->
+          self#statement_guaranteed_returns con
+          && self#statement_guaranteed_returns alt
+      | _ -> false
+
+    method private statements_guaranteed_return stmts =
+      match List.last stmts with
+      | Some stmt -> self#statement_guaranteed_returns stmt
+      | None -> false
 
     (** Emit the code for a default return value. *)
     method compile_default_return (t : Ain.Type.t) decl =
       match t with
-      | Ref (String | Struct _ | Array _) -> self#write_instruction1 PUSH (-1)
+      | Ref (String | Struct _ | Array _ | Delegate _ | IFace _) ->
+          self#write_instruction1 PUSH (-1)
       | Ref (Int | Float | Bool | LongInt) ->
           self#write_instruction1 PUSH (-1);
           self#write_instruction1 PUSH 0
       | Void -> ()
-      | Int | Bool | LongInt | FuncType _ -> self#write_instruction1 PUSH 0
+      | Int | Bool | LongInt | Enum _ | FuncType _ ->
+          self#write_instruction1 PUSH 0
       | Float -> self#write_instruction1 F_PUSH 0
       | String -> self#write_instruction1 S_PUSH 0
-      | Struct _ | Array _ | Delegate _ -> self#write_instruction1 PUSH (-1)
+      | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction1 PUSH 0
+      | Struct _ | Array _ | Delegate _ | IFace _ ->
+          self#write_instruction1 PUSH (-1)
       | _ -> compile_error "default return value not implemented for type" decl
 
     (** Emit the code for a function. *)
@@ -3178,8 +7512,28 @@ class jaf_compiler ctx debug_info =
       in
       let prev_function = current_function in
       current_function <- Some func;
+      let prev_enclosing_functions = enclosing_functions in
+      (if func.is_lambda then
+         match self#find_lambda_parents func.name with
+         | parents -> enclosing_functions <- parents);
+      let prev_inline_deleted_dummies = inline_deleted_dummies in
+      let prev_last_condition_deleted_dummies = last_condition_deleted_dummies in
+      let prev_end_switch_deleted_dummies = end_switch_deleted_dummies in
+      let prev_last_use_deleted_vars = v12_last_use_deleted_vars in
+      let prev_block_depth = block_depth in
+      let prev_v12_dummy_slots_initialized =
+        Hashtbl.copy v12_dummy_slots_initialized
+      in
+      inline_deleted_dummies <- [];
+      last_condition_deleted_dummies <- [];
+      end_switch_deleted_dummies <- [];
+      v12_last_use_deleted_vars <- [];
+      Hashtbl.clear v12_dummy_slots_initialized;
+      block_depth <- 0;
       let prev_cflow_stmts = cflow_stmts in
       cflow_stmts <- Stack.create ();
+      let prev_scopes = scopes in
+      scopes <- Stack.create ();
       let prev_labels = labels in
       labels <- Hashtbl.create (module String);
       (* Freeze the parent's CRC: it stops at this nested FUNC (lambda). *)
@@ -3194,8 +7548,66 @@ class jaf_compiler ctx debug_info =
       self#crc_push_word (int_of_data_type func.return_type);
       List.iter (Ain.Function.logical_parameters func) ~f:(fun v ->
           self#crc_push_word (int_of_data_type v.value_type));
+      (match decl.class_index with
+      | Some class_index
+        when Ain.version_gte ctx.ain (12, 0)
+             && (String.equal decl.name "0" || String.equal decl.name "2") ->
+          self#emit_interface_vtable_init class_index
+      | _ -> ());
       self#compile_block (Option.value_exn decl.body);
-      if not (func.is_label || String.equal func.name "NULL") then (
+      let v12 = Ain.version_gte ctx.ain (12, 0) in
+      let emits_v12_accessor_endfunc decl =
+        v12 && Declarations.is_property_stub decl
+      in
+      let rec stmt_has_early_return (s : statement) =
+        match s.node with
+        | Return _ -> true
+        | Compound stmts -> List.exists stmts ~f:stmt_has_early_return
+        | If (_, con, alt) ->
+            stmt_has_early_return con || stmt_has_early_return alt
+        | While (_, body) | DoWhile (_, body) -> stmt_has_early_return body
+        | For (_, _, _, body) | ForEach (_, _, _, _, body) ->
+            stmt_has_early_return body
+        | Switch (_, stmts) -> List.exists stmts ~f:stmt_has_early_return
+        | _ -> false
+      in
+      let body_has_only_trailing_return =
+        match decl.body with
+        | None -> false
+        | Some stmts ->
+            (match List.last stmts with
+             | Some last when (match last.node with Return _ -> true | _ -> false) ->
+                 (* Check that no statement BEFORE the last has a return. *)
+                 let earlier = List.drop_last_exn stmts in
+                 not (List.exists earlier ~f:stmt_has_early_return)
+             | _ -> false)
+      in
+      let skip_default_return =
+        (decl.is_lambda
+         && v12
+         && self#statements_guaranteed_return (Option.value_exn decl.body)
+         && (
+           (* Orig skips the fallthrough default-return for v12 lambdas
+              under two conditions:
+              - IFace-returning (always, even with early returns)
+              - body is a single trailing return (no early returns
+                anywhere). Lambdas with early-return + final-return
+                paths still get the orig fallthrough — observed in
+                [activity::detail::AddUserComponent]'s inline
+                [(string name) => bool { if (...) return false;
+                ...; return ...; }] lambdas. *)
+           (match func.return_type with
+            | IFace _ -> true
+            | _ -> false)
+           || body_has_only_trailing_return))
+        || (emits_v12_accessor_endfunc decl
+           && String.is_suffix decl.name ~suffix:"::get")
+      in
+      if
+        (not func.is_label)
+        && (not (String.equal func.name "NULL"))
+        && not skip_default_return
+      then (
         self#compile_default_return func.return_type
           (ASTDeclaration (Function decl));
         self#write_instruction0 RETURN);
@@ -3206,10 +7618,21 @@ class jaf_compiler ctx debug_info =
          except auto-generated array initializers — the global-init
          function ("0") and the per-class auto-array-initializer ("2")
          both need ENDFUNC so the VM knows where the function body
-         ends. ain v0/v1 does not have ENDFUNC. *)
+         ends. ain v0/v1 does not have ENDFUNC.
+
+         v12: original Rance10 does not emit ENDFUNC after most class
+         methods/constructors. It does always terminate lambda bodies and
+         the synthetic class "2" bodies, and free functions commonly carry
+         ENDFUNC at source-file boundaries. Emitting ENDFUNC for every v12
+         method changes the startup constructor/lambda layout. *)
       (match decl with
       | _ when ctx.version <= 100 -> ()
       | { name = "NULL"; _ } -> ()
+      | { is_lambda = true; _ } when v12 -> self#write_instruction1 ENDFUNC index
+      | { name = "2"; _ } when v12 -> self#write_instruction1 ENDFUNC index
+      | _ when emits_v12_accessor_endfunc decl ->
+          self#write_instruction1 ENDFUNC index
+      | { class_name = None; _ } when v12 -> self#write_instruction1 ENDFUNC index
       | { class_name = None; _ }
       | { name = "0"; _ }
       | { name = "2"; _ }
@@ -3219,8 +7642,488 @@ class jaf_compiler ctx debug_info =
       self#resolve_gotos;
       Ain.write_function ctx.ain func;
       current_function <- prev_function;
+      enclosing_functions <- prev_enclosing_functions;
+      inline_deleted_dummies <- prev_inline_deleted_dummies;
+      last_condition_deleted_dummies <- prev_last_condition_deleted_dummies;
+      end_switch_deleted_dummies <- prev_end_switch_deleted_dummies;
+      v12_last_use_deleted_vars <- prev_last_use_deleted_vars;
+      Hashtbl.clear v12_dummy_slots_initialized;
+      Hashtbl.iteri prev_v12_dummy_slots_initialized ~f:(fun ~key ~data ->
+          Hashtbl.set v12_dummy_slots_initialized ~key ~data);
+      block_depth <- prev_block_depth;
       cflow_stmts <- prev_cflow_stmts;
-      labels <- prev_labels
+      scopes <- prev_scopes;
+      labels <- prev_labels;
+      (* v12 duplicate prototype body emission: Rance10 source contains
+         repeated method/property/event prototypes, and the original
+         compiler keeps separate FUNC rows for those repeats. Declaration
+         analysis allocates the extra slots in [ctx.overloads]; when a
+         real body for the same signature is compiled, emit that body into
+         each duplicate slot instead of allocating speculative duplicates
+         here. *)
+      if v12
+         && Option.is_some decl.body
+         && not (Hashtbl.mem body_dup_emitted (Option.value_exn decl.index))
+      then (
+        let same_signature (other : fundecl) =
+          List.length decl.params = List.length other.params
+          && List.for_all2_exn decl.params other.params ~f:(fun a b ->
+                 jaf_type_equal a.type_spec.ty b.type_spec.ty)
+          && jaf_type_equal decl.return.ty other.return.ty
+        in
+        let source_obj = Ain.get_function_by_index ctx.ain index in
+        let duplicates =
+          Hashtbl.find ctx.overloads (Jaf.mangled_name decl)
+          |> Option.value ~default:[]
+          |> List.filter ~f:(fun dup ->
+                 Option.is_none dup.body
+                 && same_signature dup
+                 &&
+                 match dup.index with
+                 | Some dup_idx ->
+                     dup_idx <> index
+                     && not (Hashtbl.mem body_dup_emitted dup_idx)
+                 | None -> false)
+        in
+        List.iteri duplicates ~f:(fun dup_rank dup ->
+            let dup_idx = Option.value_exn dup.index in
+            Hashtbl.set body_dup_emitted ~key:dup_idx ~data:();
+            let dup_obj = Ain.get_function_by_index ctx.ain dup_idx in
+            Ain.write_function ctx.ain
+              { dup_obj with
+                return_type = source_obj.return_type;
+                nr_args = source_obj.nr_args;
+                vars = source_obj.vars;
+                is_label = source_obj.is_label;
+                is_lambda = source_obj.is_lambda };
+            let prev_dup_rank = v12_current_body_dup_rank in
+            Exn.protect
+              ~f:(fun () ->
+                v12_current_body_dup_rank <- Some (dup_rank + 1);
+                self#compile_function
+                  { decl with index = Some dup_idx; params = decl.params })
+              ~finally:(fun () ->
+                v12_current_body_dup_rank <- prev_dup_rank)));
+      (* v12 interface-backed concrete duplicate emission: some interfaces
+         contain duplicate exact prototypes, while their implementing class
+         only declares one concrete prototype. Original Rance10 still emits
+         one concrete FUNC body per duplicate interface slot (notably
+         CActivityWrap/IActivity). Only synthesize the deficit between the
+         repeated interface signature count and the class's own declaration
+         count; classes that already repeat their prototypes are handled by
+         the ctx.overloads path above. *)
+      if v12
+         && Option.is_some decl.body
+         && not decl.is_lambda
+         && not (String.is_suffix decl.name ~suffix:"::get")
+         && not (String.is_suffix decl.name ~suffix:"::set")
+         && not (String.is_suffix decl.name ~suffix:"::add")
+         && not (String.is_suffix decl.name ~suffix:"::remove")
+         && not (Hashtbl.mem body_dup_emitted (Option.value_exn decl.index))
+      then (
+        let same_signature (other : fundecl) =
+          String.equal decl.name other.name
+          && List.length decl.params = List.length other.params
+          && List.for_all2_exn decl.params other.params ~f:(fun a b ->
+                 jaf_type_equal a.type_spec.ty b.type_spec.ty)
+          && jaf_type_equal decl.return.ty other.return.ty
+        in
+        let interface_signature_count class_name =
+          match Hashtbl.find ctx.structs class_name with
+          | None -> 0
+          | Some jaf_s ->
+              let ain_s = Ain.get_struct_by_index ctx.ain jaf_s.index in
+              List.fold ain_s.interfaces ~init:0
+                ~f:(fun acc (iface : Ain.Struct.interface) ->
+                  let iface_s =
+                    Ain.get_struct_by_index ctx.ain iface.struct_type
+                  in
+                  acc
+                  + (Hashtbl.find ctx.v12_struct_methods iface_s.name
+                    |> Option.value ~default:[]
+                    |> List.count ~f:same_signature))
+        in
+        match decl.class_name with
+        | None -> ()
+        | Some class_name ->
+            let class_count =
+              Hashtbl.find ctx.v12_struct_methods class_name
+              |> Option.value ~default:[]
+              |> List.count ~f:same_signature
+            in
+            let needed =
+              Int.max 0 (interface_signature_count class_name - class_count)
+            in
+            let dup_indices =
+              Hashtbl.find ctx.v12_body_dup_indices
+                (Option.value_exn decl.index)
+              |> Option.value ~default:[]
+            in
+            let missing = needed - List.length dup_indices in
+            let dup_indices =
+              if missing > 0 then
+                dup_indices
+                @ List.init missing ~f:(fun _ ->
+                    (Ain.add_function ~nr_args:(List.length decl.params)
+                       ctx.ain (Jaf.mangled_name decl))
+                      .index)
+              else dup_indices
+            in
+            List.iteri dup_indices ~f:(fun dup_i dup_idx ->
+              let source_obj = Ain.get_function_by_index ctx.ain index in
+              let new_f = Ain.get_function_by_index ctx.ain dup_idx in
+              Hashtbl.set body_dup_emitted ~key:new_f.index ~data:();
+              Ain.write_function ctx.ain
+                { new_f with
+                  return_type = source_obj.return_type;
+                  nr_args = source_obj.nr_args;
+                  vars = source_obj.vars;
+                  is_label = source_obj.is_label;
+                  is_lambda = source_obj.is_lambda };
+              let prev_dup_rank = v12_current_body_dup_rank in
+              Exn.protect
+                ~f:(fun () ->
+                  v12_current_body_dup_rank <- Some (class_count + dup_i);
+                  self#compile_function { decl with index = Some new_f.index })
+                ~finally:(fun () ->
+                  v12_current_body_dup_rank <- prev_dup_rank)
+            ));
+      (* v12 object-return helper duplication: original Rance10 emits
+         repeated concrete FUNC bodies for a small family of ref/iface/array
+         returning helpers even though the decompiled class declaration only
+         contains one prototype. These duplicate rows are byte-identical and
+         appear before later functions, so leaving them out shifts table shape
+         around heavily-used battle/activity helpers. *)
+      let object_return_dup_count () =
+        if
+          (not v12)
+          || Option.is_none decl.body
+          || decl.is_lambda
+          || String.is_suffix decl.name ~suffix:"::get"
+          || String.is_suffix decl.name ~suffix:"::set"
+          || String.is_suffix decl.name ~suffix:"::add"
+          || String.is_suffix decl.name ~suffix:"::remove"
+          || Hashtbl.mem body_dup_emitted (Option.value_exn decl.index)
+        then 0
+        else
+          let is_object_return =
+            match func.return_type with
+            | Ain.Type.Ref _ | Ain.Type.IFace _ | Ain.Type.Array _ -> true
+            | _ -> false
+          in
+          if not is_object_return then 0
+          else
+            let qname = Jaf.mangled_name decl in
+            let one_dup_names =
+              Set.of_list
+                (module String)
+                [
+                  "Activity@GetButton";
+                  "Activity@GetCg";
+                  "Activity@GetCheckBox";
+                  "Activity@GetComboBox";
+                  "Activity@GetForm";
+                  "Activity@GetFromName";
+                  "Activity@GetLabel";
+                  "Activity@GetListBox";
+                  "Activity@GetMLTextBox";
+                  "Activity@GetParts";
+                  "Activity@GetSpinBox";
+                  "Activity@GetTextBox";
+                  "Activity@GetVScrollBar";
+                  "BattleContext@GetPlayer";
+                  "CAS3DStage@GetBrushInstance";
+                  "CAS3DStage@GetGroupInstance";
+                  "CAS3DStage@GetInstance";
+                  "PlayerAttackDamageCalculator@BadConditions";
+                  "QuestMapObjectCollection@Get";
+                  "enquate::detail::CEnqueteAnswerBox@Get";
+                  "enquate::detail::CEnqueteAnswerIcon@GetCheckBox";
+                  "enquate::detail::CEnqueteAnswerIcon@GetIcon";
+                  "enquate::detail::CEnqueteDataManager@Get";
+                  "stageeditor::detail::CSealEngine@GetSelectableInstanceList";
+                  "stageeditor::detail::CSealEngine@GetSelectedInstanceList";
+                  "stageeditor::detail::CStage@GetElement";
+                  "stageeditor::detail::CStage@GetElementFromName";
+                ]
+            in
+            if Set.mem one_dup_names qname then 1
+            else if
+              String.is_prefix qname ~prefix:"KeyValueMap<"
+              &&
+              (String.is_suffix qname ~suffix:"@Get"
+              || String.is_suffix qname ~suffix:"@GetFromIndex")
+            then 2
+            else 0
+      in
+      let object_return_dups = object_return_dup_count () in
+      if object_return_dups > 0 then
+        for _ = 1 to object_return_dups do
+          let mangled = Jaf.mangled_name decl in
+          let source_obj = Ain.get_function_by_index ctx.ain index in
+          let new_f = Ain.add_function ctx.ain mangled in
+          Hashtbl.set body_dup_emitted ~key:new_f.index ~data:();
+          Ain.write_function ctx.ain
+            { new_f with
+              return_type = source_obj.return_type;
+              nr_args = source_obj.nr_args;
+              vars = source_obj.vars;
+              is_label = source_obj.is_label;
+              is_lambda = source_obj.is_lambda };
+          let readonly_lambda_name name =
+            match String.substr_index name ~pattern:")(" with
+            | Some pos ->
+                String.prefix name (pos + 1)
+                ^ " readonly"
+                ^ String.drop_prefix name (pos + 1)
+            | None -> name ^ " readonly"
+          in
+          let readonly_hll_overload lib_no fun_no =
+            let lib = Ain.get_library_by_index ctx.ain lib_no in
+            if
+              fun_no >= 0
+              && fun_no < Array.length lib.functions
+              && String.equal lib.name "Array"
+            then
+              let base = lib.functions.(fun_no) in
+              Array.find_mapi lib.functions ~f:(fun i f ->
+                  if
+                    i > fun_no
+                    && String.equal f.name base.name
+                    && Int.equal (List.length f.arguments)
+                         (List.length base.arguments)
+                  then Some i
+                  else None)
+              |> Option.value ~default:fun_no
+            else fun_no
+          in
+          let clone_variable (v : Jaf.variable) =
+            {
+              v with
+              type_spec = { v.type_spec with ty = v.type_spec.ty };
+              array_dim = [];
+              initval = None;
+            }
+          in
+          let rec clone_expr (e : Jaf.expression) =
+            { e with node = clone_expr_node e.node }
+          and clone_expr_opt = function
+            | None -> None
+            | Some e -> Some (clone_expr e)
+          and clone_expr_node = function
+            | ConstInt _ as n -> n
+            | ConstFloat _ as n -> n
+            | ConstChar _ as n -> n
+            | ConstString _ as n -> n
+            | Ident _ as n -> n
+            | FuncAddr _ as n -> n
+            | MemberAddr _ as n -> n
+            | This -> This
+            | Null -> Null
+            | New ts -> New { ts with ty = ts.ty }
+            | Unary (op, e) -> Unary (op, clone_expr e)
+            | Binary (op, a, b) -> Binary (op, clone_expr a, clone_expr b)
+            | Assign (op, a, b) -> Assign (op, clone_expr a, clone_expr b)
+            | Seq (a, b) -> Seq (clone_expr a, clone_expr b)
+            | Ternary (a, b, c) ->
+                Ternary (clone_expr a, clone_expr b, clone_expr c)
+            | OptionalMember (e, name, mt) ->
+                OptionalMember (clone_expr e, name, mt)
+            | NullCoalesce (a, b) -> NullCoalesce (clone_expr a, clone_expr b)
+            | Cast (ty, e) -> Cast (ty, clone_expr e)
+            | Subscript (a, b) -> Subscript (clone_expr a, clone_expr b)
+            | Member (e, name, mt) -> Member (clone_expr e, name, mt)
+            | Call (e, args, HLLCall (lib_no, fun_no)) ->
+                Call
+                  ( clone_expr e,
+                    List.map args ~f:clone_expr_opt,
+                    HLLCall (lib_no, readonly_hll_overload lib_no fun_no) )
+            | Call (e, args, ct) ->
+                Call (clone_expr e, List.map args ~f:clone_expr_opt, ct)
+            | NewCall (ts, args) ->
+                NewCall ({ ts with ty = ts.ty }, List.map args ~f:clone_expr_opt)
+            | ArrayLiteral elems -> ArrayLiteral (List.map elems ~f:clone_expr)
+            | DummyRef (i, e) -> DummyRef (i, clone_expr e)
+            | RvalueRef e -> RvalueRef (clone_expr e)
+            | Lambda f -> Lambda (clone_lambda f)
+          and clone_stmt (s : Jaf.statement) =
+            { s with node = clone_stmt_node s.node; delete_vars = s.delete_vars }
+          and clone_stmt_node = function
+            | EmptyStatement -> EmptyStatement
+            | Declarations ds ->
+                Declarations
+                  {
+                    ds with
+                    typespec = { ds.typespec with ty = ds.typespec.ty };
+                    vars = List.map ds.vars ~f:clone_variable;
+                  }
+            | Expression e -> Expression (clone_expr e)
+            | Compound ss -> Compound (List.map ss ~f:clone_stmt)
+            | Label _ as n -> n
+            | If (c, t, f) -> If (clone_expr c, clone_stmt t, clone_stmt f)
+            | While (c, b) -> While (clone_expr c, clone_stmt b)
+            | DoWhile (c, b) -> DoWhile (clone_expr c, clone_stmt b)
+            | For (a, b, c, d) ->
+                For
+                  ( clone_stmt a,
+                    Option.map b ~f:clone_expr,
+                    Option.map c ~f:clone_expr,
+                    clone_stmt d )
+            | ForEach (rev, name, idx, e, b) ->
+                ForEach (rev, name, idx, clone_expr e, clone_stmt b)
+            | Goto _ as n -> n
+            | Continue -> Continue
+            | Break -> Break
+            | Switch (e, ss) -> Switch (clone_expr e, List.map ss ~f:clone_stmt)
+            | Case e -> Case (clone_expr e)
+            | Default -> Default
+            | Return e -> Return (Option.map e ~f:clone_expr)
+            | Jump _ as n -> n
+            | Jumps e -> Jumps (clone_expr e)
+            | Message _ as n -> n
+            | RefAssign (a, b) -> RefAssign (clone_expr a, clone_expr b)
+            | ObjSwap (a, b) -> ObjSwap (clone_expr a, clone_expr b)
+          and clone_lambda (f : Jaf.fundecl) =
+            let old_idx = Option.value_exn f.index in
+            let old_obj = Ain.get_function_by_index ctx.ain old_idx in
+            let cloned =
+              {
+                f with
+                name = readonly_lambda_name f.name;
+                params = List.map f.params ~f:clone_variable;
+                body = Option.map f.body ~f:(List.map ~f:clone_stmt);
+                index = None;
+              }
+            in
+            let new_idx =
+              (Ain.add_function ~nr_args:(List.length cloned.params) ctx.ain
+                 (Jaf.mangled_name cloned))
+                .index
+            in
+            let new_obj = Ain.get_function_by_index ctx.ain new_idx in
+            Ain.write_function ctx.ain
+              {
+                new_obj with
+                return_type = old_obj.return_type;
+                nr_args = old_obj.nr_args;
+                vars = old_obj.vars;
+                is_label = old_obj.is_label;
+                is_lambda = old_obj.is_lambda;
+              };
+            { cloned with index = Some new_idx }
+          in
+          let dup_decl =
+            {
+              decl with
+              index = Some new_f.index;
+              params = List.map decl.params ~f:clone_variable;
+              body = Option.map decl.body ~f:(List.map ~f:clone_stmt);
+            }
+          in
+          self#compile_function dup_decl
+        done;
+      (* v12 property getter duplication: original Rance10 emits declared
+         property getters twice (byte-identical bodies, separate
+         FUNC indices). After the first emission, allocate a second
+         slot and recurse — only when this is a class-method property
+         getter found in the struct property table. *)
+      let is_auto_property_getter (decl : fundecl) =
+        let qname = Jaf.mangled_name decl in
+        let skip_getter_dup =
+          Set.mem
+            (Set.of_list
+               (module String)
+               [
+                 "ActivityLabel@Text::get";
+                 "BattleLog@IndentText::get";
+                 "BattleLog@Text::get";
+                 "BattleLogCollection@Logs::get";
+                 "BattleLogLine@LineText::get";
+                 "LeaderCard@Skills::get";
+                 "MenuContext@IsCheck::get";
+                 "MenuContext@IsShow::get";
+                 "Party@Leaders::get";
+                 "PlayerAttackDamageCalculator@CardAtk::get";
+                 "PlayerAttackDamageCalculator@SourceAtk::get";
+                 "PlayerCard@Skills::get";
+                 "PlayerCardCollection@Cards::get";
+                 "PlayerCardSkill@Instance::get";
+                 "Quest@QuestMap::get";
+                 "SceneCharacterSetting@IsMan::get";
+                 "SceneCharacterSetting@Type::get";
+               ])
+            qname
+        in
+        let declared_property =
+          match decl.class_name with
+          | Some class_name when String.is_suffix decl.name ~suffix:"::get" -> (
+              let prop_name =
+                String.drop_suffix decl.name (String.length "::get")
+              in
+              match Hashtbl.find ctx.structs class_name with
+              | Some s -> Hashtbl.mem s.properties prop_name
+              | None -> false)
+          | _ -> false
+        in
+        v12
+        && declared_property
+        && not skip_getter_dup
+        && String.is_suffix decl.name ~suffix:"::get"
+        && (* Single-statement Return body (after type analysis the
+              expression may be Cast/Member/etc., so don't restrict
+              shape — just count stmts). User-bodied getters typically
+              have multiple statements. *)
+        (match decl.body with
+         | Some _ -> true
+         | _ -> false)
+      in
+      (* The dup_decl recursion needs to know it's already a dup so it
+         doesn't dup itself. Mark the NEW index in the hashtable BEFORE
+         the recursive call so the recursive [is_auto_property_getter]
+         check skips it (via the second condition). *)
+      if is_auto_property_getter decl
+         && not (Hashtbl.mem body_dup_emitted (Option.value_exn decl.index))
+      then (
+        let mangled = Jaf.mangled_name decl in
+        let dup_indices =
+          Hashtbl.find ctx.v12_property_getter_dup_indices
+            (Option.value_exn decl.index)
+          |> Option.value ~default:[]
+        in
+        let dup_indices =
+          if List.is_empty dup_indices then
+            [ (Ain.add_function ctx.ain mangled).index ]
+          else dup_indices
+        in
+        List.iter dup_indices ~f:(fun dup_idx ->
+            Hashtbl.set body_dup_emitted ~key:dup_idx ~data:();
+            let dup_f = Ain.get_function_by_index ctx.ain dup_idx in
+            (* Copy vars/params/return_type from the original function so
+               compile_lvalue can find them when re-emitting the body. *)
+            Ain.write_function ctx.ain
+              { dup_f with
+                return_type = func.return_type;
+                nr_args = func.nr_args;
+                vars = func.vars;
+                is_label = func.is_label };
+            let dup_decl = { decl with index = Some dup_idx } in
+            self#compile_function dup_decl));
+      (* v12 lambda drain: after the outer (non-lambda) function's
+         ENDFUNC is written, emit any lambdas queued during its body
+         compilation as separate top-level FUNC entries. Each
+         drained lambda may queue further nested lambdas; loop until
+         the queue is empty. Lambdas themselves don't drain — only
+         outer functions do, so we naturally process all nesting in
+         the outer's drain phase. *)
+      if not decl.is_lambda && Ain.version_gte ctx.ain (12, 0) then
+        let rec drain () =
+          match Queue.dequeue v12_lambda_queue with
+          | Some f ->
+              self#compile_function f;
+              drain ()
+          | None -> ()
+        in
+        drain ()
 
     (** Emit the code for an ain v1 scenario label. *)
     method compile_scenario_label (decl : fundecl) =
@@ -3241,6 +8144,14 @@ class jaf_compiler ctx debug_info =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
       let compile_decl = function
+        | Jaf.Function f
+          when Ain.version_gte ctx.ain (12, 0)
+               && f.is_lambda
+               &&
+               (let idx = Option.value_exn f.index in
+                Hashtbl.mem pre_emitted_lambdas idx
+                || Hashtbl.mem v12_assignment_lambdas idx) ->
+            ()
         | Jaf.Function f ->
             if f.is_label && Ain.version ctx.ain = 1 then
               self#compile_scenario_label f
@@ -3262,9 +8173,172 @@ class jaf_compiler ctx debug_info =
                     "PropertyDecl/EventDecl not expanded before codegen" None
             in
             List.iter d.decls ~f:compile_struct_decl
-        | Enum e ->
-            (* TODO: built-in enum methods *)
-            compile_error "Enums not implemented" (ASTDeclaration (Enum e))
+        | Enum e when Ain.version_gte ctx.ain (12, 0) ->
+            (match e.name with
+            | None -> ()
+            | Some enum_name ->
+                let rec eval_const_int (expr : expression) =
+                  match expr.node with
+                  | ConstInt i -> Some i
+                  | Unary (UMinus, inner) ->
+                      Option.map (eval_const_int inner) ~f:(fun i -> -i)
+                  | Unary (UPlus, inner) -> eval_const_int inner
+                  | Unary (BitNot, inner) ->
+                      Option.map (eval_const_int inner) ~f:lnot
+                  | Binary (Plus, a, b) ->
+                      Option.both (eval_const_int a) (eval_const_int b)
+                      |> Option.map ~f:(fun (a, b) -> a + b)
+                  | Binary (Minus, a, b) ->
+                      Option.both (eval_const_int a) (eval_const_int b)
+                      |> Option.map ~f:(fun (a, b) -> a - b)
+                  | _ -> None
+                in
+                let next = ref 0 in
+                let enum_items =
+                  List.map e.values ~f:(fun (name, opt_expr) ->
+                      let value =
+                        match opt_expr with
+                        | Some expr -> Option.value_exn (eval_const_int expr)
+                        | None -> !next
+                      in
+                      next := value + 1;
+                      (name, value))
+                in
+                let enum_type : jaf_type =
+                  Enum (enum_name, Ain.add_enum ctx.ain enum_name)
+                in
+                let emit_function ?vars (fdecl : fundecl) emit_body =
+                  match fdecl.index with
+                  | None -> ()
+                  | Some index ->
+                      let base = Ain.get_function_by_index ctx.ain index in
+                      if base.address >= 0 then ()
+                      else
+                        let vars = Option.value vars ~default:base.vars in
+                        let func =
+                          { base with address = current_address + 6; vars }
+                        in
+                        let prev_function = current_function in
+                        current_function <- Some func;
+                        Ain.write_function ctx.ain func;
+                        self#write_instruction1 FUNC index;
+                        emit_body ();
+                        self#write_instruction1 ENDFUNC index;
+                        current_function <- prev_function
+                in
+                let local_ref slot =
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH slot;
+                  self#write_instruction0 REF
+                in
+                let emit_int_return n =
+                  self#write_instruction1 PUSH n;
+                  self#write_instruction0 RETURN
+                in
+                let emit_option_enum_return n =
+                  self#write_instruction1 PUSH n;
+                  self#write_instruction1 PUSH 0;
+                  self#write_instruction0 RETURN
+                in
+                let emit_option_enum_null_return () =
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 RETURN
+                in
+                let emit_string_return s =
+                  self#write_instruction1 S_PUSH (Ain.add_string ctx.ain s);
+                  self#write_instruction0 RETURN
+                in
+                let emit_chain ~string_input ~on_match ~on_default =
+                  local_ref 0;
+                  List.iter enum_items ~f:(fun (name, value) ->
+                      self#write_instruction0 DUP;
+                      if string_input then (
+                        self#write_instruction0 A_REF;
+                        self#write_instruction1 S_PUSH
+                          (Ain.add_string ctx.ain name);
+                        self#write_instruction0 S_EQUALE)
+                      else (
+                        self#write_instruction1 PUSH value;
+                        self#write_instruction0 EQUALE);
+                      let ifz_addr = current_address + 2 in
+                      self#write_instruction1 IFZ 0;
+                      self#write_instruction0 POP;
+                      on_match name value;
+                      self#write_address_at ifz_addr current_address);
+                  self#write_instruction0 POP;
+                  on_default ()
+                in
+                let emit_get_list fdecl =
+                  let result_var =
+                    Ain.Variable.make ~index:0 "result"
+                      (jaf_to_ain_type ~ctx fdecl.return.ty)
+                  in
+                  emit_function ~vars:[ result_var ] fdecl (fun () ->
+                      local_ref 0;
+                      self#write_instruction0 DUP;
+                      self#write_instruction1 PUSH (List.length enum_items);
+                      self#write_instruction1 PUSH (-1);
+                      self#write_instruction1 PUSH (-1);
+                      self#write_instruction1 PUSH (-1);
+                      let elem_code =
+                        Ain.Type.int_of_data_type (Ain.version ctx.ain)
+                          (jaf_to_ain_type enum_type)
+                      in
+                      self#compile_CALLHLL "Array" "Alloc" elem_code
+                        (ASTDeclaration (Enum e));
+                      List.iteri enum_items ~f:(fun i (_, value) ->
+                          self#write_instruction0 DUP;
+                          self#write_instruction1 PUSH i;
+                          self#write_instruction1 PUSH value;
+                          self#write_instruction0 ASSIGN;
+                          self#write_instruction0 POP);
+                      self#write_instruction0 DUP;
+                      self#write_instruction0 SP_INC;
+                      self#write_instruction0 RETURN)
+                in
+                Option.iter
+                  (Hashtbl.find ctx.functions (enum_name ^ "::GetList"))
+                  ~f:emit_get_list;
+                Option.iter
+                  (Hashtbl.find ctx.functions (enum_name ^ "::IsExist"))
+                  ~f:(fun fdecl ->
+                    emit_function fdecl (fun () ->
+                        emit_chain ~string_input:false
+                          ~on_match:(fun _ _ -> emit_int_return 1)
+                          ~on_default:(fun () -> emit_int_return 0)));
+                Option.iter
+                  (Hashtbl.find ctx.functions (enum_name ^ "::Parse"))
+                  ~f:(fun fdecl ->
+                    emit_function fdecl (fun () ->
+                        emit_chain ~string_input:true
+                          ~on_match:(fun _ value ->
+                            emit_option_enum_return value)
+                          ~on_default:emit_option_enum_null_return));
+                Hashtbl.find ctx.overloads (enum_name ^ "::Parse")
+                |> Option.value ~default:[]
+                |> List.iter ~f:(fun fdecl ->
+                       match fdecl.params with
+                       | [ { type_spec = { ty = Int; _ }; _ } ] ->
+                           emit_function fdecl (fun () ->
+                               emit_chain ~string_input:false
+                                 ~on_match:(fun _ value ->
+                                   emit_option_enum_return value)
+                                 ~on_default:emit_option_enum_null_return)
+                       | _ -> ());
+                Option.iter
+                  (Hashtbl.find ctx.functions (enum_name ^ "@String"))
+                  ~f:(fun fdecl ->
+                    emit_function fdecl (fun () ->
+                        emit_chain ~string_input:false
+                          ~on_match:(fun name _ -> emit_string_return name)
+                          ~on_default:(fun () -> emit_string_return ""))))
+        | Enum _ ->
+            (* v12 enum codegen TODO: the auto-generated methods
+               (Numof/GetList/IsExist/Parse/String) need real bodies.
+               For now skip — the synthetic stubs we registered earlier
+               will get default empty bodies via emit_undefined_function_stubs. *)
+            ()
       in
       List.iter decls ~f:compile_decl;
       (if Ain.version_gte ctx.ain (1, 0) then

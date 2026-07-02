@@ -34,6 +34,37 @@ type variable = {
    brackets at use sites. Restricted to delegate-typed members so
    other [<…>]-named lowered constructs (e.g. property backing slots)
    aren't misidentified as events. *)
+(* jaf keywords that would parse-clash if used as a variable name.
+   v12 source occasionally uses `char` (and possibly others) as
+   identifiers — rename to `_keyword` at the print site so the
+   decompiled source round-trips through the parser. *)
+let jaf_keywords =
+  Set.of_list (module String)
+    [ "void"; "char"; "int"; "lint"; "float"; "bool"; "string";
+      "hll_param"; "hll_func"; "hll_func2"; "hll_delegate";
+      "if"; "else"; "while"; "do"; "for"; "foreach"; "foreach_r";
+      "switch"; "case"; "default"; "goto"; "continue"; "break";
+      "return"; "jump"; "jumps"; "assert";
+      "NULL"; "this"; "new"; "const"; "ref"; "array"; "wrap";
+      "functype"; "delegate"; "struct"; "class"; "private";
+      "public"; "enum"; "event"; "implements"; "interface";
+      "globalgroup"; "unknown_functype"; "unknown_delegate" ]
+
+(* v12 lambda parameters use positional placeholder names like `<0>`,
+   `<1>`, etc. These aren't parseable as-is (the angle brackets clash
+   with comparison operators). Translate to `_N` form for both the
+   parameter declaration and any reference. Other angle-bracketed
+   names (events, property backing fields, vtable) are handled by
+   dedicated suppression / rewriting elsewhere. Also rename
+   keyword-named variables to a `_`-prefixed safe form. *)
+let safe_var_name (name : string) =
+  let n = String.length name in
+  if n >= 3 && Char.equal name.[0] '<' && Char.equal name.[n - 1] '>' then
+    let inner = String.sub name ~pos:1 ~len:(n - 2) in
+    if String.for_all inner ~f:Char.is_digit then "_" ^ inner else name
+  else if Set.mem jaf_keywords name then "_" ^ name
+  else name
+
 let event_name_of_delegate_member (v : Ain.Variable.t) =
   let n = String.length v.name in
   let is_angle_mangled =
@@ -351,7 +382,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
               ~default:var.name
           in
           bprintf out "this.%s" name
-      | Var (_, var) -> print_string out var.name
+      | Var (_, var) -> print_string out (safe_var_name var.name)
       | Elem (array, index) ->
           bprintf out "%a[%a]"
             (self#pr_expr (prec_value PREC_DOT))
@@ -422,7 +453,14 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | Page StructPage -> print_string out "this"
       | Null -> print_string out "NULL"
       | Void -> print_string out "<void>" (* FIXME *)
-      | Option e -> bprintf out "%a?" (self#pr_expr (prec_value PREC_DOT)) e
+      | Option e ->
+          (* v12: nested `Option (Option e)` arises from
+             [push_call_result] wrapping a call result that's already
+             optional (e.g. `obj?.method()` returning an optional).
+             Print as a single `?` — the optional shape is idempotent
+             and `e??` would lex as null-coalesce. *)
+          let rec unwrap = function Option inner -> unwrap inner | x -> x in
+          bprintf out "%a?" (self#pr_expr (prec_value PREC_DOT)) (unwrap e)
       | UnaryOp (FTOI, expr) -> bprintf out "int(%a)" (self#pr_expr 0) expr
       | UnaryOp (ITOF, expr) -> bprintf out "float(%a)" (self#pr_expr 0) expr
       | UnaryOp (ITOLI, expr) -> bprintf out "lint(%a)" (self#pr_expr 0) expr
@@ -552,7 +590,19 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
 
     method private pr_callable out =
       function
-      | Function func -> print_string out func.name
+      | Function func ->
+          (* v11+ stores compiler-generated functions like enum
+             stringifiers (`Enum@String`) and class statics with `@`
+             as the receiver separator in the strtab. `@` isn't valid
+             in source qualified names — surface the call as
+             `Receiver::name`. The compiler's name-resolution does
+             the inverse on lookup (see Declarations). *)
+          let name =
+            match String.rsplit2 func.name ~on:'@' with
+            | Some (left, right) -> left ^ "::" ^ right
+            | None -> func.name
+          in
+          print_string out name
       | FuncPtr (_, e) -> self#pr_expr (prec_value PREC_DOT) out e
       | Delegate (_, e) -> self#pr_expr (prec_value PREC_DOT) out e
       | SysCall n -> print_string out syscalls.(n).name
@@ -636,7 +686,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       bprintf out "%a" self#pr_type arg.type_
 
     method private pr_vardecl out (arg : Ain.Variable.t) =
-      bprintf out "%a %s" self#pr_type arg.type_ arg.name
+      bprintf out "%a %s" self#pr_type arg.type_ (safe_var_name arg.name)
 
     method print_function ?(as_lambda = false) ?(skip_signature = false)
         (func : function_t) =
@@ -917,13 +967,40 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
        shape [T Name { get; set; }]. Read-only properties omit [set;];
        write-only ones omit [get;]. For non-auto properties the bodies
        are emitted as a top-level [T Class::Name { get { body } set { body } }]
-       block via [print_property_def]. *)
-    method print_property_prototype (p : property_def) =
+       block via [print_property_def].
+
+       [?initval] is the value the [@0] ctor assigns to the [<Name>]
+       backing field. Most expressions ([New _], [Call _], etc.) flow
+       through the field's normal initializer path and compile fine.
+       The exception is initializers that embed an inner lambda
+       (encoded as [BoundMethod (_, { kind = Lambda; _ })]): the
+       auto-property init lowering can't yet register the lambda's
+       function-table slot, so the [type_define_visitor#visit_fundecl]
+       hits [Option.value_exn None] on [f.index]. Until that lands,
+       lambda-bearing initializers fall back to a [/* TODO: = expr; */]
+       comment that keeps the deferred value visible in source. *)
+    method print_property_prototype ?initval (p : property_def) =
       self#print_indent;
       bprintf out "%a %s {" self#pr_type p.prop_type p.prop_name;
       Option.iter p.prop_get ~f:(fun _ -> print_string out " get;");
       Option.iter p.prop_set ~f:(fun _ -> print_string out " set;");
-      self#println " }"
+      print_string out " }";
+      let initval_has_lambda e =
+        let flag = ref false in
+        Ast.walk_expr
+          ~expr_cb:(fun (e : Ast.expr) ->
+            match e with
+            | Ast.BoundMethod (_, { kind = Lambda; _ }) -> flag := true
+            | _ -> ())
+          e;
+        !flag
+      in
+      (match initval with
+      | Some e when not (initval_has_lambda e) ->
+          bprintf out " = %a;" (self#pr_expr 0) e
+      | Some e -> bprintf out " /* TODO: = %a; */" (self#pr_expr 0) e
+      | None -> ());
+      self#print_newline
 
     (* Top-level implementation of a non-auto property, emitted in the
        per-class .jaf where the [::get] / [::set] definitions lived.
@@ -975,12 +1052,30 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
             Hash_set.add s ("<" ^ p.prop_name ^ ">"));
         s
       in
+      let property_by_backing_field =
+        let h = Hashtbl.create (module String) in
+        List.iter struc.properties ~f:(fun (p : property_def) ->
+            Hashtbl.set h ~key:("<" ^ p.prop_name ^ ">") ~data:p);
+        h
+      in
+      let printed_properties = Hash_set.create (module String) in
       self#with_indent (fun () ->
           Stack.push current_function (lambda_context struc.initval_lambdas);
           List.iter struc.members ~f:(fun v ->
               match v.v.type_ with
               | Void -> ()
-              | _ when Hash_set.mem property_backing_field_names v.v.name -> ()
+              | _ when Hash_set.mem property_backing_field_names v.v.name -> (
+                  match Hashtbl.find property_by_backing_field v.v.name with
+                  | None -> ()
+                  | Some p ->
+                      Hash_set.add printed_properties p.prop_name;
+                      self#print_property_prototype ?initval:v.initval p)
+              (* Suppress the synthetic [<vtable>] member emitted by v11+
+                 implements-classes. The vtable slot is compiler-managed
+                 (populated by populate_vtables from [Class@method]
+                 functions); the source form `array@int <vtable>;` is
+                 unparseable and not needed for round-trip. *)
+              | _ when String.equal v.v.name "<vtable>" -> ()
               | _ ->
                   self#print_indent;
                   (match event_name_of_delegate_member v.v with
@@ -1002,7 +1097,8 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           List.iter struc.events ~f:(fun ev ->
               self#print_event_prototype ev);
           List.iter struc.properties ~f:(fun p ->
-              self#print_property_prototype p);
+              if not (Hash_set.mem printed_properties p.prop_name) then
+                self#print_property_prototype p);
           if
             (not (List.is_empty struc.events && List.is_empty struc.properties))
             && not (List.is_empty struc.methods)
@@ -1043,12 +1139,18 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       in
       let print_group =
         List.iter ~f:(fun (v : variable) ->
-            self#print_indent;
-            self#pr_vardecl out v.v;
-            pr_array_dims out v.dims;
-            Option.iter v.initval ~f:(fun e ->
-                bprintf out " = %a" (self#pr_expr 0) e);
-            self#println ";")
+            (* Suppress synthetic angle-bracketed globals like `<void>`
+               that v12 emits as compiler-managed placeholder slots —
+               the form is unparseable and the slot is reconstructed
+               by the compiler. *)
+            if String.is_prefix v.v.name ~prefix:"<" then ()
+            else (
+              self#print_indent;
+              self#pr_vardecl out v.v;
+              pr_array_dims out v.dims;
+              Option.iter v.initval ~f:(fun e ->
+                  bprintf out " = %a" (self#pr_expr 0) e);
+              self#println ";"))
       in
       Stack.push current_function (lambda_context lambdas);
       List.iter groups ~f:(fun group ->
