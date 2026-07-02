@@ -4348,24 +4348,99 @@ class jaf_compiler ctx debug_info =
               | Some { value_type; _ } -> Some value_type
               | None -> None
             in
-            (* v12 [obj.RefStructProp = new T()] / [= NULL]: orig
-               emits a plain [CALLMETHOD] (no [A_REF; DUP_X2; ...;
-               DELETE] idiom). The idiom's [A_REF] on a fresh NEW
-               struct page corrupts the refcount the setter claims
-               via [SP_INC]; on a [-1] NULL page it trips [PAGE_COPY].
-               For other rhs shapes (e.g. [obj.X = other.Y] where Y is
-               a ref-getter), the idiom is needed. *)
-            let rhs_skips_prop_setter =
+            (* v12 struct-property setters: whether the call uses the
+               assignment-bookkeeping idiom ([A_REF; DUP_X2; CALLMETHOD;
+               DELETE]) is decided by the property's BACKING STORAGE,
+               not by the rhs shape:
+
+               - VALUE-backed ([CASSize <GridSize>;]): the setter
+                 SR_ASSIGN-copies the argument into the inline member.
+                 The caller still owns the arg page, so orig increfs it
+                 across the call and DELETEs it after — even when the
+                 rhs is a fresh [new T(...)].
+               - REF-backed ([ref T <LayoutBox>;]): the setter claims
+                 the reference itself (SP_INC inside). The caller hands
+                 over its page-ref with a plain [CALLMETHOD]; an extra
+                 A_REF here would leak.
+
+               Backing kinds are readable from our own struct table —
+               declarations.ml's expand_property_decl collapses
+               value-storable [ref T] properties to a value-typed
+               [<Name>] member (the 595ffb9 rule), matching the
+               original ain's member tables (verified: original
+               Rance10 has [CASSize <GridSize>] vs
+               [ref CEnqueteLayoutBox <LayoutBox>], and the idiom
+               follows exactly that split across the 99+15 divergent
+               setter sites, 2026-07-02).
+
+               [= NULL] rhs stays a plain call regardless: A_REF on the
+               [-1] NULL sentinel trips [PAGE_COPY]. Properties with no
+               [<Name>] backing member (fully user-bodied accessors)
+               default to the ref-backed plain call. *)
+            let rhs_is_null =
               match args with
               | [ Some { node = Null; _ } ] -> true
-              | [ Some { node = New _ | NewCall _; _ } ] -> true
-              | [ Some { node = DummyRef (_, { node = New _ | NewCall _; _ }); _ } ] -> true
               | _ -> false
+            in
+            let rhs_is_new =
+              match args with
+              | [ Some { node = New _ | NewCall _; _ } ] -> true
+              | [ Some
+                    { node = DummyRef (_, { node = New _ | NewCall _; _ }); _ }
+                ] ->
+                  true
+              | _ -> false
+            in
+            (* Backing storage of the callee's property.
+               [`Value]: value-typed [<Prop>] member — the setter
+               copies. [`Ref]: ref-typed [<Prop>] member — the setter
+               claims the reference. [`Elided]: no [<Prop>] member at
+               all (every accessor is user-bodied); these behave like
+               value properties at call sites (e.g.
+               CPartsTimeLineItem@HeaderSize).
+               [f.name] is the class-qualified callee
+               ("ns::Class@Prop::set"); [mname] is only the short
+               member name. *)
+            let prop_backing_kind =
+              match String.chop_suffix f.name ~suffix:"::set" with
+              | None -> `Elided
+              | Some qualified -> (
+                  match String.rsplit2 qualified ~on:'@' with
+                  | None -> `Elided
+                  | Some (class_name, prop) -> (
+                      match Ain.get_struct ctx.ain class_name with
+                      | None -> `Elided
+                      | Some s -> (
+                          let backing = "<" ^ prop ^ ">" in
+                          match
+                            List.find s.members
+                              ~f:(fun (m : Ain.Variable.t) ->
+                                String.equal m.name backing)
+                          with
+                          | None -> `Elided
+                          | Some m -> (
+                              match m.value_type with
+                              | Ain.Type.Ref _ -> `Ref
+                              | _ -> `Value))))
             in
             match param_ty with
             | Some (IFace _ | Wrap _) -> false
             | Some (Ref (Struct _)) when Ain.version_gte ctx.ain (12, 0) ->
-                not rhs_skips_prop_setter
+                (* NULL rhs: always a plain call (A_REF on the -1
+                   sentinel trips PAGE_COPY).
+                   Value/elided-backed property: idiom, even for a
+                   fresh [new T(...)] — the setter copies, the caller
+                   still owns and releases the arg page.
+                   Ref-backed property: the setter claims the ref.
+                   A fresh NEW hands over its only ref with a plain
+                   call; a borrowed rhs (getter result, member read)
+                   needs the idiom's A_REF so the setter's claim
+                   doesn't steal the previous owner's ref. *)
+                if rhs_is_null then false
+                else (
+                  match prop_backing_kind with
+                  | `Value | `Elided -> true
+                  | `Ref -> not rhs_is_new)
             | Some (Ref _) -> false
             | _ -> true
           in
