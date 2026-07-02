@@ -36,7 +36,7 @@ type 'a basic_block = {
   end_addr : int;
   labels : Ast.label loc list;
   code : 'a;
-  mutable nr_jump_srcs : int;
+  is_jump_target : bool;
 }
 [@@deriving show { with_path = false }]
 

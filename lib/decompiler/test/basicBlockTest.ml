@@ -80,7 +80,7 @@ let%expect_test "return 1 + 2;" =
         [{ txt = (Return (Some (BinaryOp (ADD, (Number 1l), (Number 2l)))));
            addr = 6; end_addr = 22 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -105,7 +105,7 @@ let%expect_test "return 3 && 4;" =
            (Return (Some (BinaryOp (PSEUDO_LOGAND, (Number 3l), (Number 4l)))));
            addr = 6; end_addr = 50 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -130,7 +130,7 @@ let%expect_test "return 3 || 4;" =
            (Return (Some (BinaryOp (PSEUDO_LOGOR, (Number 3l), (Number 4l)))));
            addr = 6; end_addr = 50 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -170,7 +170,7 @@ let%expect_test "return (2 && 3) || (4 && 5);" =
                        (BinaryOp (PSEUDO_LOGAND, (Number 4l), (Number 5l)))))));
            addr = 6; end_addr = 122 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -197,7 +197,7 @@ let%expect_test "return 2; return 3 || 4;" =
            (Return (Some (BinaryOp (PSEUDO_LOGOR, (Number 3l), (Number 4l)))));
            addr = 14; end_addr = 58 };
           { txt = (Return (Some (Number 2l))); addr = 6; end_addr = 14 }]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -226,7 +226,7 @@ let%expect_test "return 1 + (2 && 3);" =
                        (BinaryOp (PSEUDO_LOGAND, (Number 2l), (Number 3l)))))));
            addr = 6; end_addr = 58 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -255,7 +255,7 @@ let%expect_test "return 1 + (2 || 3);" =
                        (BinaryOp (PSEUDO_LOGOR, (Number 2l), (Number 3l)))))));
            addr = 6; end_addr = 58 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -278,7 +278,7 @@ let%expect_test "return 1 ? 2 : 3;" =
            (Return (Some (TernaryOp ((Number 1l), (Number 2l), (Number 3l)))));
            addr = 6; end_addr = 38 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -307,7 +307,7 @@ let%expect_test "return 1 ? 2 : 3 ? 4 : 5;" =
                        (TernaryOp ((Number 3l), (Number 4l), (Number 5l)))))));
            addr = 6; end_addr = 62 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -340,7 +340,7 @@ let%expect_test "return 1 + (2 ? 3 : 4 ? 5 : 6);" =
                        ))));
            addr = 6; end_addr = 70 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -391,7 +391,7 @@ let%expect_test "return var1 ?? var2;" =
                        ))));
            addr = 6; end_addr = 42 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -437,7 +437,7 @@ let%expect_test "var?.void_method();" =
                   [])));
             addr = 14; end_addr = 42 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]
 
@@ -501,6 +501,6 @@ let%expect_test "return var?.int_method() ?? 42;" =
                        (Number 42l)))));
            addr = 28; end_addr = 106 }
           ]);
-       nr_jump_srcs = 0 }
+       is_jump_target = false }
       ]
     |}]

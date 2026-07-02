@@ -37,7 +37,7 @@ type 'a basic_block = {
   end_addr : int;
   labels : label loc list;
   code : 'a;
-  mutable nr_jump_srcs : int;
+  is_jump_target : bool;
 }
 [@@deriving show { with_path = false }]
 
@@ -125,7 +125,8 @@ let make_basic_blocks func_end_addr code =
             end_addr;
             labels;
             code = inst :: insts;
-            nr_jump_srcs;
+            (* nr_jump_srcs also counts the case labels *)
+            is_jump_target = nr_jump_srcs > List.length labels;
           }
         in
         aux (basic_block :: acc) rest
@@ -634,7 +635,7 @@ let rec process t emitted = function
           bb with
           addr = flow.addr;
           labels = flow.labels;
-          nr_jump_srcs = flow.nr_jump_srcs;
+          is_jump_target = flow.is_jump_target;
         }
       in
       match eval_block t flow bb.code bb.end_addr with
@@ -738,7 +739,7 @@ let from_stmt (stmt : statement loc) =
     end_addr = stmt.end_addr;
     labels = [];
     code = (seq_terminator, [ stmt ]);
-    nr_jump_srcs = 0;
+    is_jump_target = false;
   }
 
 let from_generated_constructor (s : Ain.Struct.t) (f : CodeSection.function_t) =
