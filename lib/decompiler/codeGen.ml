@@ -1061,7 +1061,12 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       Stack.pop_exn current_function |> ignore
 
     method print_constants =
-      if Ain.ain.vers >= 6 then (
+      (* v11+ keeps int-typed true/false, matching the official SDK
+         headers: a bool-typed const would make the compiler attach an
+         Int->Bool coercion (ITOB) to the declaration's initval that
+         every use site inherits, but the original v11 compiler emits
+         e.g. [return false] as a bare [PUSH 0] with no ITOB. *)
+      if Ain.ain.vers >= 6 && Ain.ain.vers <= 8 then (
         self#println "const bool true = 1;";
         self#println "const bool false = 0;")
       else (
