@@ -15,3 +15,5 @@
  (name sys4lsp)
  (package sys4lang)
  (libraries system4_lsp linol linol-eio eio_main cmdliner dune-build-info))
+
+(executable (name classify_diffs) (libraries common base stdio))
