@@ -82,6 +82,32 @@ let pop_n ctx n =
 
 let update_stack ctx f = ctx.stack <- f ctx.stack
 
+(* True if [target] is physically [expr] or [expr] with Copy wrappers peeled off. *)
+let rec is_copy_of target = function
+  | e when phys_equal e target -> true
+  | Copy e -> is_copy_of target e
+  | _ -> false
+
+(* A value that a bare POP can drop without emitting a statement. *)
+let rec is_discardable_by_pop = function
+  | Void | Number _ | Page _
+  | BinaryOp (MUL, _, Number 2l) (* index to interface array *)
+  | TernaryOp (_, (Void | Number _), (Void | Number _))
+  | Load (Var _)
+  | RefTo (Var _)
+  | Option _ ->
+      true
+  | Copy e -> is_discardable_by_pop e
+  | _ -> false
+
+let rec is_discardable_by_delete = function
+  | Load (Var _ | Slot _ | Pointee _)
+  | RefTo (Var _ | Slot _ | Pointee _)
+  | BoundMethod _ ->
+      true
+  | Copy e -> is_discardable_by_delete e
+  | _ -> false
+
 let take_stack ctx =
   let stack = ctx.stack in
   ctx.stack <- [];
@@ -132,7 +158,7 @@ let page_var ctx page n = Var (page, varref ctx page n)
 let sh_local_struct_arg ctx local =
   let e = Load (page_var ctx LocalPage local) in
   match (varref ctx LocalPage local).type_ with
-  | Struct s | Ref (Struct s) -> CopyStruct (s, e)
+  | Struct _ | Ref (Struct _) -> Copy e
   | t ->
       Printf.failwithf "sh_local_struct_arg: expected struct local, got %s"
         (Type.show_ain_type t) ()
@@ -214,15 +240,14 @@ let refref ctx =
     | slot :: page :: stack -> Void :: RefTo (lvalue ctx page slot) :: stack
     | stack -> unexpected_stack "refref" stack)
 
-let sr_ref ctx n =
+let sr_ref ctx =
   update_stack ctx (function
-    | slot :: page :: stack ->
-        CopyStruct (n, Load (lvalue ctx page slot)) :: stack
+    | slot :: page :: stack -> Copy (Load (lvalue ctx page slot)) :: stack
     | stack -> unexpected_stack "sr_ref" stack)
 
-let sr_ref2 ctx n =
+let sr_ref2 ctx =
   update_stack ctx (function
-    | expr :: stack -> CopyStruct (n, expr) :: stack
+    | expr :: stack -> Copy expr :: stack
     | stack -> unexpected_stack "sr_ref2" stack)
 
 let unary_op ctx op =
@@ -545,7 +570,7 @@ let ain11_callmethod ctx nr_args =
           let op = Instructions.to_assign_op insn in
           push ctx (PropertySet { obj; op; func; rhs })
       | _ -> emit_expression ctx e)
-  | { kind = Setter _; _ }, e :: stack when e == List.hd_exn args ->
+  | { kind = Setter _; _ }, e :: stack when is_copy_of e (List.hd_exn args) ->
       ctx.stack <- stack;
       push ctx (PropertySet { obj; op = ASSIGN; func; rhs = List.hd_exn args })
   | { return_type = Void; _ }, _ -> emit_expression ctx e
@@ -565,20 +590,13 @@ let analyze ctx =
     | PUSH n -> push ctx (Number n)
     | POP | DG_POP -> (
         match pop ctx with
-        | Void | Number _ | Page _
-        | BinaryOp (MUL, _, Number 2l) (* index to interface array *)
-        | TernaryOp (_, (Void | Number _), (Void | Number _))
-        | Load (Var _)
-        | RefTo (Var _)
-        | Option _ ->
-            (* Can be discarded safely *) ()
         | AssignOp
             ( ASSIGN,
               Var (LocalPage, { type_ = Struct _ | Ref _ | IFace _; _ }),
               Number -1l )
           when Ain.ain.vers >= 12 ->
             (* .LOCALDELETE, ignore *) ()
-        | e when is_null_in_this_branch ctx e -> ()
+        | e when is_discardable_by_pop e || is_null_in_this_branch ctx e -> ()
         | e when List.is_empty ctx.stack -> emit_expression ctx e
         | (AssignOp _ | Call _) as e ->
             (* Occurs during assignment to a reference *)
@@ -586,11 +604,8 @@ let analyze ctx =
         | e -> unexpected_stack "POP" (e :: ctx.stack))
     | DELETE -> (
         match pop ctx with
-        | Load (Var _ | Slot _ | Pointee _)
-        | RefTo (Var _ | Slot _ | Pointee _)
-        | BoundMethod _ ->
+        | e when is_discardable_by_delete e || is_null_in_this_branch ctx e ->
             ()
-        | e when is_null_in_this_branch ctx e -> ()
         | e when List.is_empty ctx.stack -> emit_expression ctx e
         | e -> unexpected_stack "DELETE" (e :: ctx.stack))
     | SP_INC -> (
@@ -861,8 +876,8 @@ let analyze ctx =
     | C_REF -> c_ref ctx
     | C_ASSIGN -> c_assign ctx
     (* --- Structs --- *)
-    | SR_REF struct_id -> sr_ref ctx struct_id
-    | SR_REF2 struct_id -> sr_ref2 ctx struct_id
+    | SR_REF _ -> sr_ref ctx
+    | SR_REF2 _ -> sr_ref2 ctx
     | SR_POP -> emit_expression ctx (pop ctx)
     | SR_ASSIGN -> sr_assign ctx
     (* --- Arrays --- *)
@@ -872,7 +887,10 @@ let analyze ctx =
     | A_FREE ->
         builtin ctx A_FREE 0;
         emit_expression ctx (pop ctx)
-    | A_REF -> ()
+    | A_REF ->
+        update_stack ctx (function
+          | x :: stack -> Copy x :: stack
+          | stack -> unexpected_stack "A_REF" stack)
     | A_EMPTY -> builtin ctx A_EMPTY 0
     | A_COPY -> builtin ctx A_COPY 4
     | A_FILL -> builtin ctx A_FILL 3
@@ -922,7 +940,10 @@ let analyze ctx =
         update_stack ctx (function
           | Load lval :: rest -> AssignOp (X_SET, lval, src) :: rest
           | stack -> unexpected_stack "X_SET" (src :: stack))
-    | DG_COPY -> ()
+    | DG_COPY ->
+        update_stack ctx (function
+          | x :: stack -> Copy x :: stack
+          | stack -> unexpected_stack "DG_COPY" stack)
     | DG_NEW -> push ctx Null
     | DG_CLEAR ->
         builtin2 ctx DG_CLEAR 0;
@@ -1097,8 +1118,8 @@ let analyze ctx =
              ( ASSIGN,
                page_var ctx StructPage memb,
                UnaryOp (ITOB, Load (page_var ctx LocalPage local)) ))
-    | SH_STRUCT_SR_REF (memb, struc) ->
-        push ctx (CopyStruct (struc, Load (page_var ctx StructPage memb)))
+    | SH_STRUCT_SR_REF (memb, _struc) ->
+        push ctx (Copy (Load (page_var ctx StructPage memb)))
     | SH_STRUCT_S_REF slot -> push ctx (Load (page_var ctx StructPage slot))
     | S_REF2 slot ->
         push ctx (Number slot);
