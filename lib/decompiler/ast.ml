@@ -468,6 +468,16 @@ let walk ?(stmt_cb = fun _ -> ()) ?(expr_cb = fun _ -> ())
   in
   rec_stmt stmt
 
+let negate = function UnaryOp (NOT, e) -> e | e -> UnaryOp (NOT, e)
+
+(* Whether e1 and e2 are of the form e and !e (in either order), where both
+   occurrences of e are physically the same node. *)
+let are_negations e1 e2 =
+  match (e1, e2) with
+  | UnaryOp (NOT, e1), e2 when phys_equal e1 e2 -> true
+  | e1, UnaryOp (NOT, e2) when phys_equal e1 e2 -> true
+  | _ -> false
+
 let contains_expr expr sub_expr =
   let exception Found in
   let expr_cb e = if Poly.equal e sub_expr then raise Found in
