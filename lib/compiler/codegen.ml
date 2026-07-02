@@ -7350,7 +7350,39 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction0 POP
               | Some e ->
                   self#compile_expression e;
+                  (* v12 [array@T x = obj.GetList();] — the rhs is a
+                     ref-returning call held in a dummy slot. [X_SET]
+                     consumes the stacked page-ref without incref-ing,
+                     so orig bumps it first ([A_REF]) and releases the
+                     dummy immediately after the copy ([LOCALDELETE]
+                     between X_SET and the trailing DELETE) instead of
+                     at scope end. Without the bump, the dummy's later
+                     release frees the array the copy source still
+                     points at (A_ASSIGN page-acquisition faults:
+                     CRadioButtonBoxParts@InsertCheckbox class,
+                     byte-verified). *)
+                  let borrow_dummy =
+                    if Ain.version_gte ctx.ain (12, 0) then
+                      match e.node with
+                      | DummyRef (var_no, { node = Call _; _ })
+                        when self#needs_a_ref_for_consume e ->
+                          Some var_no
+                      | _ -> None
+                    else None
+                  in
+                  Option.iter borrow_dummy ~f:(fun _ ->
+                      self#write_instruction0 A_REF);
                   self#write_instruction0 X_SET;
+                  Option.iter borrow_dummy ~f:(fun var_no ->
+                      self#write_instruction1 SH_LOCALDELETE var_no;
+                      (* Released here; drop it from the scope tracker
+                         so exit paths don't replay the release. *)
+                      match Stack.top scopes with
+                      | Some scope ->
+                          scope.vars <-
+                            List.filter scope.vars ~f:(fun sv ->
+                                not (Int.equal sv.index var_no))
+                      | None -> ());
                   self#write_instruction0 DELETE
               | None ->
                   if has_dims then (
