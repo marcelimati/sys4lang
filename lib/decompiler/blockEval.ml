@@ -36,16 +36,31 @@ type terminator =
 let seq_terminator = { txt = Seq; addr = -1; end_addr = -1 }
 let ( == ) = phys_equal
 
+type env = {
+  func : Ain.Function.t;
+  struc : Ain.Struct.t option;
+  parent : CodeSection.function_t option;
+}
+
+type state = {
+  condition : expr list;
+  stack : expr list;
+  stmts : statement loc list;
+}
+
+let empty_state = { condition = []; stack = []; stmts = [] }
+
+(* The mutable working structure built by [analyze] to evaluate one basic block. *)
 type context = {
   func : Ain.Function.t;
   struc : Ain.Struct.t option;
   parent : CodeSection.function_t option;
   mutable instructions : instruction loc list;
   mutable address : int;
-  mutable end_address : int;
+  end_address : int;
   mutable stack : expr list;
   mutable stmts : statement loc list;
-  mutable condition : expr list;
+  condition : expr list;
 }
 
 let fetch_instruction ctx =
@@ -129,11 +144,6 @@ let emit_statement ctx stmt =
 let emit_expression ctx expr =
   assert_stack_empty ctx;
   emit_statement ctx (Expression expr)
-
-let take_stmts ctx =
-  let stmts = ctx.stmts in
-  ctx.stmts <- [];
-  stmts
 
 let unexpected_stack name stack =
   Printf.failwithf "%s: unexpected stack structure %s" name
@@ -577,7 +587,20 @@ let ain11_callmethod ctx nr_args =
   | _, _ -> push_call_result ctx func.return_type e
 
 (* Analyzes a basic block. *)
-let analyze ctx =
+let analyze (env : env) ~address ~end_address ~instructions (state : state) =
+  let ctx =
+    {
+      func = env.func;
+      struc = env.struc;
+      parent = env.parent;
+      instructions;
+      address;
+      end_address;
+      stack = state.stack;
+      stmts = state.stmts;
+      condition = state.condition;
+    }
+  in
   let terminator = ref None in
   let set_terminator term =
     assert (List.is_empty ctx.instructions);
@@ -1184,5 +1207,4 @@ let analyze ctx =
         Printf.failwithf "Unknown instruction %s" (show_instruction insn) ()
   done;
   ( Option.value !terminator ~default:seq_terminator,
-    take_stack ctx,
-    take_stmts ctx )
+    { condition = ctx.condition; stack = ctx.stack; stmts = ctx.stmts } )

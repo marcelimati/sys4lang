@@ -175,17 +175,17 @@ let make_basic_blocks func_end_addr code =
    reclaimed later by merge_emitted_branches when the join point reveals
    the mistake. *)
 
-(* Symbolic evaluation state carried along a forward CFG edge. *)
-type state = {
+(* Symbolic evaluation state carried along a forward CFG edge.
+   [condition] holds the conditions of the branches taken since the last
+   settled state, most recent first. *)
+type state = BlockEval.state = {
   condition : expr list;
-      (* conditions of the branches taken since the last settled state,
-         most recent first *)
   stack : expr list; (* the symbolic value stack *)
   stmts : Ast.statement loc list; (* generated statements, most recent first *)
 }
 [@@deriving show { with_path = false }]
 
-let empty_state = { condition = []; stack = []; stmts = [] }
+let empty_state = BlockEval.empty_state
 let make_option = function Option _ as obj -> obj | obj -> Option obj
 let strip_option = function Option obj -> obj | obj -> obj
 
@@ -383,7 +383,7 @@ let strip_rvalue_ref_dummy (func : Ain.Function.t) ~obj ~conds (ok : state)
       Some { condition = conds; stack = Void :: rhs :: es1; stmts }
   | _ -> None
 
-let merge_null_checked (ctx : BlockEval.context) ~obj ~conds ok null =
+let merge_null_checked (env : BlockEval.env) ~obj ~conds ok null =
   let rules =
     [
       null_coalesce;
@@ -392,7 +392,7 @@ let merge_null_checked (ctx : BlockEval.context) ~obj ~conds ok null =
       chained_null_coalesce;
       nullable_ref_chain;
       chained_nullable_fat_value;
-      strip_rvalue_ref_dummy ctx.func;
+      strip_rvalue_ref_dummy env.func;
     ]
   in
   List.find_map rules ~f:(fun rule -> rule ~obj ~conds ok null)
@@ -478,7 +478,7 @@ let merge_conditional (first : state) (second : state) =
 (* Merges two states flowing into the same join point. [first] is the inflow
    created earlier. The merged inflow keeps [first]'s block metadata, so the
    resulting block covers the whole expression region. *)
-let merge_inflows ctx addr (first : state basic_block)
+let merge_inflows env addr (first : state basic_block)
     (second : state basic_block) =
   let s1 = first.code and s2 = second.code in
   let merged =
@@ -486,11 +486,11 @@ let merge_inflows ctx addr (first : state basic_block)
     | ( UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs,
         BinaryOp (EQUALE, obj', Number -1l) :: conds )
       when obj == obj' && cs == conds ->
-        merge_null_checked ctx ~obj ~conds s1 s2
+        merge_null_checked env ~obj ~conds s1 s2
     | ( BinaryOp (EQUALE, obj', Number -1l) :: conds,
         UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs )
       when obj == obj' && cs == conds ->
-        merge_null_checked ctx ~obj ~conds s2 s1
+        merge_null_checked env ~obj ~conds s2 s1
     | _ -> None
   in
   let merged =
@@ -583,7 +583,7 @@ let reclaim_one_branch emitted (latest : state basic_block)
    ------------------------------------------------------------------------- *)
 
 type driver = {
-  ctx : BlockEval.context;
+  env : BlockEval.env;
   inflows : (int, state basic_block list) Hashtbl.t;
       (* Evaluation states propagated along forward edges but not consumed
          yet, keyed by target address; most recently created edge first.
@@ -592,9 +592,9 @@ type driver = {
          whole expression region in the output. *)
 }
 
-let add_inflow t addr inflow =
+let add_inflow t ~src_end addr inflow =
   (* Expression code never branches backwards. *)
-  assert (t.ctx.end_address <= addr);
+  assert (src_end <= addr);
   Hashtbl.add_multi t.inflows ~key:addr ~data:inflow
 
 (* Replaces the two most recently created inflows of [addr] with [inflow]. *)
@@ -605,16 +605,11 @@ let replace_latest_inflows t addr inflow =
     | None -> Printf.failwithf "no inflows at address %d" addr ())
 
 (* Evaluates one basic block starting from the given state. *)
-let eval_block t (flow : state basic_block) code end_addr =
-  let ctx = t.ctx in
-  ctx.condition <- flow.code.condition;
-  ctx.stack <- flow.code.stack;
-  ctx.stmts <- flow.code.stmts;
-  ctx.instructions <- code;
-  ctx.address <-
-    (match flow.code.stmts with [] -> flow.addr | stmt :: _ -> stmt.end_addr);
-  ctx.end_address <- end_addr;
-  BlockEval.analyze ctx
+let eval_block t (flow : state basic_block) instructions end_addr =
+  let address =
+    match flow.code.stmts with [] -> flow.addr | stmt :: _ -> stmt.end_addr
+  in
+  BlockEval.analyze t.env ~address ~end_address:end_addr ~instructions flow.code
 
 let rec process t emitted = function
   | [] -> List.rev emitted
@@ -628,7 +623,7 @@ let rec process t emitted = function
         | Some inflows ->
             (* Latest edge first: merge from the innermost fork outwards. *)
             List.reduce_exn inflows ~f:(fun merged earlier ->
-                merge_inflows t.ctx bb.addr earlier merged)
+                merge_inflows t.env bb.addr earlier merged)
       in
       let bb =
         {
@@ -639,35 +634,29 @@ let rec process t emitted = function
         }
       in
       match eval_block t flow bb.code bb.end_addr with
-      | term, [], stmts when List.is_empty t.ctx.condition ->
+      | term, { condition = []; stack = []; stmts } ->
           (* The statement is complete; bb becomes an output block. *)
           merge_emitted_branches t
             ({ bb with code = (term, stmts) } :: emitted)
             rest
-      | { txt = Branch (addr, cond); _ }, stack, stmts ->
+      | { txt = Branch (addr, cond); _ }, { condition; stack; stmts } ->
           (* A branch in the middle of an expression: propagate the state to
              both targets, recording the branch condition taken. *)
-          add_inflow t addr
+          add_inflow t ~src_end:bb.end_addr addr
             {
               flow with
-              code =
-                { condition = negate cond :: t.ctx.condition; stack; stmts };
+              code = { condition = negate cond :: condition; stack; stmts };
             };
-          add_inflow t bb.end_addr
-            {
-              flow with
-              code = { condition = cond :: t.ctx.condition; stack; stmts };
-            };
+          add_inflow t ~src_end:bb.end_addr bb.end_addr
+            { flow with code = { condition = cond :: condition; stack; stmts } };
           merge_emitted_branches t emitted rest
-      | { txt = Jump addr; _ }, stack, stmts ->
-          add_inflow t addr
-            { flow with code = { condition = t.ctx.condition; stack; stmts } };
+      | { txt = Jump addr; _ }, code ->
+          add_inflow t ~src_end:bb.end_addr addr { flow with code };
           merge_emitted_branches t emitted rest
-      | { txt = Seq; _ }, stack, stmts ->
-          add_inflow t bb.end_addr
-            { flow with code = { condition = t.ctx.condition; stack; stmts } };
+      | { txt = Seq; _ }, code ->
+          add_inflow t ~src_end:bb.end_addr bb.end_addr { flow with code };
           merge_emitted_branches t emitted rest
-      | { txt = Switch0 _ | DoWhile0 _; _ }, _, _ ->
+      | { txt = Switch0 _ | DoWhile0 _; _ }, _ ->
           failwith "switch in the middle of an expression")
 
 (* Detects join points whose inflows expose provisionally emitted branch
@@ -676,7 +665,6 @@ let rec process t emitted = function
    single branch (value-producing ?:), whose result may itself be an arm
    of an enclosing conditional, so it is retried. *)
 and merge_emitted_branches t emitted rest =
-  assert (List.is_empty t.ctx.stmts);
   let inflow_pair =
     match rest with
     | [] -> None
@@ -715,20 +703,14 @@ let rec replace_delegate_calls acc = function
   | [] -> List.rev acc
 
 let from_instructions (f : CodeSection.function_t) code =
-  let ctx : BlockEval.context =
+  let env : BlockEval.env =
     {
       func = f.func;
       struc = (match f.owner with Some (Struct s) -> Some s | _ -> None);
       parent = f.parent;
-      instructions = [];
-      address = -1;
-      end_address = -1;
-      stack = [];
-      stmts = [];
-      condition = [];
     }
   in
-  let t = { ctx; inflows = Hashtbl.create (module Int) } in
+  let t = { env; inflows = Hashtbl.create (module Int) } in
   code |> replace_delegate_calls []
   |> make_basic_blocks f.end_addr
   |> process t []

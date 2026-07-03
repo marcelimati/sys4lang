@@ -28,24 +28,34 @@ type terminator =
 
 val seq_terminator : terminator loc
 
-type context = {
+(* The immutable environment of the function being evaluated. *)
+type env = {
   func : Ain.Function.t;
   struc : Ain.Struct.t option;
   parent : CodeSection.function_t option;
-  mutable instructions : Instructions.instruction loc list;
-      (* the instructions left to evaluate *)
-  mutable address : int; (* start address of the current statement *)
-  mutable end_address : int; (* end address of the current basic block *)
-  mutable stack : Ast.expr list; (* the symbolic value stack *)
-  mutable stmts : Ast.statement loc list;
-      (* generated statements, most recent first *)
-  mutable condition : Ast.expr list;
-      (* conditions of the branches taken to reach this block, most recent
-         first (see BasicBlock) *)
 }
 
-(* Evaluates ctx.instructions, simulating their effect on ctx.stack and
-   emitting completed statements to ctx.stmts. Returns the terminator of the
-   basic block along with the final value stack and the generated statements
-   (most recent first), leaving ctx.stack and ctx.stmts empty. *)
-val analyze : context -> terminator loc * Ast.expr list * Ast.statement loc list
+(* The symbolic evaluation state carried across basic blocks. *)
+type state = {
+  condition : Ast.expr list;
+      (* conditions of the branches taken since the last settled state, most
+         recent first *)
+  stack : Ast.expr list; (* the symbolic value stack *)
+  stmts : Ast.statement loc list; (* generated statements, most recent first *)
+}
+
+val empty_state : state
+
+(* Evaluates [instructions], simulating their effect on the value stack and
+   emitting completed statements. [address] is the start address of the current
+   statement and [end_address] the end address of the basic block. Returns the
+   terminator of the basic block and the resulting state: its stack and stmts
+   are the final ones (stmts most recent first); its condition is carried
+   through unchanged. *)
+val analyze :
+  env ->
+  address:int ->
+  end_address:int ->
+  instructions:Instructions.instruction loc list ->
+  state ->
+  terminator loc * state
