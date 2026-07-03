@@ -5404,6 +5404,59 @@ class jaf_compiler ctx debug_info =
                     | _ -> false)
                 | _ -> false
               in
+              let is_value_prop_setter =
+                Ain.version ctx.ain > 8
+                &&
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                String.is_suffix f.name ~suffix:"::set"
+                && List.length args = 1
+                && Poly.equal f.return_type Ain.Type.Void
+                &&
+                match List.hd (Ain.Function.logical_parameters f) with
+                | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
+                | _ -> true
+              in
+              if
+                is_dummyref
+                && (not receiver_is_iface)
+                && (not receiver_is_casted_from_iface)
+                && not is_value_prop_setter
+              then (
+                (* v12 [dummy?.Method(args) ?? fallback] where the receiver
+                   is a ref-returning call/getter (dummy slot),
+                   non-interface. The original compiler CALLS the method
+                   inside the non-null branch — where the null check just
+                   proved the receiver valid — pushing a 0 marker below
+                   the result; the null branch pushes [-1, -1]. The
+                   generic path below instead DEFERS the CALLMETHOD past
+                   the ?? marker check, by which point the receiver
+                   page-ref is gone and CALLMETHOD dispatches on -1
+                   (REF Page=-1, e.g. CEnqueteView@MouseWheelEvent's
+                   this.Item?.IsFocusTextBox() ?? false on survey scroll). *)
+                self#compile_lvalue receiver;
+                self#write_instruction0 DUP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let a_null = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#compile_method_call_for_receiver receiver.ty args
+                  method_no;
+                self#write_instruction1 PUSH 0;
+                let a_merge = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at a_null current_address;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_address_at a_merge current_address;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let a_have = current_address + 2 in
+                self#write_instruction1 IFZ 0;
+                self#write_instruction0 POP;
+                self#compile_expression b;
+                self#write_address_at a_have current_address)
+              else (
               if is_dummyref then (
                 self#compile_lvalue receiver;
                 if not receiver_is_casted_from_iface then
@@ -5448,18 +5501,6 @@ class jaf_compiler ctx debug_info =
               let jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at ifz_addr current_address;
-              let is_value_prop_setter =
-                Ain.version ctx.ain > 8
-                &&
-                let f = Ain.get_function_by_index ctx.ain method_no in
-                String.is_suffix f.name ~suffix:"::set"
-                && List.length args = 1
-                && Poly.equal f.return_type Ain.Type.Void
-                &&
-                match List.hd (Ain.Function.logical_parameters f) with
-                | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
-                | _ -> true
-              in
               if is_value_prop_setter then (
                 let f = Ain.get_function_by_index ctx.ain method_no in
                 self#compile_method_selector receiver.ty method_no;
@@ -5477,7 +5518,7 @@ class jaf_compiler ctx debug_info =
               else
                 self#compile_method_call_for_receiver receiver.ty args
                   method_no;
-              self#write_address_at jump_addr current_address
+              self#write_address_at jump_addr current_address)
           | Call
               ( {
                   node =
