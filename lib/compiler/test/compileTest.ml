@@ -1444,6 +1444,71 @@ let%expect_test "v11 OBJSWAP encodes type as direct operand" =
     048: EOF
     |}]
 
+(* v12 user-bodied event invocation: when the accessor bodies reference
+   the event's own backing field (so [<E>] is kept), [this.E(args)]
+   fires the backing delegate via the DG_CALLBEGIN/DG_CALL loop, same
+   as a plain delegate member call. Regression: this used to fall
+   through to the UnresolvedCall placeholder path (callee value +
+   PUSH 0), silently dropping the dispatch — Rance10's parts-layer
+   mouse-wheel events (CPartsFunctionSet@CallFunctionMouseWheel) never
+   fired. *)
+let%expect_test "v12 user-bodied event invocation is a delegate call" =
+  compile_test ~ain_version:12
+    {|
+      delegate void dg(int n);
+      class C {
+        event dg E;
+        void CallE(int n);
+      };
+      event dg C::E {
+        add { this.E += value; }
+        remove { this.E -= value; }
+      }
+      void C::CallE(int n) { this.E(n); }
+    |};
+  [%expect
+    {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@E::add
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: PUSHLOCALPAGE
+    048: PUSH 0
+    054: REF
+    056: DG_PLUSA
+    058: POP
+    060: RETURN
+    062: FUNC C@E::remove
+    068: PUSHSTRUCTPAGE
+    070: PUSH 0
+    076: REF
+    078: PUSHLOCALPAGE
+    080: PUSH 0
+    086: REF
+    088: DG_MINUSA
+    090: POP
+    092: RETURN
+    094: FUNC C@CallE
+    100: PUSHSTRUCTPAGE
+    102: PUSH 0
+    108: REF
+    110: PUSHLOCALPAGE
+    112: PUSH 0
+    118: REF
+    120: DG_CALLBEGIN delegate(0)
+    126: DG_CALL delegate(0), 142
+    136: JUMP 126
+    142: RETURN
+    144: EOF test.jaf
+    150: FUNC NULL
+    156: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)

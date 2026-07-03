@@ -1941,14 +1941,21 @@ class type_analyze_visitor ctx =
           let struc = Hashtbl.find_exn ctx.structs ev.event_class in
           let backing_name = "<" ^ event_name ^ ">" in
           (match Hashtbl.find struc.members backing_name with
-          | Some m ->
+          | Some m -> (
               e.node <-
                 Member
                   ( obj,
                     backing_name,
                     ClassVariable (Option.value_exn m.index) );
               e.ty <- m.type_spec.ty;
-              expr.ty <- HLLParam
+              match m.type_spec.ty with
+              | Delegate (Some (name, _)) | Ref (Delegate (Some (name, _))) ->
+                  let f = Hashtbl.find_exn ctx.delegates name in
+                  let args = check_call f.name f.params args in
+                  expr.node <-
+                    Call (e, args, DelegateCall (Option.value_exn f.index));
+                  expr.ty <- f.return.ty
+              | _ -> expr.ty <- HLLParam)
           | None ->
               (* User-bodied event with no JAF-side backing field —
                  rewrite the callee to a [Null]-typed sentinel so the
