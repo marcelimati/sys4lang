@@ -913,11 +913,11 @@ let%expect_test "member pointer" =
      Please change this test to not include a backtrace. *)
   (Failure "tried to create array<interface>")
   Raised at Stdlib.failwith in file "stdlib.ml", line 29, characters 17-33
-  Called from Compiler__Codegen.jaf_compiler#compile_function.(fun) in file "lib/compiler/codegen.ml", line 7668, characters 29-60
+  Called from Compiler__Codegen.jaf_compiler#compile_function.(fun) in file "lib/compiler/codegen.ml", line 7758, characters 29-60
   Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
-  Called from Compiler__Codegen.jaf_compiler#compile_function in file "lib/compiler/codegen.ml", lines 7667-7668, characters 6-61
+  Called from Compiler__Codegen.jaf_compiler#compile_function in file "lib/compiler/codegen.ml", lines 7757-7758, characters 6-61
   Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
-  Called from Compiler__Codegen.jaf_compiler#compile in file "lib/compiler/codegen.ml", line 8461, characters 6-37
+  Called from Compiler__Codegen.jaf_compiler#compile in file "lib/compiler/codegen.ml", line 8551, characters 6-37
   Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
   Called from Compiler__Compile.compile in file "lib/compiler/compile.ml", line 463, characters 2-37
   Called from Compiler_test__CompileTest.compile_test in file "lib/compiler/test/compileTest.ml", lines 76-78, characters 4-39

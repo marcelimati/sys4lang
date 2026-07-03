@@ -3360,6 +3360,96 @@ class jaf_compiler ctx debug_info =
               compiler_bug "invalid binary expression"
                 (Some (ASTExpression expr)))
       | Assign (op, lhs, rhs) -> (
+          (* v12 [receiver?.DelegateMember += method] / [-= method].
+             The optional-member compound-assign to a delegate member
+             is NOT the rvalue-member shape: the original keeps the
+             member as a place (REF) in the non-null branch and builds
+             the rhs delegate in BOTH null-check branches — the
+             receiver-null path still constructs and DELETEs the
+             delegate (balanced), only the fully-non-null path runs
+             DG_PLUSA/DG_MINUSA. Compiling the OptionalMember as an
+             rvalue (the previous behaviour) collapsed the null branch
+             and ran DG_PLUSA on a -1 sentinel, mis-registering the
+             handler; firing it (e.g. mouse wheel on a scroll view)
+             then REF'd a -1 page. Handles the call-receiver, direct
+             ClassVariable delegate-member shape (ScrollBase@Init
+             getCurrentSceneStack()?.WheelEvent += this.OnWheel). *)
+          let rhs_is_method_ref =
+            match rhs.node with
+            | Member (_, _, ClassMethod _)
+            | Cast (_, { node = Member (_, _, ClassMethod _); _ })
+            | Lambda _ | FuncAddr _
+            | Cast (_, { node = FuncAddr _; _ })
+            | Cast (_, { node = Lambda _; _ }) ->
+                true
+            | _ -> false
+          in
+          let optional_delegate_add =
+            if
+              Ain.version_gte ctx.ain (12, 0)
+              && (match op with PlusAssign | MinusAssign -> true | _ -> false)
+              && (match lhs.ty with Delegate _ -> true | _ -> false)
+              && rhs_is_method_ref
+            then
+              match lhs.node with
+              | OptionalMember
+                  (({ node = DummyRef (_, { node = Call _; _ }); _ } as receiver),
+                   _, ClassVariable midx) ->
+                  Some (receiver, midx)
+              | _ -> None
+            else None
+          in
+          (match optional_delegate_add with
+          | Some (receiver, midx) ->
+              let dgop = match op with PlusAssign -> DG_PLUSA | _ -> DG_MINUSA in
+              let emit_rhs_dg () =
+                self#compile_expression rhs;
+                self#write_instruction0 DG_NEW_FROM_METHOD
+              in
+              (* Evaluate the receiver call: CALLFUNC; store to its
+                 dummy slot; leave the page-ref on the stack. The
+                 DummyRef machinery registers the slot so its
+                 SH_LOCALDELETE is emitted at statement cleanup. *)
+              self#compile_expression receiver;
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let a_recv_null = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              (* receiver non-null: push [member_index, valid-marker 0] *)
+              self#write_instruction1 PUSH midx;
+              self#write_instruction1 PUSH 0;
+              let a_merge = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at a_recv_null current_address;
+              (* receiver null: drop it, push three -1 sentinels *)
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at a_merge current_address;
+              (* second level: was the marker valid (not -1)? *)
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let a_member_null = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              (* member present: REF to the delegate place, add rhs *)
+              self#write_instruction0 REF;
+              emit_rhs_dg ();
+              self#write_instruction0 dgop;
+              self#write_instruction0 DELETE;
+              let a_end = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at a_member_null current_address;
+              (* receiver was null: still build+discard the delegate *)
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              emit_rhs_dg ();
+              self#write_instruction0 DELETE;
+              self#write_address_at a_end current_address
+          | None -> ());
+          if Option.is_some optional_delegate_add then ()
+          else (
           let lhs_is_v12_iface =
             Ain.version_gte ctx.ain (12, 0)
             && is_variable_ref lhs.node
@@ -3805,7 +3895,7 @@ class jaf_compiler ctx debug_info =
                     (Some (ASTExpression expr)))
           | _, _ ->
               compiler_bug "invalid assignment" (Some (ASTExpression expr)))
-          )))
+          ))))
       | Seq (a, b) ->
           self#compile_expr_and_pop a;
           self#compile_expression b
