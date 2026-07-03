@@ -18,3 +18,5 @@
 
 (executable (name classify_diffs) (libraries common base stdio))
 (executable (name scan_dispatch) (libraries common base stdio))
+(executable (name scan_vtables) (libraries common base stdio))
+(executable (name scan_new) (libraries common base stdio))
