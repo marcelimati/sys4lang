@@ -4531,6 +4531,16 @@ class jaf_compiler ctx debug_info =
                   match prop_backing_kind with
                   | `Value | `Elided -> true
                   | `Ref -> not rhs_is_new)
+            | Some (Ref (Delegate _)) when Ain.version_gte ctx.ain (12, 0) ->
+                (* Delegate-typed property setters take the arg as a
+                   ref-delegate page. The setter stores it without its
+                   own incref, so orig increfs across the call
+                   ([A_REF; DUP_X2; CALLMETHOD; DELETE], e.g.
+                   CEnqueteView@Prepare's [this.SendEnquete = dgFunc]).
+                   Without it the stored delegate page dies with the
+                   caller's arg slot — firing it later dispatches on a
+                   freed page. *)
+                not rhs_is_null
             | Some (Ref _) -> false
             | _ -> true
           in
@@ -4630,7 +4640,9 @@ class jaf_compiler ctx debug_info =
                   self#compile_function_arguments args f)
                 ~finally:(fun () -> in_prop_setter_arg <- prev));
             let is_ref_struct_new_setter =
-              match param_ty with Some (Ref (Struct _)) -> true | _ -> false
+              match param_ty with
+              | Some (Ref (Struct _ | Delegate _)) -> true
+              | _ -> false
             in
             if is_ref_struct_new_setter then self#write_instruction0 A_REF;
             self#write_instruction0 DUP_X2;
