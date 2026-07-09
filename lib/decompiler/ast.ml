@@ -69,7 +69,7 @@ and expr =
   | Option of expr
   | New of { struc : int; func : int; args : expr list }
   | ArrayLiteral of expr list
-  | CopyStruct of int * expr
+  | Copy of expr
   | UnaryOp of Instructions.instruction * expr
   | BinaryOp of Instructions.instruction * expr * expr
   | AssignOp of Instructions.instruction * lvalue * expr
@@ -228,7 +228,7 @@ let subst expr e1 e2 =
       | TempRef (v, e) -> TempRef (v, rec_expr e)
       | Option e -> Option (rec_expr e)
       | ArrayLiteral es -> ArrayLiteral (List.map ~f:rec_expr es)
-      | CopyStruct (n, e) -> CopyStruct (n, rec_expr e)
+      | Copy e -> Copy (rec_expr e)
       | UnaryOp (inst, e) -> UnaryOp (inst, rec_expr e)
       | BinaryOp (inst, lhs, rhs) -> BinaryOp (inst, rec_expr lhs, rec_expr rhs)
       | AssignOp (inst, l, e) -> AssignOp (inst, rec_lvalue l, rec_expr e)
@@ -281,7 +281,7 @@ let map_expr stmt ~f =
     | Option expr -> Option (rec_expr expr) |> f
     | New r -> New { r with args = List.map ~f:rec_expr r.args } |> f
     | ArrayLiteral es -> ArrayLiteral (List.map ~f:rec_expr es) |> f
-    | CopyStruct (n, expr) -> CopyStruct (n, rec_expr expr) |> f
+    | Copy expr -> Copy (rec_expr expr) |> f
     | UnaryOp (inst, expr) -> UnaryOp (inst, rec_expr expr) |> f
     | BinaryOp (inst, lhs, rhs) ->
         BinaryOp (inst, rec_expr lhs, rec_expr rhs) |> f
@@ -373,7 +373,7 @@ let walk_expr ?(expr_cb = fun _ -> ()) ?(lvalue_cb = fun _ -> ()) =
     | Option expr -> rec_expr expr
     | New r -> List.iter ~f:rec_expr r.args
     | ArrayLiteral es -> List.iter ~f:rec_expr es
-    | CopyStruct (_, expr) -> rec_expr expr
+    | Copy expr -> rec_expr expr
     | UnaryOp (_, expr) -> rec_expr expr
     | BinaryOp (_, lhs, rhs) ->
         rec_expr lhs;
@@ -467,6 +467,16 @@ let walk ?(stmt_cb = fun _ -> ()) ?(expr_cb = fun _ -> ())
         rec_stmt stmt
   in
   rec_stmt stmt
+
+let negate = function UnaryOp (NOT, e) -> e | e -> UnaryOp (NOT, e)
+
+(* Whether e1 and e2 are of the form e and !e (in either order), where both
+   occurrences of e are physically the same node. *)
+let are_negations e1 e2 =
+  match (e1, e2) with
+  | UnaryOp (NOT, e1), e2 when phys_equal e1 e2 -> true
+  | e1, UnaryOp (NOT, e2) when phys_equal e1 e2 -> true
+  | _ -> false
 
 let contains_expr expr sub_expr =
   let exception Found in

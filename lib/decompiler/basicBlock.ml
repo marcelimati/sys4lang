@@ -19,7 +19,7 @@ open Loc
 open Ast
 open Instructions
 
-type terminator =
+type terminator = BlockEval.terminator =
   | Seq
   | Jump of int (* addr *)
   | Branch of int * expr (* (addr, cond) - jumps if cond == 0 *)
@@ -27,7 +27,7 @@ type terminator =
   | DoWhile0 of int (* addr of branching basic block *)
 [@@deriving show { with_path = false }]
 
-let seq_terminator = { txt = Seq; addr = -1; end_addr = -1 }
+let seq_terminator = BlockEval.seq_terminator
 
 type fragment = terminator loc * Ast.statement loc list
 [@@deriving show { with_path = false }]
@@ -37,20 +37,17 @@ type 'a basic_block = {
   end_addr : int;
   labels : label loc list;
   code : 'a;
-  mutable nr_jump_srcs : int;
+  is_jump_target : bool;
 }
 [@@deriving show { with_path = false }]
 
 type t = fragment basic_block [@@deriving show { with_path = false }]
 
 let ( == ) = phys_equal
-let negate = function UnaryOp (NOT, e) -> e | e -> UnaryOp (NOT, e)
 
-let are_negations e1 e2 =
-  match (e1, e2) with
-  | UnaryOp (NOT, e1), e2 when e1 == e2 -> true
-  | e1, UnaryOp (NOT, e2) when e1 == e2 -> true
-  | _ -> false
+(* -------------------------------------------------------------------------
+   Basic block construction
+   ------------------------------------------------------------------------- *)
 
 let branch_target = function
   | JUMP addr -> Some addr
@@ -128,7 +125,8 @@ let make_basic_blocks func_end_addr code =
             end_addr;
             labels;
             code = inst :: insts;
-            nr_jump_srcs;
+            (* nr_jump_srcs also counts the case labels *)
+            is_jump_target = nr_jump_srcs > List.length labels;
           }
         in
         aux (basic_block :: acc) rest
@@ -136,1229 +134,156 @@ let make_basic_blocks func_end_addr code =
   in
   aux [] code
 
-type predecessor = {
+(* -------------------------------------------------------------------------
+   Expression reconstruction across basic blocks
+
+   Short-circuit and conditional expressions (&&, ||, ?:, and the ain v11+
+   null-conditional forms obj?.member / a ?? b) are compiled into
+   conditional branches, so a single expression can span several basic
+   blocks:
+
+       <a> IFZ Lelse; <b> JUMP Lend; Lelse: <c>; Lend: ...    (a ? b : c)
+
+   BlockEval.analyze evaluates one block at a time; when it reaches the
+   terminator while an expression is still open, values remain on the
+   symbolic stack. This section reconnects such blocks.
+
+   Blocks are processed in address order. The evaluation state at the end
+   of a block that does not complete a statement is propagated along its
+   outgoing edges as an "inflow" of each target block. Expression code
+   never branches backwards, so a target block is always processed after
+   all of its inflows are known. When the block ends with a branch, the
+   branch condition is pushed onto the state's condition list, recording
+   the decision that leads to each path. A block that receives two inflows
+   is the join point of a conditional expression; merge_inflows compares
+   the two states and reconstructs the operator that produced the fork
+   (see the merge rules below).
+
+   Shared-tail invariant: two states flowing into the same join point were
+   forked from a common state, and everything below the operands of the
+   forking operator must be untouched on both paths. The merge rules verify
+   this cheaply with phys_equal ( == ) on the tails of the condition /
+   stack / stmts lists.
+
+   A block whose state is settled (empty stack, no pending conditions) at
+   its terminator completes a statement. It is emitted as an output block;
+   statement-level control flow between output blocks is reconstructed
+   later by ControlFlow. One ambiguity remains here: the leading branches
+   of a value-producing && / || / ?: that starts a statement also execute
+   on a settled state, so they are indistinguishable from statement-level
+   control flow at this point. They are provisionally emitted as well and
+   reclaimed later by merge_emitted_branches when the join point reveals
+   the mistake. *)
+
+(* Symbolic evaluation state carried along a forward CFG edge.
+   [condition] holds the conditions of the branches taken since the last
+   settled state, most recent first. *)
+type state = BlockEval.state = {
   condition : expr list;
-  stack : expr list;
-  stmts : Ast.statement loc list;
+  stack : expr list; (* the symbolic value stack *)
+  stmts : Ast.statement loc list; (* generated statements, most recent first *)
 }
 [@@deriving show { with_path = false }]
 
-type analyze_context = {
-  func : Ain.Function.t;
-  struc : Ain.Struct.t option;
-  parent : CodeSection.function_t option;
-  mutable instructions : instruction loc list;
-  mutable address : int;
-  mutable end_address : int;
-  mutable stack : expr list;
-  mutable stmts : statement loc list;
-  mutable condition : expr list;
-  predecessors : (int, predecessor basic_block list) Hashtbl.t;
-}
-
-let fetch_instruction ctx =
-  match ctx.instructions with
-  | [] -> failwith "unexpected end of basic block"
-  | inst :: tl ->
-      ctx.instructions <- tl;
-      inst.txt
-
-let current_address ctx =
-  match ctx.instructions with hd :: _ -> hd.addr | [] -> ctx.end_address
-
-let push ctx expr = ctx.stack <- expr :: ctx.stack
-let pushl ctx exprs = ctx.stack <- List.rev_append exprs ctx.stack
-
-let pop ctx =
-  match ctx.stack with
-  | [] -> failwith "stack underflow"
-  | hd :: tl ->
-      ctx.stack <- tl;
-      hd
-
-let pop2 ctx =
-  match ctx.stack with
-  | b :: a :: tl ->
-      ctx.stack <- tl;
-      (a, b)
-  | _ -> failwith "stack underflow"
-
-let pop_n ctx n =
-  let es, rest = List.split_n ctx.stack n in
-  ctx.stack <- rest;
-  List.rev es
-
-let update_stack ctx f = ctx.stack <- f ctx.stack
-
-let take_stack ctx =
-  let stack = ctx.stack in
-  ctx.stack <- [];
-  stack
-
-let assert_stack_empty ctx =
-  match take_stack ctx with
-  | [] -> ()
-  | stack ->
-      Stdio.eprintf "0x%08x: Warning: Non-empty stack at statement end: %s\n"
-        (current_address ctx)
-        ([%show: expr list] stack)
-
-let emit_statement ctx stmt =
-  let end_addr = current_address ctx in
-  ctx.stmts <- { addr = ctx.address; end_addr; txt = stmt } :: ctx.stmts;
-  ctx.address <- end_addr
-
-let emit_expression ctx expr =
-  assert_stack_empty ctx;
-  emit_statement ctx (Expression expr)
-
-let take_stmts ctx =
-  let stmts = ctx.stmts in
-  ctx.stmts <- [];
-  stmts
-
-let unexpected_stack name stack =
-  Printf.failwithf "%s: unexpected stack structure %s" name
-    ([%derive.show: expr list] stack)
-    ()
-
-let varref ctx page n =
-  match page with
-  | GlobalPage -> Ain.ain.glob.(n)
-  | LocalPage -> ctx.func.vars.(n)
-  | StructPage -> (Option.value_exn ctx.struc).members.(n)
-  | ParentPage level ->
-      let rec loop (f : CodeSection.function_t) = function
-        | 0 -> f.func.vars.(n)
-        | n -> loop (Option.value_exn f.parent) (n - 1)
-      in
-      loop (Option.value_exn ctx.parent) level
-
-let page_var ctx page n = Var (page, varref ctx page n)
-
-(* The SH_*_A_PUSHBACK_LOCAL_STRUCT shortcuts push a copy of a local struct. *)
-let sh_local_struct_arg ctx local =
-  let e = Load (page_var ctx LocalPage local) in
-  match (varref ctx LocalPage local).type_ with
-  | Struct s | Ref (Struct s) -> CopyStruct (s, e)
-  | t ->
-      Printf.failwithf "sh_local_struct_arg: expected struct local, got %s"
-        (Type.show_ain_type t) ()
-
-let lvalue ctx page slot =
-  match (page, slot) with
-  | Number -1l, Number 0l -> NullPlace
-  | Page page, Number n -> page_var ctx page (Int32.to_int_exn n)
-  | RefTo lval, Void -> Pointee (Load lval)
-  | Load lval, Void -> lval
-  | e, Void -> Pointee e
-  | _, _ -> Slot (page, slot)
-
-(* Reassemble a reference value carried on the stack as a (page, slot) pair
-   into a single reference-typed expression node. *)
-let ref_value ctx page slot =
-  match (page, slot) with
-  | RefTo lval, Void -> RefTo (Pointee (Load lval))
-  | e, Void -> e
-  | _, _ -> RefTo (lvalue ctx page slot)
-
-let rec interface_value obj vofs =
-  match (obj, vofs) with
-  | TernaryOp (c1, a1, b1), TernaryOp (c2, a2, b2) when c1 == c2 ->
-      TernaryOp (c1, interface_value a1 a2, interface_value b1 b2)
-  | Number -1l, Number 0l -> RefTo NullPlace
-  | _, Void -> RefTo (Pointee obj)
-  | _, _ -> RefTo (Slot (obj, vofs))
-
-let resolve_method ctx obj index =
-  let fid =
-    match
-      (new TypeAnalysis.analyzer ctx.func ctx.struc)#analyze_expr Any obj
-    with
-    | _, (Struct s | Ref (Struct s)) -> Ain.ain.strt.(s).vtable.(index)
-    | _, (IFace iface | Ref (IFace iface)) -> (
-        match Ain.ain.strt.(iface).implementers with
-        | [] -> Ain.ain.strt.(iface).vtable.(index)
-        | implementer :: _ ->
-            let index = implementer.vtable_offset + index in
-            Ain.ain.strt.(implementer.struct_type).vtable.(index))
-    | _, t ->
-        failwith
-          ("resolve_method: non-struct/interface type " ^ Type.show_ain_type t)
-  in
-  Ain.ain.func.(fid)
-
-let delegate_value ctx obj func =
-  match (obj, func) with
-  | _, Number func_no ->
-      BoundMethod (obj, Ain.ain.func.(Int32.to_int_exn func_no))
-  | Number -1l, DelegateCast _ -> func
-  | ( _,
-      Load
-        (Slot (Load (Slot (obj', Number 0l)), BinaryOp (ADD, Void, Number index)))
-    )
-    when obj == obj' ->
-      BoundMethod (obj, resolve_method ctx obj (Int32.to_int_exn index))
-  | _, _ ->
-      Printf.failwithf "cannot create delegate value:\nobj = %s\nfunc=%s"
-        (show_expr obj) (show_expr func) ()
-
-let convert_stack_top_to_delegate ctx =
-  update_stack ctx (function
-    | func :: obj :: stack -> delegate_value ctx obj func :: stack
-    | stack -> unexpected_stack "convert_stack_top_to_delegate" stack)
-
-let ref_ ctx =
-  update_stack ctx (function
-    | TernaryOp (cond, l12, l22) :: TernaryOp (cond', l11, l21) :: stack
-      when cond == cond' ->
-        TernaryOp (cond, Load (lvalue ctx l11 l12), Load (lvalue ctx l21 l22))
-        :: stack
-    | slot :: page :: stack -> Load (lvalue ctx page slot) :: stack
-    | stack -> unexpected_stack "ref" stack)
-
-let refref ctx =
-  update_stack ctx (function
-    | slot :: page :: stack -> Void :: RefTo (lvalue ctx page slot) :: stack
-    | stack -> unexpected_stack "refref" stack)
-
-let sr_ref ctx n =
-  update_stack ctx (function
-    | slot :: page :: stack ->
-        CopyStruct (n, Load (lvalue ctx page slot)) :: stack
-    | stack -> unexpected_stack "sr_ref" stack)
-
-let sr_ref2 ctx n =
-  update_stack ctx (function
-    | expr :: stack -> CopyStruct (n, expr) :: stack
-    | stack -> unexpected_stack "sr_ref2" stack)
-
-let unary_op ctx op =
-  update_stack ctx (function
-    | v :: stack -> UnaryOp (op, v) :: stack
-    | stack -> unexpected_stack (show_instruction op) stack)
-
-let binary_op ctx op =
-  update_stack ctx (function
-    | rhs :: lhs :: stack -> BinaryOp (op, lhs, rhs) :: stack
-    | stack -> unexpected_stack (show_instruction op) stack)
-
-let lift_ternary_fatref ctx page slot =
-  match (page, slot) with
-  | TernaryOp (c, p1, p2), TernaryOp (c', s1, s2) when c == c' ->
-      TernaryOp (c, RefTo (lvalue ctx p1 s1), RefTo (lvalue ctx p2 s2))
-  | _ -> RefTo (lvalue ctx page slot)
-
-let ref_binary_op ctx op =
-  update_stack ctx (function
-    | rslot :: rpage :: lslot :: lpage :: stack ->
-        BinaryOp
-          ( op,
-            lift_ternary_fatref ctx lpage lslot,
-            lift_ternary_fatref ctx rpage rslot )
-        :: stack
-    | stack -> unexpected_stack (show_instruction op) stack)
-
-let assign_op ctx op =
-  update_stack ctx (function
-    | value :: slot :: page :: stack -> (
-        let lhs = lvalue ctx page slot in
-        match (op, lhs, slot, ctx.instructions) with
-        | ( (ASSIGN | F_ASSIGN),
-            Var (LocalPage, v),
-            Number varno',
-            { txt = POP; _ }
-            :: { txt = PUSHLOCALPAGE; _ }
-            :: { txt = PUSH varno; _ }
-            :: rest )
-          when Int32.(varno = varno')
-               && Type.is_scalar v.type_
-               && Ain.Variable.is_dummy v
-               && String.is_substring v.name ~substring:"右辺値参照化用" ->
-            ctx.instructions <- rest;
-            Void :: TempRef (v, value) :: stack
-        | _ -> AssignOp (op, lhs, value) :: stack)
-    | stack -> unexpected_stack (show_instruction op) stack)
-
-let assign_op2 ctx op =
-  update_stack ctx (function
-    | value :: Load lvalue :: stack -> AssignOp (op, lvalue, value) :: stack
-    | stack -> unexpected_stack (show_instruction op) stack)
-
-let r_assign ctx =
-  update_stack ctx (function
-    | src_slot :: src_page :: dst_slot :: dst_page :: stack ->
-        Void
-        :: AssignOp
-             ( R_ASSIGN,
-               lvalue ctx dst_page dst_slot,
-               RefTo (lvalue ctx src_page src_slot) )
-        :: stack
-    | stack -> unexpected_stack "R_ASSIGN" stack)
-
-let builtin ctx insn nr_args =
-  let args = pop_n ctx nr_args in
-  update_stack ctx (function
-    | slot :: page :: rest ->
-        Call (Builtin (insn, lvalue ctx page slot), args) :: rest
-    | stack -> unexpected_stack (show_instruction insn) (List.rev args @ stack))
-
-let builtin2 ctx insn nr_args =
-  let args = pop_n ctx nr_args in
-  update_stack ctx (function
-    | expr :: rest -> Call (Builtin2 (insn, expr), args) :: rest
-    | stack -> unexpected_stack (show_instruction insn) (List.rev args @ stack))
-
-let s_erase2 ctx =
-  match take_stack ctx with
-  | [ Number 1l; index; str ] ->
-      emit_expression ctx (Call (Builtin2 (S_ERASE2, str), [ index ]))
-  | stack -> unexpected_stack "S_ERASE2" stack
-
-let ft_assigns ctx =
-  update_stack ctx (function
-    | Number functype :: str :: slot :: page :: stack ->
-        AssignOp
-          ( PSEUDO_FT_ASSIGNS (Int32.to_int_exn functype),
-            lvalue ctx page slot,
-            str )
-        :: stack
-    | stack -> unexpected_stack "FT_ASSIGNS" stack)
-
-let c_ref ctx =
-  update_stack ctx (function
-    | i :: str :: stack -> C_Ref (str, i) :: stack
-    | stack -> unexpected_stack "C_REF" stack)
-
-let c_assign ctx =
-  update_stack ctx (function
-    | c :: i :: str :: stack -> C_Assign (str, i, c) :: stack
-    | stack -> unexpected_stack "C_ASSIGN" stack)
-
-let sr_assign ctx =
-  if Ain.ain.vers <= 1 || Ain.ain.vers >= 11 then
-    update_stack ctx (function
-      | value :: Load lvalue :: stack ->
-          AssignOp (SR_ASSIGN, lvalue, value) :: stack
-      | value :: (AssignOp (ASSIGN, Var (LocalPage, v), _) as assign) :: stack
-        when Ain.Variable.is_dummy v ->
-          AssignOp (SR_ASSIGN, Pointee assign, value) :: stack
-      | stack -> unexpected_stack "SR_ASSIGN" stack)
-  else
-    update_stack ctx (function
-      | Number _struct_id :: value :: Load lvalue :: stack ->
-          AssignOp (SR_ASSIGN, lvalue, value) :: stack
-      | stack -> unexpected_stack "SR_ASSIGN" stack)
-
-let a_alloc ctx insn =
-  match take_stack ctx with
-  | Number rank :: stack -> (
-      match List.split_n stack (Int32.to_int_exn rank) with
-      | dims, [ slot; page ] ->
-          emit_expression ctx
-            (Call (Builtin (insn, lvalue ctx page slot), List.rev dims))
-      | _ -> unexpected_stack (show_instruction insn) (Number rank :: stack))
-  | stack -> unexpected_stack (show_instruction insn) stack
-
-let objswap ctx type_ =
-  if Ain.ain.vers > 8 then
-    match take_stack ctx with
-    | [ slot2; page2; slot1; page1 ] ->
-        BinaryOp
-          ( OBJSWAP type_,
-            Load (lvalue ctx page1 slot1),
-            Load (lvalue ctx page2 slot2) )
-    | stack -> unexpected_stack "OBJSWAP" stack
-  else
-    match take_stack ctx with
-    | [ Number type_; slot2; page2; slot1; page1 ] ->
-        BinaryOp
-          ( OBJSWAP (Int32.to_int_exn type_),
-            Load (lvalue ctx page1 slot1),
-            Load (lvalue ctx page2 slot2) )
-    | stack -> unexpected_stack "OBJSWAP" stack
-
-let incdec ctx op =
-  let consume_localref varno =
-    match ctx.instructions with
-    | { txt = PUSHLOCALPAGE; _ }
-      :: { txt = PUSH varno'; _ }
-      :: { txt = REF; _ }
-      :: rest
-      when Int32.equal varno varno' ->
-        ctx.instructions <- rest;
-        true
-    | _ -> false
-  in
-  update_stack ctx (function
-    | slot :: page :: slot' :: page' :: stack'
-      when phys_equal page page' && phys_equal slot slot' ->
-        Void :: Load (IncDec (Prefix, op, lvalue ctx page slot)) :: stack'
-    (* Stack structure after the post-increment sequence (DUP2, REF, DUP_X2, POP, INC) *)
-    | Number slot :: Page page :: Load (Var (_, var) as lval) :: stack'
-      when phys_equal var (varref ctx page (Int32.to_int_exn slot)) ->
-        Load (IncDec (Postfix, op, lval)) :: stack'
-    | slot1 :: obj1 :: Load (Slot (obj2, slot2) as operand) :: stack'
-      when phys_equal obj1 obj2 && phys_equal slot1 slot2 ->
-        Load (IncDec (Postfix, op, operand)) :: stack'
-    | Void :: RefTo lval :: Load (Pointee (Load lval')) :: stack'
-      when phys_equal lval lval' ->
-        Load (IncDec (Postfix, op, lval)) :: stack'
-    (* index variable of foreach statement. `.LOCALINC var; .LOCALREF var` *)
-    | [ Number slot; Page LocalPage ] when consume_localref slot ->
-        [
-          Load
-            (IncDec (Prefix, op, page_var ctx LocalPage (Int32.to_int_exn slot)));
-        ]
-    | stack -> unexpected_stack (show_incdec_op op) stack)
-
-let pop_args ctx vartypes =
-  let rec aux acc (vartypes : Ain.type_t list) =
-    match vartypes with
-    | [] -> acc
-    | Void :: ts -> aux acc ts
-    | t :: ts when Type.is_fat_reference t ->
-        let page, slot = pop2 ctx in
-        aux (ref_value ctx page slot :: acc) ts
-    | IFace _ :: ts ->
-        let obj, vofs = pop2 ctx in
-        aux (interface_value obj vofs :: acc) ts
-    | (HllFunc | HllFunc2) :: ts ->
-        let obj, func = pop2 ctx in
-        aux (delegate_value ctx obj func :: acc) ts
-    | _ :: ts ->
-        let arg = pop ctx in
-        aux (arg :: acc) ts
-  in
-  aux [] (List.rev vartypes)
-
-let new_ ctx struc func =
-  if Ain.ain.vers < 11 then
-    update_stack ctx (function
-      | Number struc :: stack ->
-          New { struc = Int32.to_int_exn struc; func = -1; args = [] } :: stack
-      | stack -> unexpected_stack "NEW" stack)
-  else if func = -1 then push ctx (New { struc; func = -1; args = [] })
-  else
-    let f = Ain.ain.func.(func) in
-    let args = pop_args ctx (Ain.Function.arg_types f) in
-    push ctx (New { struc; func; args })
-
-let rec reshape_args ctx (vartypes : Ain.type_t list) args =
-  match (vartypes, args) with
-  | [], [] -> []
-  | _ :: Void :: ts, page :: slot :: args ->
-      ref_value ctx page slot :: reshape_args ctx ts args
-  | _ :: ts, arg :: args -> arg :: reshape_args ctx ts args
-  | _ -> failwith "reshape_args: argument count mismatch"
-
-let determine_functype ctx = function
-  | -1l ->
-      let functype_name =
-        match ctx.func.name with
-        | "SP_SELECT" -> "select_callback_t"
-        | "message" ->
-            if Ain.ain.vers <= 5 then "sact_message_callback_t" else "FTMessage"
-        | "tagScrollBar@scroll" -> "ftScrollCallback"
-        | "tagScrollBar@checkWheel" -> "ftWheelCallback"
-        | "tagBattleScroll@scroll" -> "ftScrollCallback"
-        | "T_ScrollBar@scroll" -> "ftScrollCallback"
-        | "T_ScrollBar@checkWheel" -> "ftWheelCallback"
-        | "T_DragMouse@run" -> "ftDropCallback"
-        | "T_DragMouse@setPos" -> "ftDragCallback"
-        | "SYS_CallShowMessageWindowCallbackFuncList" ->
-            "FTShowMessageWindowCallback"
-        | "CMessageTextView@_DrawChar" -> "FTDrawMessageChar"
-        | _ -> failwith ("Cannot determine functype in " ^ ctx.func.name)
-      in
-      Array.find_exn Ain.ain.fnct ~f:(fun f ->
-          String.equal f.name functype_name)
-  | n -> Ain.ain.fnct.(Int32.to_int_exn n)
-
-let sh_apushback_localsref ctx page slot local =
-  Call
-    ( Builtin (A_PUSHBACK, page_var ctx page slot),
-      [ Load (page_var ctx LocalPage local) ] )
-
-let sh_sassign_sref ctx page slot =
-  match take_stack ctx with
-  | [ Load lval ] -> AssignOp (S_ASSIGN, lval, Load (page_var ctx page slot))
-  | stack -> unexpected_stack "sh_sassign_sref" stack
-
-let sh_sref_ne_str0 ctx page slot strno =
-  push ctx
-    (BinaryOp
-       (S_NOTE, Load (page_var ctx page slot), String Ain.ain.str0.(strno)))
-
-let is_null_in_this_branch ctx expr =
-  List.exists ctx.condition ~f:(function
-    | BinaryOp (EQUALE, (Option e | e), Number -1l) -> (
-        contains_expr expr e
-        || match e with Load l -> contains_expr expr (RefTo l) | _ -> false)
-    | _ -> false)
-
-let push_call_result ctx (return_type : Ain.type_t) e =
-  match return_type with
-  | Void -> emit_expression ctx e
-  | Option _ -> pushl ctx [ e; Option e ]
-  | t when Type.is_fat t -> pushl ctx [ e; Void ]
-  | _ -> push ctx e
-
-let x_icast ctx struc =
-  let obj = pop ctx in
-  let e = InterfaceCast (struc, obj) in
-  pushl ctx [ e; Void; Option e ]
-
-let array_literal expr =
-  let rec unfold args = function
-    | Call (HllFunc ("Array", { name = "PushBack"; _ }), [ e; arg ]) ->
-        unfold (arg :: args) e
-    | Call (HllFunc ("Array", { name = "Free"; _ }), [ Load lval ]) ->
-        AssignOp (PSEUDO_ARRAY_ASSIGN, lval, ArrayLiteral args)
-    | e ->
-        Printf.failwithf "array_literal: unexpected expression %s" (show_expr e)
-          ()
-  in
-  unfold [] expr
-
-let ain11_callmethod ctx nr_args =
-  let args = pop_n ctx nr_args in
-  let obj, func_expr = pop2 ctx in
-  let func =
-    match func_expr with
-    | Number fid -> Ain.ain.func.(Int32.to_int_exn fid)
-    | Load (Slot (_, BinaryOp (ADD, (Number 0l | Void), Number index))) ->
-        resolve_method ctx obj (Int32.to_int_exn index)
-    | _ -> unexpected_stack "CALLMETHOD" (func_expr :: obj :: ctx.stack)
-  in
-  let e =
-    Call
-      (Method (obj, func), reshape_args ctx (Ain.Function.arg_types func) args)
-  in
-  match (func, ctx.stack) with
-  | { kind = Setter prop; _ }, Number 0l :: obj' :: stack when obj == obj' -> (
-      match (ctx.instructions, List.hd_exn args) with
-      | ( { txt = POP; _ }
-          :: { txt = PUSH fid; _ }
-          :: { txt = CALLMETHOD 0; _ }
-          :: insns,
-          BinaryOp
-            ( insn,
-              Call (Method (obj', { id = fid'; kind = Getter prop'; _ }), []),
-              rhs ) )
-        when obj == obj'
-             && Int32.to_int_exn fid = fid'
-             && String.equal prop prop' ->
-          ctx.instructions <- insns;
-          ctx.stack <- stack;
-          let op = Instructions.to_assign_op insn in
-          push ctx (PropertySet { obj; op; func; rhs })
-      | _ -> emit_expression ctx e)
-  | { kind = Setter _; _ }, e :: stack when e == List.hd_exn args ->
-      ctx.stack <- stack;
-      push ctx (PropertySet { obj; op = ASSIGN; func; rhs = List.hd_exn args })
-  | { return_type = Void; _ }, _ -> emit_expression ctx e
-  | _, _ -> push_call_result ctx func.return_type e
-
-(* Analyzes a basic block. *)
-let analyze ctx =
-  let terminator = ref None in
-  let set_terminator term =
-    assert (List.is_empty ctx.instructions);
-    terminator :=
-      Some { txt = term; addr = ctx.address; end_addr = current_address ctx }
-  in
-  while not (List.is_empty ctx.instructions) do
-    match fetch_instruction ctx with
-    (* --- Stack Management --- *)
-    | PUSH n -> push ctx (Number n)
-    | POP | DG_POP -> (
-        match pop ctx with
-        | Void | Number _ | Page _
-        | BinaryOp (MUL, _, Number 2l) (* index to interface array *)
-        | TernaryOp (_, (Void | Number _), (Void | Number _))
-        | Load (Var _)
-        | RefTo (Var _)
-        | Option _ ->
-            (* Can be discarded safely *) ()
-        | AssignOp
-            ( ASSIGN,
-              Var (LocalPage, { type_ = Struct _ | Ref _ | IFace _; _ }),
-              Number -1l )
-          when Ain.ain.vers >= 12 ->
-            (* .LOCALDELETE, ignore *) ()
-        | e when is_null_in_this_branch ctx e -> ()
-        | e when List.is_empty ctx.stack -> emit_expression ctx e
-        | (AssignOp _ | Call _) as e ->
-            (* Occurs during assignment to a reference *)
-            emit_statement ctx (Expression e)
-        | e -> unexpected_stack "POP" (e :: ctx.stack))
-    | DELETE -> (
-        match pop ctx with
-        | Load (Var _ | Slot _ | Pointee _)
-        | RefTo (Var _ | Slot _ | Pointee _)
-        | BoundMethod _ ->
-            ()
-        | e when is_null_in_this_branch ctx e -> ()
-        | e when List.is_empty ctx.stack -> emit_expression ctx e
-        | e -> unexpected_stack "DELETE" (e :: ctx.stack))
-    | SP_INC -> (
-        match pop ctx with
-        | AssignOp _ as e when List.is_empty ctx.stack -> emit_expression ctx e
-        | _ -> () (* reference counting is implicit *))
-    | CHECKUDO -> (
-        match pop ctx with
-        | Load (Var (LocalPage, _)) -> ()
-        | e -> unexpected_stack "CHECKUDO" (e :: ctx.stack))
-    | F_PUSH f -> push ctx (Float f)
-    | REF -> ref_ ctx
-    | REFREF -> refref ctx
-    | DUP ->
-        update_stack ctx (function
-          | x :: stack -> x :: x :: stack
-          | stack -> unexpected_stack "DUP" stack)
-    | DUP2 ->
-        update_stack ctx (function
-          | a :: b :: stack -> a :: b :: a :: b :: stack
-          | stack -> unexpected_stack "DUP2" stack)
-    | DUP_X2 -> (
-        match List.hd ctx.instructions with
-        | Some { txt = POP; _ } ->
-            fetch_instruction ctx |> ignore;
-            update_stack ctx (function
-              | a :: b :: c :: stack -> b :: c :: a :: stack
-              | stack -> unexpected_stack "DUP_X2; POP" stack)
-        | _ ->
-            update_stack ctx (function
-              | a :: b :: c :: stack -> a :: b :: c :: a :: stack
-              | stack -> unexpected_stack "DUP_X2" stack))
-    | DUP2_X1 ->
-        update_stack ctx (function
-          | a :: b :: c :: stack -> a :: b :: c :: a :: b :: stack
-          | stack -> unexpected_stack "DUP2_X1" stack)
-    | DUP_U2 ->
-        update_stack ctx (function
-          | a :: b :: stack -> b :: a :: b :: stack
-          | stack -> unexpected_stack "DUP_U2" stack)
-    | SWAP ->
-        update_stack ctx (function
-          | a :: b :: stack -> b :: a :: stack
-          | stack -> unexpected_stack "SWAP" stack)
-    (* --- Variables --- *)
-    | PUSHGLOBALPAGE -> push ctx (Page GlobalPage)
-    | PUSHLOCALPAGE -> push ctx (Page LocalPage)
-    | PUSHSTRUCTPAGE -> push ctx (Page StructPage)
-    | X_GETENV -> (
-        match pop ctx with
-        | Page (ParentPage level) -> push ctx (Page (ParentPage (level + 1)))
-        | Page LocalPage -> push ctx (Page (ParentPage 0))
-        | e -> unexpected_stack "X_GETENV" (e :: ctx.stack))
-    | (S_ASSIGN | DG_ASSIGN) as op -> assign_op2 ctx op
-    | SH_GLOBALREF n -> push ctx (Load (page_var ctx GlobalPage n))
-    | SH_LOCALREF n -> push ctx (Load (page_var ctx LocalPage n))
-    | SH_STRUCTREF n -> push ctx (Load (page_var ctx StructPage n))
-    | SH_LOCALASSIGN (var, value) ->
-        emit_expression ctx
-          (AssignOp (ASSIGN, Var (LocalPage, ctx.func.vars.(var)), Number value))
-    | SH_LOCALINC var ->
-        emit_expression ctx
-          (Load
-             (IncDec (Prefix, Increment, Var (LocalPage, ctx.func.vars.(var)))))
-    | SH_LOCALDEC var ->
-        emit_expression ctx
-          (Load
-             (IncDec (Prefix, Decrement, Var (LocalPage, ctx.func.vars.(var)))))
-    | SH_LOCALDELETE _slot -> (* ignore *) ()
-    | SH_LOCALCREATE (var, _struct) ->
-        assert_stack_empty ctx;
-        emit_statement ctx (VarDecl (ctx.func.vars.(var), None))
-    | R_ASSIGN -> r_assign ctx
-    | NEW (struc, func) -> new_ ctx struc func
-    | OBJSWAP type_ -> emit_expression ctx (objswap ctx type_)
-    (* --- Control Flow --- *)
-    | CALLFUNC n ->
-        let func = Ain.ain.func.(n) in
-        let args = pop_args ctx (Ain.Function.arg_types func) in
-        push_call_result ctx func.return_type (Call (Function func, args))
-    | CALLFUNC2 -> (
-        match pop2 ctx with
-        | func, Number fnct ->
-            let functype = determine_functype ctx fnct in
-            let args = pop_args ctx (Ain.FuncType.arg_types functype) in
-            let e = Call (FuncPtr (functype, func), args) in
-            push_call_result ctx functype.return_type e
-        | a, b -> unexpected_stack "CALLFUNC2" (a :: b :: ctx.stack))
-    | PSEUDO_DG_CALL n ->
-        let dg_type = Ain.ain.delg.(n) in
-        let args = pop_args ctx (Ain.FuncType.arg_types dg_type) in
-        let delg = pop ctx in
-        push_call_result ctx dg_type.return_type
-          (Call (Delegate (dg_type, delg), args))
-    | CALLMETHOD n ->
-        if Ain.ain.vers >= 11 then ain11_callmethod ctx n
-        else
-          let func = Ain.ain.func.(n) in
-          let args = pop_args ctx (Ain.Function.arg_types func) in
-          let this = pop ctx in
-          let e = Call (Method (this, func), args) in
-          push_call_result ctx func.return_type e
-    | CALLHLL (lib_id, func_id, type_param) -> (
-        let lib = Ain.ain.hll0.(lib_id) in
-        let func = lib.functions.(func_id) in
-        let args =
-          pop_args ctx
-            (Ain.HLL.arg_types func
-            |> List.map ~f:(Type.replace_hll_param type_param))
-        in
-        let e = Call (HllFunc (lib.name, func), args) in
-        match (lib.name, func.name, ctx.stack) with
-        | "Array", ("Free" | "PushBack"), array :: stack
-          when List.hd_exn args == array -> (
-            match ctx.instructions with
-            | { txt = DUP; _ } :: { txt = SP_INC; _ } :: _ ->
-                ctx.stack <- array_literal e :: stack
-            | { txt = DUP; _ } :: _ -> ctx.stack <- e :: stack
-            | _ -> ctx.stack <- array_literal e :: stack)
-        | _ ->
-            push_call_result ctx
-              (Type.replace_hll_param type_param func.return_type)
-              e)
-    | RETURN -> (
-        match (ctx.func.return_type, take_stack ctx) with
-        | Void, [] -> emit_statement ctx (Return None)
-        | _, [ v ] -> emit_statement ctx (Return (Some v))
-        | t, [ slot; obj ] when Type.is_fat_reference t ->
-            emit_statement ctx
-              (Return (Some (lift_ternary_fatref ctx obj slot)))
-        | IFace _, [ vofs; obj ] ->
-            emit_statement ctx (Return (Some (interface_value obj vofs)))
-        | _, stack -> unexpected_stack "RETURN" stack)
-    | CALLSYS n ->
-        let syscall = syscalls.(n) in
-        let args = pop_args ctx syscall.arg_types in
-        let e = Call (SysCall n, args) in
-        push_call_result ctx syscall.return_type e
-    | CALLONJUMP -> ()
-    | SJUMP -> (
-        match take_stack ctx with
-        | [ String s ] -> emit_statement ctx (ScenarioJump s)
-        | stack -> unexpected_stack "SJUMP" stack)
-    | MSG n ->
-        assert_stack_empty ctx;
-        emit_statement ctx (Msg (Ain.ain.msg.(n), None))
-    | JUMP addr -> set_terminator (Jump addr)
-    | IFZ addr -> set_terminator (Branch (addr, pop ctx))
-    | IFNZ addr -> set_terminator (Branch (addr, negate (pop ctx)))
-    | SH_IF_LOC_LT_IMM (local, imm, addr) ->
-        let e =
-          BinaryOp (GTE, Load (page_var ctx LocalPage local), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_LOC_GT_IMM (local, imm, addr) ->
-        let e =
-          BinaryOp (LTE, Load (page_var ctx LocalPage local), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_LOC_GE_IMM (local, imm, addr) ->
-        let e =
-          BinaryOp (LT, Load (page_var ctx LocalPage local), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_LOC_NE_IMM (local, imm, addr) ->
-        let e =
-          BinaryOp (EQUALE, Load (page_var ctx LocalPage local), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_STRUCTREF_Z (memb, addr) ->
-        let e =
-          BinaryOp (NOTE, Load (page_var ctx StructPage memb), Number 0l)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_STRUCT_A_NOT_EMPTY (memb, addr) ->
-        let e = Call (Builtin (A_EMPTY, page_var ctx StructPage memb), []) in
-        set_terminator (Branch (addr, e))
-    | SH_IF_SREF_NE_STR0 (strno, addr) ->
-        update_stack ctx (function
-          | slot :: page :: stack ->
-              BinaryOp
-                ( S_EQUALE,
-                  Load (lvalue ctx page slot),
-                  String Ain.ain.str0.(strno) )
-              :: stack
-          | stack -> unexpected_stack "SH_IF_SREF_NE_STR0" stack);
-        set_terminator (Branch (addr, pop ctx))
-    | SH_IF_STRUCTREF_GT_IMM (memb, imm, addr) ->
-        let e =
-          BinaryOp (LTE, Load (page_var ctx StructPage memb), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_STRUCTREF_NE_IMM (memb, imm, addr) ->
-        let e =
-          BinaryOp (EQUALE, Load (page_var ctx StructPage memb), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_STRUCTREF_EQ_IMM (memb, imm, addr) ->
-        let e =
-          BinaryOp (NOTE, Load (page_var ctx StructPage memb), Number imm)
-        in
-        set_terminator (Branch (addr, e))
-    | SH_IF_STRUCTREF_NE_LOCALREF (memb, local, addr) ->
-        let e =
-          BinaryOp
-            ( EQUALE,
-              Load (page_var ctx StructPage memb),
-              Load (page_var ctx LocalPage local) )
-        in
-        set_terminator (Branch (addr, e))
-    | SWITCH id -> set_terminator (Switch0 (id, pop ctx))
-    | STRSWITCH id -> set_terminator (Switch0 (id, pop ctx))
-    | ASSERT -> (
-        match take_stack ctx with
-        | [ _line; _file; _expr; expr ] -> emit_statement ctx (Assert expr)
-        | stack -> unexpected_stack "ASSERT" stack)
-    (* --- Arithmetic --- *)
-    | (INV | NOT | COMPL | ITOB | ITOF | ITOLI | FTOI | F_INV | I_STRING | STOI)
-      as op ->
-        unary_op ctx op
-    | ( ADD | SUB | MUL | DIV | MOD | LT | GT | LTE | GTE | NOTE | EQUALE | AND
-      | OR | XOR | LSHIFT | RSHIFT | F_ADD | F_SUB | F_MUL | F_DIV | F_LT | F_GT
-      | F_LTE | F_GTE | F_EQUALE | F_NOTE | LI_ADD | LI_SUB | LI_MUL | LI_DIV
-      | LI_MOD | S_PLUSA | S_PLUSA2 | S_ADD | S_LT | S_GT | S_LTE | S_GTE
-      | S_NOTE | S_EQUALE | DG_PLUSA | DG_MINUSA | PSEUDO_NULL_COALESCE ) as op
-      ->
-        binary_op ctx op
-    | ( ASSIGN | F_ASSIGN | LI_ASSIGN | PLUSA | MINUSA | MULA | DIVA | MODA
-      | ANDA | ORA | XORA | LSHIFTA | RSHIFTA | F_PLUSA | F_MINUSA | F_MULA
-      | F_DIVA | LI_PLUSA | LI_MINUSA | LI_MULA | LI_DIVA | LI_MODA | LI_ANDA
-      | LI_ORA | LI_XORA | LI_LSHIFTA | LI_RSHIFTA ) as op ->
-        assign_op ctx op
-    | INC | LI_INC -> incdec ctx Increment
-    | DEC | LI_DEC -> incdec ctx Decrement
-    | (R_EQUALE | R_NOTE) as op -> ref_binary_op ctx op
-    (* --- Strings --- *)
-    | S_PUSH n ->
-        let tbl = if Ain.ain.vers = 0 then Ain.ain.msg else Ain.ain.str0 in
-        push ctx (String tbl.(n))
-    | S_POP -> emit_expression ctx (pop ctx)
-    | S_REF -> ref_ ctx
-    | S_MOD t ->
-        let t =
-          if Ain.ain.vers <= 8 then
-            match pop ctx with
-            | Number t -> Int32.to_int_exn t
-            | e ->
-                Printf.failwithf "S_MOD: unexpected argument %s" (show_expr e)
-                  ()
-          else t
-        in
-        binary_op ctx (S_MOD t)
-    | S_LENGTH -> builtin ctx S_LENGTH 0
-    | S_LENGTH2 -> builtin2 ctx S_LENGTH2 0
-    | S_LENGTHBYTE -> builtin ctx S_LENGTHBYTE 0
-    | S_EMPTY -> builtin2 ctx S_EMPTY 0
-    | S_FIND -> builtin2 ctx S_FIND 1
-    | S_GETPART -> builtin2 ctx S_GETPART 2
-    | S_PUSHBACK2 ->
-        builtin2 ctx S_PUSHBACK2 1;
-        emit_expression ctx (pop ctx)
-    | S_POPBACK2 ->
-        builtin2 ctx S_POPBACK2 0;
-        emit_expression ctx (pop ctx)
-    | S_ERASE2 -> s_erase2 ctx
-    | FTOS -> builtin2 ctx FTOS 1
-    | FT_ASSIGNS -> ft_assigns ctx
-    | C_REF -> c_ref ctx
-    | C_ASSIGN -> c_assign ctx
-    (* --- Structs --- *)
-    | SR_REF struct_id -> sr_ref ctx struct_id
-    | SR_REF2 struct_id -> sr_ref2 ctx struct_id
-    | SR_POP -> emit_expression ctx (pop ctx)
-    | SR_ASSIGN -> sr_assign ctx
-    (* --- Arrays --- *)
-    | A_NUMOF -> builtin ctx A_NUMOF 1
-    | A_ALLOC -> a_alloc ctx A_ALLOC
-    | A_REALLOC -> a_alloc ctx A_REALLOC
-    | A_FREE ->
-        builtin ctx A_FREE 0;
-        emit_expression ctx (pop ctx)
-    | A_REF -> ()
-    | A_EMPTY -> builtin ctx A_EMPTY 0
-    | A_COPY -> builtin ctx A_COPY 4
-    | A_FILL -> builtin ctx A_FILL 3
-    | A_PUSHBACK ->
-        builtin ctx A_PUSHBACK 1;
-        emit_expression ctx (pop ctx)
-    | A_POPBACK ->
-        builtin ctx A_POPBACK 0;
-        emit_expression ctx (pop ctx)
-    | A_INSERT ->
-        builtin ctx A_INSERT 2;
-        emit_expression ctx (pop ctx)
-    | A_ERASE -> builtin ctx A_ERASE 1
-    | A_SORT ->
-        if Ain.ain.vers >= 8 then convert_stack_top_to_delegate ctx;
-        builtin ctx A_SORT 1;
-        emit_expression ctx (pop ctx)
-    | A_SORT_MEM ->
-        builtin ctx A_SORT_MEM 1;
-        emit_expression ctx (pop ctx)
-    | A_FIND ->
-        if Ain.ain.vers >= 8 then convert_stack_top_to_delegate ctx;
-        builtin ctx A_FIND 4
-    | A_REVERSE ->
-        builtin ctx A_REVERSE 0;
-        emit_expression ctx (pop ctx)
-    | SH_SR_ASSIGN -> (
-        match take_stack ctx with
-        | [ slot; page; Load lval ] ->
-            emit_expression ctx
-              (AssignOp (SR_ASSIGN, lval, Load (lvalue ctx page slot)))
-        | stack -> unexpected_stack "SH_SR_ASSIGN" stack)
-    | SH_MEM_ASSIGN_LOCAL (memb, local) ->
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               Var (StructPage, (Option.value_exn ctx.struc).members.(memb)),
-               Load (page_var ctx LocalPage local) ))
-    | A_NUMOF_GLOB_1 var ->
-        push ctx
-          (Call (Builtin (A_NUMOF, page_var ctx GlobalPage var), [ Number 1l ]))
-    | A_NUMOF_STRUCT_1 var ->
-        push ctx
-          (Call (Builtin (A_NUMOF, page_var ctx StructPage var), [ Number 1l ]))
-    | X_SET ->
-        let src = pop ctx in
-        update_stack ctx (function
-          | Load lval :: rest -> AssignOp (X_SET, lval, src) :: rest
-          | stack -> unexpected_stack "X_SET" (src :: stack))
-    | DG_COPY -> ()
-    | DG_NEW -> push ctx Null
-    | DG_CLEAR ->
-        builtin2 ctx DG_CLEAR 0;
-        emit_expression ctx (pop ctx)
-    | DG_NUMOF -> builtin2 ctx DG_NUMOF 0
-    | DG_NEW_FROM_METHOD -> convert_stack_top_to_delegate ctx
-    | (DG_SET | DG_ADD) as op -> (
-        match take_stack ctx with
-        | [ func; obj; Load lvalue ] ->
-            emit_expression ctx
-              (AssignOp (op, lvalue, delegate_value ctx obj func))
-        | stack -> unexpected_stack (show_instruction op) stack)
-    | DG_ERASE -> (
-        match take_stack ctx with
-        | [ func; obj; Load lvalue ] ->
-            emit_expression ctx
-              (Call (Builtin (DG_ERASE, lvalue), [ delegate_value ctx obj func ]))
-        | stack -> unexpected_stack "DG_ERASE" stack)
-    | DG_EXIST ->
-        update_stack ctx (function
-          | Number func_no :: obj :: delg :: stack ->
-              let arg =
-                BoundMethod (obj, Ain.ain.func.(Int32.to_int_exn func_no))
-              in
-              Call (Builtin2 (DG_EXIST, delg), [ arg ]) :: stack
-          | stack -> unexpected_stack "DG_EXIST" stack)
-    | DG_STR_TO_METHOD dg_type ->
-        if Ain.ain.vers > 8 then
-          update_stack ctx (function
-            | str :: stack -> DelegateCast (str, dg_type) :: stack
-            | stack -> unexpected_stack "DG_STR_TO_METHOD" stack)
-        else
-          update_stack ctx (function
-            | Number dg_type :: str :: stack ->
-                DelegateCast (str, Int32.to_int_exn dg_type) :: stack
-            | stack -> unexpected_stack "DG_STR_TO_METHOD" stack)
-    | SH_MEM_ASSIGN_IMM (slot, value) ->
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               Var (StructPage, (Option.value_exn ctx.struc).members.(slot)),
-               Number value ))
-    | SH_LOCALREFREF var ->
-        pushl ctx [ RefTo (page_var ctx LocalPage var); Void ]
-    | SH_LOCALASSIGN_SUB_IMM (local, imm) ->
-        emit_expression ctx
-          (AssignOp (MINUSA, page_var ctx LocalPage local, Number imm))
-    | SH_LOCREF_ASSIGN_MEM (local, memb) ->
-        assert_stack_empty ctx;
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               Pointee (Load (page_var ctx LocalPage local)),
-               Load (page_var ctx StructPage memb) ))
-    | PAGE_REF slot ->
-        push ctx (Number slot);
-        ref_ ctx
-    | SH_GLOBAL_ASSIGN_LOCAL (glob, local) ->
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               page_var ctx GlobalPage glob,
-               Load (page_var ctx LocalPage local) ))
-    | SH_LOCAL_ASSIGN_STRUCTREF (local, memb) ->
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               page_var ctx LocalPage local,
-               Load (page_var ctx StructPage memb) ))
-    | SH_STRUCTREF_CALLMETHOD_NO_PARAM (memb, func) ->
-        let func = Ain.ain.func.(func) in
-        let e = Call (Method (Load (page_var ctx StructPage memb), func), []) in
-        push_call_result ctx func.return_type e
-    | SH_STRUCTREF2 (memb, slot) ->
-        push ctx
-          (Load (lvalue ctx (Load (page_var ctx StructPage memb)) (Number slot)))
-    | SH_REF_LOCAL_ASSIGN_STRUCTREF2 (memb, ref_local, slot) ->
-        let rhs =
-          Load (lvalue ctx (Load (page_var ctx StructPage memb)) (Number slot))
-        in
-        emit_expression ctx
-          (AssignOp
-             (ASSIGN, Pointee (Load (page_var ctx LocalPage ref_local)), rhs))
-    | SH_REF_STRUCTREF2 (slot1, slot2) ->
-        update_stack ctx (function
-          | page :: stack' ->
-              let e = Load (lvalue ctx page (Number slot1)) in
-              let e = Load (lvalue ctx e (Number slot2)) in
-              e :: stack'
-          | stack -> unexpected_stack "SH_REF_STRUCTREF2" stack)
-    | SH_STRUCTREF3 (memb, slot1, slot2) ->
-        let e = Load (page_var ctx StructPage memb) in
-        let e = Load (lvalue ctx e (Number slot1)) in
-        let e = Load (lvalue ctx e (Number slot2)) in
-        push ctx e
-    | SH_STRUCTREF2_CALLMETHOD_NO_PARAM (memb, slot, func) ->
-        let func = Ain.ain.func.(func) in
-        let lhs =
-          lvalue ctx (Load (page_var ctx StructPage memb)) (Number slot)
-        in
-        let e = Call (Method (Load lhs, func), []) in
-        push_call_result ctx func.return_type e
-    | THISCALLMETHOD_NOPARAM n ->
-        let func = Ain.ain.func.(n) in
-        let e = Call (Method (Page StructPage, func), []) in
-        push_call_result ctx func.return_type e
-    | SH_GLOBAL_ASSIGN_IMM (var, value) ->
-        let e = AssignOp (ASSIGN, page_var ctx GlobalPage var, Number value) in
-        emit_expression ctx e
-    | SH_LOCALSTRUCT_ASSIGN_IMM (local, slot, imm) ->
-        let e = Load (page_var ctx LocalPage local) in
-        let e = AssignOp (ASSIGN, lvalue ctx e (Number slot), Number imm) in
-        emit_expression ctx e
-    | SH_STRUCT_A_PUSHBACK_LOCAL_STRUCT (memb, local) ->
-        emit_expression ctx
-          (Call
-             ( Builtin (A_PUSHBACK, page_var ctx StructPage memb),
-               [ sh_local_struct_arg ctx local ] ))
-    | SH_GLOBAL_A_PUSHBACK_LOCAL_STRUCT (glob, local) ->
-        emit_expression ctx
-          (Call
-             ( Builtin (A_PUSHBACK, page_var ctx GlobalPage glob),
-               [ sh_local_struct_arg ctx local ] ))
-    | SH_LOCAL_A_PUSHBACK_LOCAL_STRUCT (arrayvar, structvar) ->
-        emit_expression ctx
-          (Call
-             ( Builtin (A_PUSHBACK, page_var ctx LocalPage arrayvar),
-               [ sh_local_struct_arg ctx structvar ] ))
-    | SH_S_ASSIGN_REF -> (
-        match take_stack ctx with
-        | [ slot; page; Load lval ] ->
-            let e = AssignOp (S_ASSIGN, lval, Load (lvalue ctx page slot)) in
-            emit_expression ctx e
-        | stack -> unexpected_stack "SH_S_ASSIGN_REF" stack)
-    | SH_A_FIND_SREF ->
-        update_stack ctx (function
-          | slot :: page :: stack ->
-              Number 0l :: Load (lvalue ctx page slot) :: stack
-          | stack -> unexpected_stack "SH_A_FIND_SREF" stack);
-        builtin ctx A_FIND 4
-    | SH_SREF_EMPTY -> builtin ctx S_EMPTY 0
-    | SH_STRUCTSREF_EQ_LOCALSREF (memb, local) ->
-        push ctx
-          (BinaryOp
-             ( S_EQUALE,
-               Load (page_var ctx StructPage memb),
-               Load (page_var ctx LocalPage local) ))
-    | SH_STRUCTSREF_NE_LOCALSREF (memb, local) ->
-        push ctx
-          (BinaryOp
-             ( S_NOTE,
-               Load (page_var ctx StructPage memb),
-               Load (page_var ctx LocalPage local) ))
-    | SH_LOCALSREF_EQ_STR0 (local, strno) ->
-        push ctx
-          (BinaryOp
-             ( S_EQUALE,
-               Load (page_var ctx LocalPage local),
-               String Ain.ain.str0.(strno) ))
-    | SH_LOCALSREF_NE_STR0 (local, strno) ->
-        sh_sref_ne_str0 ctx LocalPage local strno
-    | SH_STRUCTSREF_NE_STR0 (memb, strno) ->
-        sh_sref_ne_str0 ctx StructPage memb strno
-    | SH_GLOBALSREF_NE_STR0 (glob, strno) ->
-        sh_sref_ne_str0 ctx GlobalPage glob strno
-    | SH_STRUCTREF_GT_IMM (memb, imm) ->
-        push ctx
-          (BinaryOp (GT, Load (page_var ctx StructPage memb), Number imm))
-    | SH_STRUCT_ASSIGN_LOCALREF_ITOB (memb, local) ->
-        emit_expression ctx
-          (AssignOp
-             ( ASSIGN,
-               page_var ctx StructPage memb,
-               UnaryOp (ITOB, Load (page_var ctx LocalPage local)) ))
-    | SH_STRUCT_SR_REF (memb, struc) ->
-        push ctx (CopyStruct (struc, Load (page_var ctx StructPage memb)))
-    | SH_STRUCT_S_REF slot -> push ctx (Load (page_var ctx StructPage slot))
-    | S_REF2 slot ->
-        push ctx (Number slot);
-        ref_ ctx
-    | SH_GLOBAL_S_REF var -> push ctx (Load (page_var ctx GlobalPage var))
-    | SH_LOCAL_S_REF var -> push ctx (Load (page_var ctx LocalPage var))
-    | SH_LOCALREF_SASSIGN_LOCALSREF (lvar, rvar) ->
-        emit_expression ctx
-          (AssignOp
-             ( S_ASSIGN,
-               page_var ctx LocalPage lvar,
-               Load (page_var ctx LocalPage rvar) ))
-    | SH_LOCAL_APUSHBACK_LOCALSREF (arrayvar, strvar) ->
-        emit_expression ctx
-          (sh_apushback_localsref ctx LocalPage arrayvar strvar)
-    | SH_GLOBAL_APUSHBACK_LOCALSREF (glob, local) ->
-        emit_expression ctx (sh_apushback_localsref ctx GlobalPage glob local)
-    | SH_STRUCT_APUSHBACK_LOCALSREF (memb, local) ->
-        emit_expression ctx (sh_apushback_localsref ctx StructPage memb local)
-    | SH_S_ASSIGN_CALLSYS19 -> (
-        match take_stack ctx with
-        | [ expr; Load lval ] ->
-            emit_expression ctx
-              (AssignOp (S_ASSIGN, lval, Call (SysCall 19, [ expr ])))
-        | stack -> unexpected_stack "SH_S_ASSIGN_CALLSYS19" stack)
-    | SH_S_ASSIGN_STR0 n -> (
-        match take_stack ctx with
-        | [ Load lval ] ->
-            emit_expression ctx
-              (AssignOp (S_ASSIGN, lval, String Ain.ain.str0.(n)))
-        | stack -> unexpected_stack "SH_S_ASSIGN_STR0" stack)
-    | SH_SASSIGN_LOCALSREF local ->
-        emit_expression ctx (sh_sassign_sref ctx LocalPage local)
-    | SH_SASSIGN_STRUCTSREF memb ->
-        emit_expression ctx (sh_sassign_sref ctx StructPage memb)
-    | SH_SASSIGN_GLOBALSREF glob ->
-        emit_expression ctx (sh_sassign_sref ctx GlobalPage glob)
-    | SH_STRUCTREF_SASSIGN_LOCALSREF (memb, local) ->
-        emit_expression ctx
-          (AssignOp
-             ( S_ASSIGN,
-               page_var ctx StructPage memb,
-               Load (page_var ctx LocalPage local) ))
-    | SH_LOCALSREF_EMPTY var ->
-        push ctx
-          (Call (Builtin2 (S_EMPTY, Load (page_var ctx LocalPage var)), []))
-    | SH_STRUCTSREF_EMPTY memb ->
-        push ctx
-          (Call (Builtin2 (S_EMPTY, Load (page_var ctx StructPage memb)), []))
-    | SH_GLOBALSREF_EMPTY var ->
-        push ctx
-          (Call (Builtin2 (S_EMPTY, Load (page_var ctx GlobalPage var)), []))
-    | SH_LOC_LT_IMM_OR_LOC_GE_IMM (local, imm1, imm2) ->
-        let v = Load (page_var ctx LocalPage local) in
-        push ctx
-          (BinaryOp
-             ( PSEUDO_LOGOR,
-               BinaryOp (LT, v, Number imm1),
-               BinaryOp (GTE, v, Number imm2) ))
-    | X_ICAST sno -> x_icast ctx sno
-    | insn ->
-        Printf.failwithf "Unknown instruction %s" (show_instruction insn) ()
-  done;
-  ( Option.value !terminator ~default:seq_terminator,
-    take_stack ctx,
-    take_stmts ctx )
-
-let add_predecessor ctx addr predecessor =
-  assert (ctx.end_address <= addr);
-  Hashtbl.add_multi ctx.predecessors ~key:addr ~data:predecessor
-
-let replace_top2_predecessors ctx addr predecessor =
-  Hashtbl.update ctx.predecessors addr ~f:(function
-    | Some (_ :: _ :: rest) -> predecessor :: rest
-    | Some _ -> Printf.failwithf "only one predecessor at address %d" addr ()
-    | None -> Printf.failwithf "no predecessors at address %d" addr ())
-
+let empty_state = BlockEval.empty_state
 let make_option = function Option _ as obj -> obj | obj -> Option obj
 let strip_option = function Option obj -> obj | obj -> obj
 
-let merge_complemental_predecessors ctx (p1 : predecessor) (p2 : predecessor) =
-  match (p1, p2) with
-  (* {obj != -1} [e1]
-     {obj == -1} [e2]
-     => [e1{obj/Option(obj)} ?? e2] *)
-  | ( { stack = e1 :: es1; _ },
-      {
-        condition =
-          BinaryOp (EQUALE, (Option obj | obj), Number -1l) :: condition;
-        stack = e2 :: es2;
-        _;
-      } )
-    when Ain.ain.vers >= 11 && es1 == es2 && p1.stmts == p2.stmts ->
+(* ---- Merge rules for null-checked forks (ain v11+ ?. and ?? operators) ----
+
+   The v11+ compiler expands obj?.member and a ?? b into a null check
+   followed by a fork:
+
+       <obj> DUP; PUSH -1; EQUALE; IFNZ Lnull
+       <evaluate member using obj>    ; leaves the value slots, if any,
+       PUSH 0                         ; and a "was not null" marker on top
+       JUMP Ljoin
+     Lnull:
+       POP; PUSH -1; ...              ; placeholders of the same depth
+     Ljoin:
+
+   so the two states reaching the join point are distinguished by their
+   most recent conditions: !(obj == -1) on the non-null path and
+   (obj == -1) on the null path. At the join, the ok path's marker and the
+   null path's top placeholder merge into the Option-typed value
+   Option(obj), and the slots below merge into the member value.
+
+   Each rule below inverts one shape of the forked code. All rules take
+     [obj]   the null-checked expression (possibly already Option-wrapped
+             by the merge of an inner ?. of a chain),
+     [conds] the conditions remaining after consuming the null check,
+     [ok]    the state of the non-null path,
+     [null]  the state of the null path,
+   and return the merged state, or None if the shape does not match. *)
+
+(* a ?? b -- both paths leave a proper value (not a placeholder):
+     ok: [a | t]   null: [b | t]
+     => [a{obj -> Option obj} ?? b | t] *)
+let null_coalesce ~obj ~conds (ok : state) (null : state) =
+  match (ok.stack, null.stack) with
+  | e1 :: es1, e2 :: es2
+    when Ain.ain.vers >= 11 && es1 == es2 && ok.stmts == null.stmts ->
+      let obj = strip_option obj in
       Some
         {
-          condition;
+          condition = conds;
           stack =
             BinaryOp (PSEUDO_NULL_COALESCE, insert_option e1 obj, e2) :: es1;
-          stmts = p1.stmts;
+          stmts = ok.stmts;
         }
-  (* {obj != -1} [e, 0]
-     {obj == -1} [-1, -1]
-     => [e, Option(obj)] *)
-  | ( { stack = Number 0l :: e :: es1; stmts; _ },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: Number -1l :: es2;
-        _;
-      } )
+  | _ -> None
+
+(* obj?.member evaluating to a value:
+     ok: [0; v | t]        null: [-1; -1 | t]        (plain value)
+     ok: [0; num; v | t]   null: [-1; -1; -1 | t]    (fat value)
+     ok: [0; Void; v | t]  null: [-1; -1; -1 | t]    (interface value)
+     => [Option obj; ... | t] *)
+let nullable_member_value ~obj ~conds (ok : state) (null : state) =
+  match (ok.stack, null.stack) with
+  | Number 0l :: e :: es1, Number -1l :: Number -1l :: es2 when es1 == es2 ->
+      Some
+        {
+          condition = conds;
+          stack = make_option obj :: e :: es1;
+          stmts = ok.stmts;
+        }
+  | ( Number 0l :: (Number _ as n) :: e :: es1,
+      Number -1l :: Number -1l :: Number -1l :: es2 )
     when es1 == es2 ->
-      Some { condition; stack = make_option obj :: e :: es1; stmts }
-  (* {obj != -1} [e, num, 0]
-     {obj == -1} [-1, -1, -1]
-     => [e, num, Option(obj)] *)
-  | ( { stack = Number 0l :: (Number _ as n) :: e :: es1; stmts; _ },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: Number -1l :: Number -1l :: es2;
-        _;
-      } )
+      Some
+        {
+          condition = conds;
+          stack = make_option obj :: n :: e :: es1;
+          stmts = ok.stmts;
+        }
+  | Number 0l :: Void :: e :: es1, Number -1l :: Number -1l :: Number -1l :: es2
     when es1 == es2 ->
-      Some { condition; stack = make_option obj :: n :: e :: es1; stmts }
-  (* expr?.iface_expr *)
-  (* {Load obj != -1} [e, Void, 0]
-     {Load obj == -1} [-1, -1, -1]
-     => [e, Void, Option(RefTo obj)] *)
-  | ( { stack = Number 0l :: Void :: e :: es1; stmts; _ },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: Number -1l :: Number -1l :: es2;
-        _;
-      } )
-    when es1 == es2 ->
+      (* Interfaces are null-checked on their loaded value, but the merged
+         expression refers to the reference itself. *)
       let obj = match obj with Load o -> RefTo o | _ -> obj in
-      Some { condition; stack = make_option obj :: Void :: e :: es1; stmts }
-  (* obj?.void_method() *)
-  (* {obj != -1} [e1] stmts=[stmt]
-     {obj == -1} [-1] stmts=[]
-     when e1 == 0 || (e1 == Option _ && e1 contains obj)
-     => [Option(obj)] stmts=[stmt{obj/Option(obj)}] *)
-  | ( {
-        stack = e1 :: es1;
-        stmts = ({ txt = Expression expr; _ } as stmt) :: stmts1;
-        _;
-      },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: es2;
-        stmts = stmts2;
-      } )
-    when es1 == es2 && stmts1 == stmts2
+      Some
+        {
+          condition = conds;
+          stack = make_option obj :: Void :: e :: es1;
+          stmts = ok.stmts;
+        }
+  | _ -> None
+
+(* obj?.member consumed within a statement -- the use of the member was
+   already emitted as a statement, but only on the ok path; rewrite it to
+   record the null check.
+     obj?.void_method():
+       ok: [0 | t] stmts = stmt :: S   null: [-1 | t] stmts = S
+       (the marker may also be an Option produced by an inner ?. merge)
+     obj?.member op= value:
+       ok: [] stmts = stmt :: S        null: [] stmts = S
+     => stmt{obj -> Option obj} *)
+let nullable_member_statement ~obj ~conds (ok : state) (null : state) =
+  match (ok.stack, ok.stmts, null.stack) with
+  | ( e1 :: es1,
+      ({ txt = Expression expr; _ } as stmt) :: stmts1,
+      Number -1l :: es2 )
+    when es1 == es2 && stmts1 == null.stmts
          &&
          match e1 with
          | Number 0l -> true
@@ -1367,327 +292,402 @@ let merge_complemental_predecessors ctx (p1 : predecessor) (p2 : predecessor) =
       let obj = strip_option obj in
       Some
         {
-          condition;
+          condition = conds;
           stack = Option obj :: es1;
           stmts =
             { stmt with txt = Expression (insert_option expr obj) } :: stmts1;
         }
-  (* obj?.expr assign_op expr; *)
-  (* {obj != -1} [] stmts=[stmt]
-     {obj == -1} [] stmts=[]
-     => [] stmts=[stmt{obj/Option(obj)}] *)
-  | ( { stack = []; stmts = ({ txt = Expression expr; _ } as stmt) :: stmts1; _ },
-      {
-        condition = BinaryOp (EQUALE, Option obj, Number -1l) :: condition;
-        stack = [];
-        stmts = stmts2;
-      } )
-    when stmts1 == stmts2 ->
+  | [], ({ txt = Expression expr; _ } as stmt) :: stmts1, []
+    when stmts1 == null.stmts -> (
+      match obj with
+      | Option obj ->
+          Some
+            {
+              condition = conds;
+              stack = [];
+              stmts =
+                { stmt with txt = Expression (insert_option expr obj) }
+                :: stmts1;
+            }
+      | _ -> None)
+  | _ -> None
+
+(* obj?.e1 ?? e2 where e2 is itself null-checked (obj2?. ...):
+     ok: [0; e1 | t]   null: [Option obj2; e2 | t]
+     => [Option obj2; e1{obj -> Option obj} ?? e2 | t] *)
+let chained_null_coalesce ~obj ~conds (ok : state) (null : state) =
+  match (obj, ok.stack, null.stack) with
+  | Option obj, Number 0l :: e1 :: es1, Option obj2 :: e2 :: es2
+    when es1 == es2 && ok.stmts == null.stmts ->
       Some
         {
-          condition;
-          stack = [];
-          stmts =
-            { stmt with txt = Expression (insert_option expr obj) } :: stmts1;
-        }
-  (* obj?.e1 ?? obj?.e2 *)
-  (* {Option(obj) != -1} [e1, 0]
-     {Option(obj) == -1} [e2, Option(obj2)]
-     => [e1{obj/Option(obj)} ?? e2, Option(obj2)] *)
-  | ( { stack = Number 0l :: e1 :: es2; _ },
-      {
-        condition = BinaryOp (EQUALE, Option obj, Number -1l) :: condition;
-        stack = Option obj2 :: e2 :: es1;
-        _;
-      } )
-    when es1 == es2 && p1.stmts == p2.stmts ->
-      Some
-        {
-          condition;
+          condition = conds;
           stack =
             Option obj2
             :: BinaryOp (PSEUDO_NULL_COALESCE, insert_option e1 obj, e2)
-            :: es1;
-          stmts = p1.stmts;
+            :: es2;
+          stmts = ok.stmts;
         }
-  (* obj?.ref_expr ?? e *)
-  (* {obj != -1} [e, Option(e')]
-     {obj == -1} [-1, -1]
-     when e contains e' and e' contains obj
-     => [e, Option(obj)] *)
-  | ( { stack = Option e' :: e :: es1; _ },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: Number -1l :: es2;
-        _;
-      } )
+  | _ -> None
+
+(* obj?.ref_member ?? ... -- the ok path evaluated a reference e through the
+   null-checked inner value e':
+     ok: [Option e'; e | t]   null: [-1; -1 | t]
+     when e contains e' and e' refers to obj
+     => [Option obj; e{e' -> Option e'} | t] *)
+let nullable_ref_chain ~obj ~conds (ok : state) (null : state) =
+  match (ok.stack, null.stack) with
+  | Option e' :: e :: es1, Number -1l :: Number -1l :: es2
     when es1 == es2 && contains_expr e e' && contains_interface_expr e' obj ->
       let e = if Poly.equal e e' then e else insert_option e e' in
-      Some { condition; stack = make_option obj :: e :: es1; stmts = p1.stmts }
-  (* obj?.fat_value ?? e *)
-  (* {obj != -1} [e, e2, Option(e)]
-     {obj == -1} [-1, -1, -1]
-     when e contains obj
-     => [e, e2, Option(obj)] *)
-  | ( { stack = Option e :: e2 :: e' :: es1; _ },
-      {
-        condition = BinaryOp (EQUALE, obj, Number -1l) :: condition;
-        stack = Number -1l :: Number -1l :: Number -1l :: es2;
-        _;
-      } )
+      Some
+        {
+          condition = conds;
+          stack = make_option obj :: e :: es1;
+          stmts = ok.stmts;
+        }
+  | _ -> None
+
+(* obj?.fat_value -- like nullable_member_value, but the marker was already
+   Option-wrapped by the merge of an inner ?. of the chain:
+     ok: [Option e; e2; e | t]   null: [-1; -1; -1 | t]   (e refers to obj)
+     => [Option obj; e2; e | t] *)
+let chained_nullable_fat_value ~obj ~conds (ok : state) (null : state) =
+  match (ok.stack, null.stack) with
+  | Option e :: e2 :: e' :: es1, Number -1l :: Number -1l :: Number -1l :: es2
     when Poly.equal e e' && es1 == es2
          && contains_interface_expr e (strip_option obj) ->
       Some
         {
-          condition;
+          condition = conds;
           stack = make_option obj :: e2 :: e' :: es1;
-          stmts = p1.stmts;
+          stmts = ok.stmts;
         }
-  (* {Option(obj) != -1} [LocalPage, slot] stmts=[local.slot = obj;]
-     {Option(obj) == -1} [-1, 0] stmts=[]
-     => [obj, Void]
-     XXX: This removes assignment to <dummy : 右辺値参照化用> var *)
-  | ( {
-        stack = Number slot :: Page LocalPage :: es1;
-        stmts =
-          { txt = Expression (AssignOp (ASSIGN, Var (LocalPage, v), obj)); _ }
-          :: stmts;
-        _;
-      },
-      {
-        condition = BinaryOp (EQUALE, Option obj', Number -1l) :: condition;
-        stack = Number 0l :: Number -1l :: es2;
-        _;
-      } )
-    when obj == obj' && es1 == es2 && stmts == p2.stmts
-         && ctx.func.vars.(Int32.to_int_exn slot) == v ->
-      Some { condition; stack = Void :: obj :: es1; stmts }
   | _ -> None
 
-let merge_predecessors ctx address (p1 : predecessor basic_block)
-    (p2 : predecessor basic_block) =
-  Option.value_or_thunk
-    (match (p1.code, p2.code) with
-    | ( {
-          condition = UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs1;
-          _;
-        },
-        { condition = BinaryOp (EQUALE, obj', Number -1l) :: cs2; _ } )
-      when obj == obj' && cs1 == cs2 ->
-        merge_complemental_predecessors ctx p1.code p2.code
-    | ( { condition = BinaryOp (EQUALE, obj', Number -1l) :: cs2; _ },
-        {
-          condition = UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs1;
-          _;
-        } )
-      when obj == obj' && cs1 == cs2 ->
-        merge_complemental_predecessors ctx p2.code p1.code
-    | _ -> None)
-    ~default:(fun () ->
-      match (p1.code, p2.code) with
-      (* ?: operator *)
-      | ( { condition = c1 :: cs1; stack = e1 :: es1; _ },
-          { condition = c2 :: cs2; stack = e2 :: es2; _ } )
-        when are_negations c1 c2 && cs1 == cs2 && es1 == es2
-             && p1.code.stmts == p2.code.stmts ->
-          let e =
-            match c1 with
-            | UnaryOp (NOT, _) when Ain.ain.vers >= 11 -> TernaryOp (c2, e2, e1)
-            | _ -> TernaryOp (c1, e1, e2)
-          in
-          { condition = cs1; stack = e :: es1; stmts = p1.code.stmts }
-      | ( { condition = c1 :: cs1; stack = e12 :: e11 :: es1; _ },
-          { condition = c2 :: cs2; stack = e22 :: e21 :: es2; _ } )
-        when are_negations c1 c2 && cs1 == cs2 && es1 == es2
-             && p1.code.stmts == p2.code.stmts ->
-          let stack =
-            match c1 with
-            | UnaryOp (NOT, _) ->
-                TernaryOp (c2, e22, e12) :: TernaryOp (c2, e21, e11) :: es1
-            | _ -> TernaryOp (c1, e12, e22) :: TernaryOp (c1, e11, e21) :: es1
-          in
-          { condition = cs1; stack; stmts = p1.code.stmts }
-      (* && or || *)
-      | { condition = c1 :: cs1; _ }, { condition = c2 :: c1' :: cs2; _ }
-        when are_negations c1 c1' && cs1 == cs2
-             && p1.code.stack == p2.code.stack
-             && p1.code.stmts == p2.code.stmts ->
-          { p1.code with condition = BinaryOp (PSEUDO_LOGOR, c1, c2) :: cs1 }
-      (* && operator *)
-      | ( { condition = c2 :: c1 :: cs1; stack = Number 1l :: es1; _ },
-          {
-            condition = BinaryOp (PSEUDO_LOGOR, c1', c2') :: cs2;
-            stack = Number 0l :: es2;
-            _;
-          } )
-        when are_negations c1 c1' && are_negations c2 c2' && cs1 == cs2
-             && es1 == es2
-             && p1.code.stmts == p2.code.stmts ->
-          {
-            condition = cs1;
-            stack = BinaryOp (PSEUDO_LOGAND, c1, c2) :: es1;
-            stmts = p1.code.stmts;
-          }
-      (* || operator *)
-      | ( { condition = c2 :: c1 :: cs1; stack = Number 0l :: es1; _ },
-          {
-            condition = BinaryOp (PSEUDO_LOGOR, c1', c2') :: cs2;
-            stack = Number 1l :: es2;
-            _;
-          } )
-        when are_negations c1 c1' && are_negations c2 c2' && cs1 == cs2
-             && es1 == es2
-             && p1.code.stmts == p2.code.stmts ->
-          {
-            condition = cs1;
-            stack = BinaryOp (PSEUDO_LOGOR, c1', c2') :: es1;
-            stmts = p1.code.stmts;
-          }
-      | _ ->
-          Printf.failwithf
-            "cannot merge predecessors at 0x%x:\npred1 = %s\npred2 = %s" address
-            ([%show: predecessor basic_block] p1)
-            ([%show: predecessor basic_block] p2)
-            ())
-  |> fun code -> { p1 with code }
+(* The ok path stored obj into a <dummy : 右辺値参照化用> variable and left a
+   reference to it on the stack; undo the store and use obj directly.
+     ok: [slot; LocalPage | t] stmts = (dummy = obj) :: S
+     null: [0; -1 | t]         stmts = S
+     => [Void; obj | t] *)
+let strip_rvalue_ref_dummy (func : Ain.Function.t) ~obj ~conds (ok : state)
+    (null : state) =
+  match (obj, ok.stack, ok.stmts, null.stack) with
+  | ( Option obj,
+      Number slot :: Page LocalPage :: es1,
+      { txt = Expression (AssignOp (ASSIGN, Var (LocalPage, v), rhs)); _ }
+      :: stmts,
+      Number 0l :: Number -1l :: es2 )
+    when rhs == obj && es1 == es2 && stmts == null.stmts
+         && func.vars.(Int32.to_int_exn slot) == v ->
+      Some { condition = conds; stack = Void :: rhs :: es1; stmts }
+  | _ -> None
 
-let rec analyze_basic_blocks ctx acc = function
-  | [] -> List.rev acc
+let merge_null_checked (env : BlockEval.env) ~obj ~conds ok null =
+  let rules =
+    [
+      null_coalesce;
+      nullable_member_value;
+      nullable_member_statement;
+      chained_null_coalesce;
+      nullable_ref_chain;
+      chained_nullable_fat_value;
+      strip_rvalue_ref_dummy env.func;
+    ]
+  in
+  List.find_map rules ~f:(fun rule -> rule ~obj ~conds ok null)
+
+(* ---- Merge rules for the plain conditional operators (?:, &&, ||) ----
+
+   [first] is the state of the earlier-created edge (from the lower-address
+   block) and [second] that of the later one. *)
+let merge_conditional (first : state) (second : state) =
+  match (first, second) with
+  (* a ? b : c -- both arms leave one value:
+       first: {a} [b | t]   second: {!a} [c | t] *)
+  | ( { condition = c1 :: cs1; stack = e1 :: es1; _ },
+      { condition = c2 :: cs2; stack = e2 :: es2; _ } )
+    when are_negations c1 c2 && cs1 == cs2 && es1 == es2
+         && first.stmts == second.stmts ->
+      let e =
+        match c1 with
+        (* ain v11+ compiles ?: with IFNZ, negating the fall-through
+           condition; flip the ternary to recover the source orientation. *)
+        | UnaryOp (NOT, _) when Ain.ain.vers >= 11 -> TernaryOp (c2, e2, e1)
+        | _ -> TernaryOp (c1, e1, e2)
+      in
+      Some { condition = cs1; stack = e :: es1; stmts = first.stmts }
+  (* Same, for arms leaving a two-slot (fat) value. *)
+  | ( { condition = c1 :: cs1; stack = e12 :: e11 :: es1; _ },
+      { condition = c2 :: cs2; stack = e22 :: e21 :: es2; _ } )
+    when are_negations c1 c2 && cs1 == cs2 && es1 == es2
+         && first.stmts == second.stmts ->
+      let stack =
+        match c1 with
+        | UnaryOp (NOT, _) ->
+            TernaryOp (c2, e22, e12) :: TernaryOp (c2, e21, e11) :: es1
+        | _ -> TernaryOp (c1, e12, e22) :: TernaryOp (c1, e11, e21) :: es1
+      in
+      Some { condition = cs1; stack; stmts = first.stmts }
+  (* Two branches of a short-circuit chain jumping to the same address:
+     the target is reached if !a (branching on the first operand) or
+     a && !b (branching on the second). Used while evaluating a && b and
+     a || b; the branch conditions merge into a disjunction. *)
+  | { condition = c1 :: cs1; _ }, { condition = c2 :: c1' :: cs2; _ }
+    when are_negations c1 c1' && cs1 == cs2
+         && first.stack == second.stack
+         && first.stmts == second.stmts ->
+      Some { first with condition = BinaryOp (PSEUDO_LOGOR, c1, c2) :: cs1 }
+  (* a && b as a value: the fall-through path (both conditions hold) pushed
+     1; the short-circuit path (both branches, merged above into a
+     disjunction) pushed 0. *)
+  | ( { condition = c2 :: c1 :: cs1; stack = Number 1l :: es1; _ },
+      {
+        condition = BinaryOp (PSEUDO_LOGOR, c1', c2') :: cs2;
+        stack = Number 0l :: es2;
+        _;
+      } )
+    when are_negations c1 c1' && are_negations c2 c2' && cs1 == cs2
+         && es1 == es2
+         && first.stmts == second.stmts ->
+      Some
+        {
+          condition = cs1;
+          stack = BinaryOp (PSEUDO_LOGAND, c1, c2) :: es1;
+          stmts = first.stmts;
+        }
+  (* a || b as a value: as above with 0 and 1 exchanged; here the merged
+     disjunction c1' || c2' is the source expression itself. *)
+  | ( { condition = c2 :: c1 :: cs1; stack = Number 0l :: es1; _ },
+      {
+        condition = BinaryOp (PSEUDO_LOGOR, c1', c2') :: cs2;
+        stack = Number 1l :: es2;
+        _;
+      } )
+    when are_negations c1 c1' && are_negations c2 c2' && cs1 == cs2
+         && es1 == es2
+         && first.stmts == second.stmts ->
+      Some
+        {
+          condition = cs1;
+          stack = BinaryOp (PSEUDO_LOGOR, c1', c2') :: es1;
+          stmts = first.stmts;
+        }
+  | _ -> None
+
+(* Merges two states flowing into the same join point. [first] is the inflow
+   created earlier. The merged inflow keeps [first]'s block metadata, so the
+   resulting block covers the whole expression region. *)
+let merge_inflows env addr (first : state basic_block)
+    (second : state basic_block) =
+  let s1 = first.code and s2 = second.code in
+  let merged =
+    match (s1.condition, s2.condition) with
+    | ( UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs,
+        BinaryOp (EQUALE, obj', Number -1l) :: conds )
+      when obj == obj' && cs == conds ->
+        merge_null_checked env ~obj ~conds s1 s2
+    | ( BinaryOp (EQUALE, obj', Number -1l) :: conds,
+        UnaryOp (NOT, BinaryOp (EQUALE, obj, Number -1l)) :: cs )
+      when obj == obj' && cs == conds ->
+        merge_null_checked env ~obj ~conds s2 s1
+    | _ -> None
+  in
+  let merged =
+    match merged with Some _ as m -> m | None -> merge_conditional s1 s2
+  in
+  match merged with
+  | Some code -> { first with code }
+  | None ->
+      Printf.failwithf "cannot merge inflows at 0x%x:\nfirst = %s\nsecond = %s"
+        addr
+        ([%show: state basic_block] first)
+        ([%show: state basic_block] second)
+        ()
+
+(* ---- Reclaiming provisionally emitted branch blocks ----
+
+   A branch on a settled state is normally statement-level control flow and
+   is emitted as an output block. However, the leading branches of a
+   value-producing && / || / ?: look exactly the same when the operator
+   starts a statement (nothing was on the stack when they executed):
+
+       <a> IFZ Lfalse; <b> IFZ Lfalse; PUSH 1; JUMP Lend
+       Lfalse: PUSH 0
+       Lend: ...                                        (x = a && b;)
+
+   The mistake becomes visible at the join point: the block after the one
+   just processed has two value-carrying inflows that cannot be merged
+   without the emitted branch conditions. The functions below un-emit the
+   branch blocks and replay them through the standard merge rules: the two
+   pending inflows are rewritten to the states that expression-level
+   processing would have produced, and merge_conditional reconstructs the
+   operator. *)
+
+(* An inflow can be reclaimed if it is an untouched value chain forked at
+   the un-emitted branch: no conditions or statements of its own, and one
+   or two values on the stack. *)
+let is_reclaimable_inflow (inflow : state basic_block) =
+  match inflow.code with
+  | { condition = []; stack = [ _ ] | [ _; _ ]; stmts = [] } -> true
+  | _ -> false
+
+(* The two states a Branch (_, cond) block evaluated in state (conds, [],
+   stmts) would have dispatched: (fall-through edge, jump edge). *)
+let branch_edge_states cond ~conds ~stmts =
+  ( { condition = cond :: conds; stack = []; stmts },
+    { condition = negate cond :: conds; stack = []; stmts } )
+
+(* Two emitted branches jumping to the block that produced [latest]: the
+   shape of a value-producing && / ||. The fall-through chain (which
+   produced [second]) went through both branches; the target block joins
+   the two jump edges, which merge into a short-circuit disjunction. *)
+let reclaim_two_branches emitted (latest : state basic_block)
+    (second : state basic_block) =
+  match emitted with
+  | { code = { txt = Branch (target', c2); _ }, []; _ }
+    :: ({ code = { txt = Branch (target, c1); _ }, stmts; _ } as first)
+    :: emitted'
+    when latest.addr = target && latest.addr = target' ->
+      let fall1, jump1 = branch_edge_states c1 ~conds:[] ~stmts in
+      let fall2, jump2 = branch_edge_states c2 ~conds:fall1.condition ~stmts in
+      Option.bind (merge_conditional jump1 jump2) ~f:(fun disjunction ->
+          merge_conditional
+            { fall2 with stack = second.code.stack }
+            { disjunction with stack = latest.code.stack })
+      |> Option.map ~f:(fun code ->
+          ({ first with end_addr = latest.end_addr; code }, emitted'))
+  | _ -> None
+
+(* One emitted branch jumping to the arm that produced [latest] (or
+   [second]): the shape of a value-producing ?:. *)
+let reclaim_one_branch emitted (latest : state basic_block)
+    (second : state basic_block) =
+  match emitted with
+  | ({ code = { txt = Branch (target, cond); _ }, stmts; _ } as first)
+    :: emitted'
+    when latest.addr = target || second.addr = target ->
+      let fall, jump = branch_edge_states cond ~conds:[] ~stmts in
+      let latest_edge, second_edge =
+        if latest.addr = target then (jump, fall) else (fall, jump)
+      in
+      merge_conditional
+        { second_edge with stack = second.code.stack }
+        { latest_edge with stack = latest.code.stack }
+      |> Option.map ~f:(fun code ->
+          ({ first with end_addr = latest.end_addr; code }, emitted'))
+  | _ -> None
+
+(* -------------------------------------------------------------------------
+   Driver
+   ------------------------------------------------------------------------- *)
+
+type driver = {
+  env : BlockEval.env;
+  inflows : (int, state basic_block list) Hashtbl.t;
+      (* Evaluation states propagated along forward edges but not consumed
+         yet, keyed by target address; most recently created edge first.
+         Each inflow is the output block under construction: it carries the
+         metadata (addr, labels, ...) of the block that will represent the
+         whole expression region in the output. *)
+}
+
+let add_inflow t ~src_end addr inflow =
+  (* Expression code never branches backwards. *)
+  assert (src_end <= addr);
+  Hashtbl.add_multi t.inflows ~key:addr ~data:inflow
+
+(* Replaces the two most recently created inflows of [addr] with [inflow]. *)
+let replace_latest_inflows t addr inflow =
+  Hashtbl.update t.inflows addr ~f:(function
+    | Some (_ :: _ :: rest) -> inflow :: rest
+    | Some _ -> Printf.failwithf "only one inflow at address %d" addr ()
+    | None -> Printf.failwithf "no inflows at address %d" addr ())
+
+(* Evaluates one basic block starting from the given state. *)
+let eval_block t (flow : state basic_block) instructions end_addr =
+  let address =
+    match flow.code.stmts with [] -> flow.addr | stmt :: _ -> stmt.end_addr
+  in
+  BlockEval.analyze t.env ~address ~end_address:end_addr ~instructions flow.code
+
+let rec process t emitted = function
+  | [] -> List.rev emitted
   | bb :: rest -> (
-      let pred : predecessor basic_block =
-        match Hashtbl.find_and_remove ctx.predecessors bb.addr with
-        | None ->
-            {
-              bb with
-              code = { condition = []; stack = []; stmts = [] };
-              addr =
-                (match List.hd ctx.stmts with
-                | None -> bb.addr
-                | Some s -> s.end_addr);
-            }
-        | Some preds ->
-            List.reduce_exn preds ~f:(fun p1 p2 ->
-                merge_predecessors ctx bb.addr p2 p1)
+      (* The output block being built: bb itself when no expression is in
+         progress, or the pending block of the expression region flowing
+         into bb. *)
+      let flow =
+        match Hashtbl.find_and_remove t.inflows bb.addr with
+        | None -> { bb with code = empty_state }
+        | Some inflows ->
+            (* Latest edge first: merge from the innermost fork outwards. *)
+            List.reduce_exn inflows ~f:(fun merged earlier ->
+                merge_inflows t.env bb.addr earlier merged)
       in
       let bb =
         {
           bb with
-          addr = pred.addr;
-          labels = pred.labels;
-          nr_jump_srcs = pred.nr_jump_srcs;
+          addr = flow.addr;
+          labels = flow.labels;
+          is_jump_target = flow.is_jump_target;
         }
       in
-      ctx.condition <- pred.code.condition;
-      ctx.stack <- pred.code.stack;
-      ctx.stmts <- pred.code.stmts;
-      ctx.instructions <- bb.code;
-      ctx.address <-
-        (match ctx.stmts with [] -> bb.addr | stmt :: _ -> stmt.end_addr);
-      ctx.end_address <- bb.end_addr;
-      match analyze ctx with
-      | term, [], stmts when List.is_empty ctx.condition ->
-          let acc = { bb with code = (term, stmts) } :: acc in
-          reduce ctx acc rest
-      | { txt = Branch (addr, cond); _ }, stack, stmts ->
-          add_predecessor ctx addr
+      match eval_block t flow bb.code bb.end_addr with
+      | term, { condition = []; stack = []; stmts } ->
+          (* The statement is complete; bb becomes an output block. *)
+          merge_emitted_branches t
+            ({ bb with code = (term, stmts) } :: emitted)
+            rest
+      | { txt = Branch (addr, cond); _ }, { condition; stack; stmts } ->
+          (* A branch in the middle of an expression: propagate the state to
+             both targets, recording the branch condition taken. *)
+          add_inflow t ~src_end:bb.end_addr addr
             {
-              pred with
-              code = { condition = negate cond :: ctx.condition; stack; stmts };
+              flow with
+              code = { condition = negate cond :: condition; stack; stmts };
             };
-          add_predecessor ctx bb.end_addr
-            {
-              pred with
-              code = { condition = cond :: ctx.condition; stack; stmts };
-            };
-          reduce ctx acc rest
-      | { txt = Jump addr; _ }, stack, stmts ->
-          add_predecessor ctx addr
-            { pred with code = { condition = ctx.condition; stack; stmts } };
-          reduce ctx acc rest
-      | { txt = Seq; _ }, stack, stmts ->
-          add_predecessor ctx bb.end_addr
-            { pred with code = { condition = ctx.condition; stack; stmts } };
-          reduce ctx acc rest
-      | _ -> failwith "cannot reduce")
+          add_inflow t ~src_end:bb.end_addr bb.end_addr
+            { flow with code = { condition = cond :: condition; stack; stmts } };
+          merge_emitted_branches t emitted rest
+      | { txt = Jump addr; _ }, code ->
+          add_inflow t ~src_end:bb.end_addr addr { flow with code };
+          merge_emitted_branches t emitted rest
+      | { txt = Seq; _ }, code ->
+          add_inflow t ~src_end:bb.end_addr bb.end_addr { flow with code };
+          merge_emitted_branches t emitted rest
+      | { txt = Switch0 _ | DoWhile0 _; _ }, _ ->
+          failwith "switch in the middle of an expression")
 
-and reduce ctx acc rest =
-  assert (List.is_empty ctx.stmts);
-  let predecessors =
+(* Detects join points whose inflows expose provisionally emitted branch
+   blocks (see the comment above is_reclaimable_inflow) and reclaims them.
+   A two-branch shape is tried first (value-producing && / ||), then a
+   single branch (value-producing ?:), whose result may itself be an arm
+   of an enclosing conditional, so it is retried. *)
+and merge_emitted_branches t emitted rest =
+  let inflow_pair =
     match rest with
     | [] -> None
-    | bb :: _ ->
-        Option.bind (Hashtbl.find ctx.predecessors bb.addr) ~f:(function
-          | pred1 :: pred2 :: _ -> Some (pred1, pred2)
-          | _ -> None)
+    | bb :: _ -> (
+        match Hashtbl.find t.inflows bb.addr with
+        | Some (latest :: second :: _)
+          when is_reclaimable_inflow latest && is_reclaimable_inflow second ->
+            Some (latest, second)
+        | _ -> None)
   in
-  match (acc, predecessors) with
-  (* && operator *)
-  | ( { code = { txt = Branch (label1', rhs); _ }, []; _ }
-      :: ({ code = { txt = Branch (label1'', lhs); _ }, stmts; _ } as top)
-      :: stack',
-      Some
-        ( ({ code = { stack = [ Number 0l ]; stmts = []; condition; _ }; _ } as
-           pred1),
-          ({ code = { stack = [ Number 1l ]; stmts = []; _ }; _ } as pred2) ) )
-    when pred1.addr = label1' && pred1.addr = label1''
-         && condition == pred2.code.condition ->
-      replace_top2_predecessors ctx (List.hd_exn rest).addr
-        {
-          top with
-          end_addr = pred1.end_addr;
-          code =
-            { condition; stack = [ BinaryOp (PSEUDO_LOGAND, lhs, rhs) ]; stmts };
-        };
-      analyze_basic_blocks ctx stack' rest
-  (* || operator *)
-  | ( { code = { txt = Branch (label1', rhs); _ }, []; _ }
-      :: ({ code = { txt = Branch (label1'', lhs); _ }, stmts; _ } as top)
-      :: stack',
-      Some
-        ( ({ code = { stack = [ Number 1l ]; stmts = []; condition; _ }; _ } as
-           pred1),
-          ({ code = { stack = [ Number 0l ]; stmts = []; _ }; _ } as pred2) ) )
-    when pred1.addr = label1' && pred1.addr = label1''
-         && condition == pred2.code.condition ->
-      replace_top2_predecessors ctx (List.hd_exn rest).addr
-        {
-          top with
-          end_addr = pred1.end_addr;
-          code =
-            {
-              condition;
-              stack = [ BinaryOp (PSEUDO_LOGOR, negate lhs, negate rhs) ];
-              stmts;
-            };
-        };
-      analyze_basic_blocks ctx stack' rest
-  (* ?: operator *)
-  | ( ({ code = { txt = Branch (label1', a); _ }, stmts; _ } as top) :: stack',
-      Some
-        ( ({ code = { stack = ([ _ ] | [ _; _ ]) as stack1; stmts = []; _ }; _ }
-           as pred1),
-          ({ code = { stack = stack2; stmts = []; _ }; _ } as pred2) ) )
-    when (pred1.addr = label1' || pred2.addr = label1')
-         && List.length stack1 = List.length stack2
-         && pred1.code.condition == pred2.code.condition ->
-      let stack =
-        match (stack1, stack2) with
-        | [ c ], [ b ] when pred1.addr = label1' -> [ TernaryOp (a, b, c) ]
-        | [ b ], [ c ] when pred2.addr = label1' -> [ TernaryOp (a, b, c) ]
-        | [ c2; c1 ], [ b2; b1 ] when pred1.addr = label1' ->
-            [ TernaryOp (a, b2, c2); TernaryOp (a, b1, c1) ]
-        | [ b2; b1 ], [ c2; c1 ] when pred2.addr = label1' ->
-            [ TernaryOp (a, b2, c2); TernaryOp (a, b1, c1) ]
-        | _ -> failwith "cannot happen"
-      in
-      replace_top2_predecessors ctx (List.hd_exn rest).addr
-        {
-          top with
-          end_addr = pred1.end_addr;
-          code = { condition = pred1.code.condition; stack; stmts };
-        };
-      reduce ctx stack' rest
-  | stack', _ -> analyze_basic_blocks ctx stack' rest
+  match inflow_pair with
+  | None -> process t emitted rest
+  | Some (latest, second) -> (
+      match reclaim_two_branches emitted latest second with
+      | Some (inflow, emitted') ->
+          replace_latest_inflows t (List.hd_exn rest).addr inflow;
+          process t emitted' rest
+      | None -> (
+          match reclaim_one_branch emitted latest second with
+          | Some (inflow, emitted') ->
+              replace_latest_inflows t (List.hd_exn rest).addr inflow;
+              merge_emitted_branches t emitted' rest
+          | None -> process t emitted rest))
 
 let rec replace_delegate_calls acc = function
   | { addr = addr1; txt = DG_CALLBEGIN dg_type; _ }
@@ -1703,22 +703,17 @@ let rec replace_delegate_calls acc = function
   | [] -> List.rev acc
 
 let from_instructions (f : CodeSection.function_t) code =
+  let env : BlockEval.env =
+    {
+      func = f.func;
+      struc = (match f.owner with Some (Struct s) -> Some s | _ -> None);
+      parent = f.parent;
+    }
+  in
+  let t = { env; inflows = Hashtbl.create (module Int) } in
   code |> replace_delegate_calls []
   |> make_basic_blocks f.end_addr
-  |> analyze_basic_blocks
-       {
-         func = f.func;
-         struc = (match f.owner with Some (Struct s) -> Some s | _ -> None);
-         parent = f.parent;
-         instructions = [];
-         address = -1;
-         end_address = -1;
-         stack = [];
-         stmts = [];
-         condition = [];
-         predecessors = Hashtbl.create (module Int);
-       }
-       []
+  |> process t []
 
 let from_stmt (stmt : statement loc) =
   {
@@ -1726,7 +721,7 @@ let from_stmt (stmt : statement loc) =
     end_addr = stmt.end_addr;
     labels = [];
     code = (seq_terminator, [ stmt ]);
-    nr_jump_srcs = 0;
+    is_jump_target = false;
   }
 
 let from_generated_constructor (s : Ain.Struct.t) (f : CodeSection.function_t) =

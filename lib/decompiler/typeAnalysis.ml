@@ -280,9 +280,10 @@ class analyzer (func : Ain.Function.t) (struc : Ain.Struct.t option) =
           let e, et = self#analyze_expr Any e in
           let es = List.map ~f:(fun e -> fst (self#analyze_expr et e)) es in
           (ArrayLiteral (e :: es), Array et)
-      | CopyStruct (struc, expr) ->
-          let expr, _ = self#analyze_expr (Struct struc) expr in
-          (CopyStruct (struc, expr), Struct struc)
+      | Copy expr ->
+          (* A copy yields a value, so strip any outer Ref from the operand type. *)
+          let expr, t = self#analyze_expr expected expr in
+          (Copy expr, auto_deref t)
       | UnaryOp (insn, e) -> self#analyze_unary_op insn e
       | BinaryOp (insn, lhs, rhs) -> self#analyze_binary_op insn lhs rhs
       | AssignOp (insn, lval, rhs) -> self#analyze_assign_op insn lval rhs
