@@ -127,8 +127,14 @@ let insert_rvalue_ref e =
     match e.node with
     (* A call whose ain-level return is a ref still needs a dummy slot
        when the language-level type isn't [Ref _], so the rvalue has a
-       stable address for downstream consumers (e.g. method receivers). *)
-    | Call (_, _, (BuiltinCall _ | HLLCall _ | MethodCall _)) -> (
+       stable address for downstream consumers (e.g. method receivers).
+       [FunctionCall] belongs here too: [f(...).String()] must spill
+       the result into a [<dummy : 右辺値参照化用>] local because the
+       Int/Float HLL receiver is a (page, index) pair — passing the
+       bare value makes the VM pop the value as the index and whatever
+       lies beneath as the page. *)
+    | Call
+        (_, _, (BuiltinCall _ | HLLCall _ | MethodCall _ | FunctionCall _)) -> (
         match e.ty with Ref _ -> false | _ -> true)
     | _ -> false
   in

@@ -1499,6 +1499,53 @@ let%expect_test "v12 user-bodied event invocation is a delegate call" =
     156: EOF
     |}]
 
+(* [f(...).String()] — a plain function-call receiver of an
+   HLL-implemented primitive method. The Int/Float HLL takes the
+   receiver as a (page, index) pair, so the rvalue must spill into a
+   [<dummy : 右辺値参照化用>] local first. Regression: [FunctionCall]
+   receivers skipped the RvalueRef wrap and pushed the bare value —
+   the VM popped the value as the index and whatever lay beneath as
+   the page (Rance10 in-game-menu hard fault at 多田情報ログ確認's
+   [Ｐ味方カード個別名有無("Lv42 ランス").String()]). *)
+let%expect_test "v12 function-call receiver of Int.String spills to a dummy local" =
+  compile_test ~ain_version:12
+    ~hlls:[ ("Int.hll", "string String(ref int self);") ]
+    {|
+      int f() { return 42; }
+      string test() { return f().String(); }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC f
+    036: PUSH 42
+    042: RETURN
+    044: PUSH 0
+    050: RETURN
+    052: ENDFUNC f
+    058: FUNC test
+    064: CALLFUNC f
+    070: PUSHLOCALPAGE
+    072: SWAP
+    074: PUSH 0
+    080: SWAP
+    082: ASSIGN
+    084: POP
+    086: PUSHLOCALPAGE
+    088: PUSH 0
+    094: CALLHLL library(0), library_function(0), -1
+    108: RETURN
+    110: S_PUSH ""
+    116: RETURN
+    118: ENDFUNC test
+    124: EOF test.jaf
+    130: FUNC NULL
+    136: EOF
+    |}]
+
 (* v12 [(v?.P = v?.P + n) ?? n] — the decompiled expansion of a
    compound assignment on an optional interface receiver. The receiver
    is null-checked ONCE; the getter runs on a DUP2 of the verified
