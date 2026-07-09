@@ -77,8 +77,14 @@ let compile_test ?(ain_version = 4) ?(hlls = []) input =
         List.Assoc.find hlls ~equal:String.equal name
         |> Option.value ~default:input);
     print_disassemble ctx.ain
-  with CompileError.Compile_error e ->
-    CompileError.print_error e (fun _ -> Some input)
+  with
+  | CompileError.Compile_error e ->
+      CompileError.print_error e (fun _ -> Some input)
+  | Failure msg ->
+      (* Print compiler crashes without the backtrace — recorded
+         backtraces embed source line numbers and churn on every
+         codegen.ml edit. *)
+      Stdio.printf "(Failure %S)\n" msg
 
 let%expect_test "empty function" =
   compile_test {|
@@ -906,24 +912,8 @@ let%expect_test "member pointer" =
         as.SortBy(&S::b);
       }
     |};
-  [%expect.unreachable]
-[@@expect.uncaught_exn {|
-  (* CR expect_test_collector: This test expectation appears to contain a backtrace.
-     This is strongly discouraged as backtraces are fragile.
-     Please change this test to not include a backtrace. *)
-  (Failure "tried to create array<interface>")
-  Raised at Stdlib.failwith in file "stdlib.ml", line 29, characters 17-33
-  Called from Compiler__Codegen.jaf_compiler#compile_function.(fun) in file "lib/compiler/codegen.ml", line 7811, characters 29-60
-  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
-  Called from Compiler__Codegen.jaf_compiler#compile_function in file "lib/compiler/codegen.ml", lines 7810-7811, characters 6-61
-  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
-  Called from Compiler__Codegen.jaf_compiler#compile in file "lib/compiler/codegen.ml", line 8604, characters 6-37
-  Called from Base__List0.iter in file "src/list0.ml", line 66, characters 4-7
-  Called from Compiler__Compile.compile in file "lib/compiler/compile.ml", line 463, characters 2-37
-  Called from Compiler_test__CompileTest.compile_test in file "lib/compiler/test/compileTest.ml", lines 76-78, characters 4-39
-  Called from Compiler_test__CompileTest.(fun) in file "lib/compiler/test/compileTest.ml", lines 899-908, characters 2-6
-  Called from Ppx_expect_runtime__Test_block.Configured.dump_backtrace in file "runtime/test_block.ml", line 142, characters 10-28
-  |}]
+  [%expect {| (Failure "tried to create array<interface>") |}]
+
 
 let%expect_test "dg_return_null" =
   compile_test
