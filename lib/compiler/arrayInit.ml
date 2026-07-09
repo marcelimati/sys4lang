@@ -497,15 +497,15 @@ class visitor ctx =
               | None -> (
                   match v.type_spec.ty with
                   | Array _ | Ref (Array _) -> None
-                  | Struct (name, sno)
-                    when not (is_interface_type v.type_spec.ty) ->
-                      Some
-                        (make_expr
-                           (New
-                              {
-                                ty = Struct (name, sno);
-                                location = dummy_location;
-                              }))
+                  (* Value-struct backings: the VM auto-constructs value
+                     struct members when the parent page is created (their
+                     @0/@2 chain runs), and the original compiler emits NO
+                     @0 code for them — an explicit [new T] here allocated
+                     a second object over the auto-created one at every
+                     instantiation (leak + identity churn; BattleContext@0
+                     carried ten of these vs original's none). *)
+                  | Struct _ when not (is_interface_type v.type_spec.ty) ->
+                      None
                   | _ -> zero_for_type v.type_spec.ty)
             in
             (match rhs with
