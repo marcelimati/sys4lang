@@ -5448,11 +5448,27 @@ class jaf_compiler ctx debug_info =
                 | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
                 | _ -> true
               in
+              (* Property READS ([x?.Prop ?? b], the getter has no
+                 source-level call syntax) are DEFERRED by the original
+                 compiler like all optional-chain consumers — the
+                 receiver crosses the merge as a padded 2-slot pair.
+                 Only explicit method calls ([x?.M() ?? b]) evaluate
+                 inside the non-null branch (exemplars: deferred
+                 CommonMenu@IsQuestRetireEnable [findQuestFromId(..)?
+                 .IsRetireEnable ?? false] vs in-branch CEnqueteView@
+                 MouseWheelEvent [this.Item?.IsFocusTextBox() ?? false]). *)
+              let is_property_getter =
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                (String.is_suffix f.name ~suffix:"::get"
+                || String.is_substring f.name ~substring:"::get#")
+                && List.is_empty args
+              in
               if
                 is_dummyref
                 && (not receiver_is_iface)
                 && (not receiver_is_casted_from_iface)
-                && not is_value_prop_setter
+                && (not is_value_prop_setter)
+                && not (is_property_getter && Ain.version_gte ctx.ain (12, 0))
               then (
                 (* v12 [dummy?.Method(args) ?? fallback] where the receiver
                    is a ref-returning call/getter (dummy slot),
@@ -5503,11 +5519,30 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 REF;
                 self#write_instruction1 PUSH (-1);
                 self#write_instruction0 EQUALE);
+              (* v12: the original's optional-chain protocol always
+                 carries the deferred receiver across the marker merge
+                 as a 2-slot pair. Interface receivers are naturally
+                 2-slot fat-refs; PLAIN receivers get padded with a
+                 [PUSH 0] (and the null pair is [-1; -1]). Exemplars:
+                 Scenes::RunISceneWithAssistant [assistant?.
+                 ParentPartsNumber ?? 0] and CommonMenu@
+                 IsQuestRetireEnable [findQuestFromId(..)?.IsRetireEnable
+                 ?? false]. *)
+              let pad_plain_receiver =
+                Ain.version_gte ctx.ain (12, 0)
+                && (not receiver_is_iface)
+                && not receiver_is_casted_from_iface
+              in
+              let receiver_slots_2 =
+                receiver_is_iface || receiver_is_casted_from_iface
+                || pad_plain_receiver
+              in
               let ifnz_addr = current_address + 2 in
               self#write_instruction1 IFNZ 0;
               if not is_dummyref then
                 self#write_instruction0
                   (if receiver_is_iface then REFREF else REF);
+              if pad_plain_receiver then self#write_instruction1 PUSH 0;
               self#write_instruction1 PUSH 0;
               let optional_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
@@ -5520,20 +5555,12 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 POP;
                 self#write_instruction0 POP);
               self#write_instruction1 PUSH (-1);
-              if receiver_is_iface then self#write_instruction1 PUSH (-1);
+              if receiver_slots_2 then self#write_instruction1 PUSH (-1);
               self#write_instruction1 PUSH (-1);
               self#write_address_at optional_jump_addr current_address;
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 EQUALE;
-              let ifz_addr = current_address + 2 in
-              self#write_instruction1 IFZ 0;
-              self#write_instruction0 POP;
-              if receiver_is_iface then self#write_instruction0 POP;
-              self#compile_expression b;
-              let jump_addr = current_address + 2 in
-              self#write_instruction1 JUMP 0;
-              self#write_address_at ifz_addr current_address;
-              if is_value_prop_setter then (
+              let compile_setter_call () =
                 let f = Ain.get_function_by_index ctx.ain method_no in
                 self#compile_method_selector receiver.ty method_no;
                 let prev = in_prop_setter_arg in
@@ -5544,13 +5571,43 @@ class jaf_compiler ctx debug_info =
                   ~finally:(fun () -> in_prop_setter_arg <- prev);
                 self#write_instruction0 DUP_X2;
                 (match List.hd (Ain.Function.logical_parameters f) with
-                | Some { value_type = String; _ } -> self#write_instruction0 A_REF
+                | Some { value_type = String; _ } ->
+                    self#write_instruction0 A_REF
                 | _ -> ());
-                self#write_instruction1 CALLMETHOD f.nr_args)
-              else
-                self#compile_method_call_for_receiver receiver.ty args
-                  method_no;
-              self#write_address_at jump_addr current_address)
+                self#write_instruction1 CALLMETHOD f.nr_args
+              in
+              if is_value_prop_setter && Ain.version_gte ctx.ain (12, 0) then (
+                (* Setter form: the original lays out the non-null
+                   branch FIRST ([IFNZ] to the null/fallback branch),
+                   the reverse of the value-form order below. Exemplar:
+                   RunISceneWithAssistant [(assistant?.ParentPartsNumber
+                   = ss.LayerPartsNumber) ?? ss.LayerPartsNumber]. *)
+                let null_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                if pad_plain_receiver then self#write_instruction0 POP;
+                compile_setter_call ();
+                let end_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at null_addr current_address;
+                self#write_instruction0 POP;
+                if receiver_slots_2 then self#write_instruction0 POP;
+                self#compile_expression b;
+                self#write_address_at end_addr current_address)
+              else (
+                let ifz_addr = current_address + 2 in
+                self#write_instruction1 IFZ 0;
+                self#write_instruction0 POP;
+                if receiver_slots_2 then self#write_instruction0 POP;
+                self#compile_expression b;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                if pad_plain_receiver then self#write_instruction0 POP;
+                if is_value_prop_setter then compile_setter_call ()
+                else
+                  self#compile_method_call_for_receiver receiver.ty args
+                    method_no;
+                self#write_address_at jump_addr current_address))
           | Call
               ( {
                   node =
