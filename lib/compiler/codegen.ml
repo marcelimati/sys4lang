@@ -1924,8 +1924,28 @@ class jaf_compiler ctx debug_info =
          argument): collapse to the primary's lvalue. The fallback is
          a sentinel (-1, [], etc.) that the runtime won't reach when
          the primary resolves. v12-wip — round-trip drops the
-         fallback. *)
-      | NullCoalesce (a, _) -> self#compile_lvalue a
+         fallback.
+
+         EXCEPT when the fallback is a constructible [new T(...)]
+         (dummy-backed): the original null-checks the primary and
+         builds the fallback in the null path — e.g. a ref-returning
+         getter [return find(...) ?? new T(...)]
+         (SceneQuestMapGetCardDialog@CardInstance::get). Dropping it
+         returned NULL to callers that immediately dereference. *)
+      | NullCoalesce (a, b) -> (
+          match b.node with
+          | DummyRef (_, { node = New _ | NewCall _; _ })
+            when Ain.version_gte ctx.ain (12, 0) ->
+              self#compile_lvalue a;
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let ifz_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#compile_lvalue b;
+              self#write_address_at ifz_addr current_address
+          | _ -> self#compile_lvalue a)
       (* v12 user-bodied event used as an lvalue (e.g. receiver for
          [this.Event.Clear()]). When the class still has an auto-event
          backing field, use it; otherwise fall back to the sentinel
