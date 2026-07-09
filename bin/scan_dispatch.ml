@@ -57,8 +57,13 @@ let binding_sites code s e =
 let function_ranges ain =
   let acc = ref [] in
   Ain.function_iter ain ~f:(fun f ->
+      (* Lambda naming differs between compilers (ours lacks the
+         [Class@] prefix and line numbers shift), so lambdas can't be
+         matched by name — and they must not bound parents' address
+         ranges either, or one side's range swallows its nested
+         lambdas' code. Exclude by substring. *)
       if
-        (not (String.is_prefix f.name ~prefix:"<lambda"))
+        (not (String.is_substring f.name ~substring:"<lambda"))
         && (not (String.is_empty f.name))
         && f.address > 0
       then acc := f :: !acc);
