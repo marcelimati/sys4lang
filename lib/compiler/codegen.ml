@@ -5829,6 +5829,102 @@ class jaf_compiler ctx debug_info =
                 self#write_address_at jump_addr current_address)
               else self#write_address_at ifz_addr current_address)
 
+    (** v12 [call()?.Event += handler] statement, where the event lives
+        on an interface receiver so the subscription dispatches the
+        [::add]/[::remove] accessor through the vtable. The original
+        compiler DEFERS the accessor call past the null-check merge — a
+        marker recheck guards the dispatch — and builds the handler
+        delegate in BOTH branches (the null branch constructs and
+        DELETEs it, balanced, without the call). The generic optional-
+        call arm instead calls inside the non-null branch and pushes a
+        marker the statement then POPs — runtime-equivalent, but a
+        LENGTH divergence at every subscription site (CADVEngine@
+        OpenPanel's ten panel buttons, sealtool CCamera@0, ...).
+        Emits the original shape and returns true when it applies. *)
+    method private try_optional_event_subscription_stmt (expr : expression) =
+      match expr.node with
+      | Call
+          ( { node = OptionalMember (e, _, _); _ },
+            ([ Some rhs ] as args),
+            MethodCall (_, method_no) )
+        when Ain.version_gte ctx.ain (12, 0) -> (
+          let f = Ain.get_function_by_index ctx.ain method_no in
+          let is_accessor =
+            String.is_suffix f.name ~suffix:"::add"
+            || String.is_suffix f.name ~suffix:"::remove"
+          in
+          let rhs_builds_delegate =
+            (* Both branches compile the rhs, so it must be a pure
+               method reference / pre-emitted lambda (pushes only). *)
+            match rhs.node with
+            | Member (_, _, ClassMethod _) | Lambda _ -> true
+            | _ -> false
+          in
+          let rec is_dummyref_shape (e : expression) =
+            match e.node with
+            | DummyRef _ -> true
+            | Call
+                (_, _, (HLLCall _ | FunctionCall _ | MethodCall _ | BuiltinCall _))
+              ->
+                true
+            | Cast (_, inner) -> is_dummyref_shape inner
+            | _ -> false
+          in
+          let rec v12_iface_walk (ty : jaf_type) =
+            match ty with
+            | Struct (name, _) | Ref (Struct (name, _)) ->
+                Hashtbl.mem ctx.interface_names name
+            | Wrap inner -> v12_iface_walk inner
+            | _ -> false
+          in
+          let receiver_is_casted_iface =
+            match e.node with
+            | Cast (Struct (name, _), _) | Cast (Ref (Struct (name, _)), _) ->
+                Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          if
+            is_accessor
+            && Poly.equal f.return_type Ain.Type.Void
+            && rhs_builds_delegate && is_dummyref_shape e
+            && v12_iface_walk e.ty
+            && not receiver_is_casted_iface
+          then (
+            self#pre_emit_lambda_args args;
+            self#compile_lvalue e;
+            self#write_instruction0 DUP_U2;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifnz1_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            self#write_instruction1 PUSH 0;
+            let jump_merge_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#write_address_at ifnz1_addr current_address;
+            self#write_instruction0 POP;
+            self#write_instruction0 POP;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction1 PUSH (-1);
+            self#write_address_at jump_merge_addr current_address;
+            self#write_instruction1 PUSH (-1);
+            self#write_instruction0 EQUALE;
+            let ifnz2_addr = current_address + 2 in
+            self#write_instruction1 IFNZ 0;
+            self#compile_method_call_for_receiver ~prefer_first_duplicate:true
+              e.ty args method_no;
+            let jump_end_addr = current_address + 2 in
+            self#write_instruction1 JUMP 0;
+            self#write_address_at ifnz2_addr current_address;
+            self#write_instruction0 POP;
+            self#write_instruction0 POP;
+            self#compile_function_arguments args f;
+            self#write_instruction0 DELETE;
+            self#write_address_at jump_end_addr current_address;
+            true)
+          else false)
+      | _ -> false
+
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
       match expr.node with
@@ -6264,9 +6360,11 @@ class jaf_compiler ctx debug_info =
          explicit [POP] so the stack stays balanced. *)
       | Call ({ node = OptionalMember _; _ }, _, (MethodCall _ | HLLCall _))
         when Ain.version ctx.ain > 8 && Poly.equal expr.ty Void ->
-          self#compile_expression expr;
-          before_pop ();
-          self#write_instruction0 POP
+          if self#try_optional_event_subscription_stmt expr then before_pop ()
+          else (
+            self#compile_expression expr;
+            before_pop ();
+            self#write_instruction0 POP)
       | NullCoalesce
           ( {
               node =
