@@ -5381,7 +5381,7 @@ class jaf_compiler ctx debug_info =
               self#compile_method_call_for_receiver receiver.ty [] method_no;
               self#write_address_at jump_addr current_address
           | Call
-              ( { node = OptionalMember (receiver, _, _); _ },
+              ( { node = OptionalMember (receiver, opt_mname, _); _ },
                 args,
                 MethodCall (_, method_no) )
             when Ain.version ctx.ain > 8 ->
@@ -5560,21 +5560,78 @@ class jaf_compiler ctx debug_info =
               self#write_address_at optional_jump_addr current_address;
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 EQUALE;
+              (* [(x?.Prop = x?.Prop + rhs) ?? rhs] — the decompiled
+                 expansion of a compound assignment on an optional
+                 receiver. The original checks the receiver ONCE and
+                 runs the getter on a [DUP2] of the already-verified
+                 pair inside the non-null branch; the inner [x?.Prop]
+                 must NOT go through the generic optional-value
+                 protocol (its unconsumed status marker corrupts the
+                 stack under the setter CALLMETHOD — the survey-scroll
+                 [構造体ページ N 取得失敗] crash at CEnqueteView@Scroll).
+                 Mirrors the non-optional reused-receiver arm. *)
+              let reused_optional_getter =
+                match (String.chop_suffix opt_mname ~suffix:"::set", args) with
+                | ( Some prop_base,
+                    [ Some
+                        { node =
+                            Binary
+                              ( op,
+                                { node =
+                                    Call
+                                      ( { node =
+                                            OptionalMember
+                                              (getter_recv, getter_name, _);
+                                          _ },
+                                        [],
+                                        MethodCall (_, getter_no) );
+                                  ty = getter_ty;
+                                  _ },
+                                tail );
+                          _ } ] )
+                  when Ain.version_gte ctx.ain (12, 0)
+                       && receiver_is_iface
+                       && String.equal getter_name (prop_base ^ "::get")
+                       && self#same_lvalue_shape receiver getter_recv
+                       &&
+                       (match (getter_ty, op) with
+                       | (Int | Enum _ | LongInt | Float), (Plus | Minus) ->
+                           true
+                       | _ -> false) ->
+                    Some (op, getter_no, getter_ty, tail)
+                | _ -> None
+              in
               let compile_setter_call () =
                 let f = Ain.get_function_by_index ctx.ain method_no in
-                self#compile_method_selector receiver.ty method_no;
-                let prev = in_prop_setter_arg in
-                Exn.protect
-                  ~f:(fun () ->
-                    in_prop_setter_arg <- true;
-                    self#compile_function_arguments args f)
-                  ~finally:(fun () -> in_prop_setter_arg <- prev);
-                self#write_instruction0 DUP_X2;
-                (match List.hd (Ain.Function.logical_parameters f) with
-                | Some { value_type = String; _ } ->
-                    self#write_instruction0 A_REF
-                | _ -> ());
-                self#write_instruction1 CALLMETHOD f.nr_args
+                match reused_optional_getter with
+                | Some (op, getter_no, getter_ty, tail) ->
+                    self#write_instruction0 DUP2;
+                    self#compile_method_selector receiver.ty method_no;
+                    self#write_instruction0 DUP_X2;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 SWAP;
+                    self#compile_method_selector receiver.ty getter_no;
+                    self#write_instruction1 CALLMETHOD 0;
+                    self#compile_expression tail;
+                    ignore
+                      (self#emit_reused_receiver_binary_op getter_ty op
+                        : bool);
+                    self#write_instruction0 DUP_X2;
+                    self#write_instruction1 CALLMETHOD f.nr_args
+                | None ->
+                    self#compile_method_selector receiver.ty method_no;
+                    let prev = in_prop_setter_arg in
+                    Exn.protect
+                      ~f:(fun () ->
+                        in_prop_setter_arg <- true;
+                        self#compile_function_arguments args f)
+                      ~finally:(fun () -> in_prop_setter_arg <- prev);
+                    self#write_instruction0 DUP_X2;
+                    (match List.hd (Ain.Function.logical_parameters f) with
+                    | Some { value_type = String; _ } ->
+                        self#write_instruction0 A_REF
+                    | _ -> ());
+                    self#write_instruction1 CALLMETHOD f.nr_args
               in
               if is_value_prop_setter && Ain.version_gte ctx.ain (12, 0) then (
                 (* Setter form: the original lays out the non-null

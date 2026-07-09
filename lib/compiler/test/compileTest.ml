@@ -1499,6 +1499,120 @@ let%expect_test "v12 user-bodied event invocation is a delegate call" =
     156: EOF
     |}]
 
+(* v12 [(v?.P = v?.P + n) ?? n] — the decompiled expansion of a
+   compound assignment on an optional interface receiver. The receiver
+   is null-checked ONCE; the getter runs on a DUP2 of the verified
+   fat-ref pair inside the non-null branch. Regression: the inner
+   [v?.P] used to compile through the generic optional-value protocol,
+   leaving its status marker on the stack under the setter CALLMETHOD —
+   the VM then read an int as a struct page id (Rance10 survey-scroll
+   構造体ページ取得失敗 crash at enquate CEnqueteView@Scroll). *)
+let%expect_test "v12 optional compound assignment fuses getter onto checked receiver" =
+  compile_test ~ain_version:12
+    {|
+      interface I {
+        int P::get();
+        void P::set(int value);
+      };
+      class C implements I {
+        int P { get; set; }
+      };
+      void f(I v, int n) {
+        (v?.P = v?.P + n) ?? n;
+      }
+    |};
+  [%expect
+    {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@P::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 1
+    044: REF
+    046: RETURN
+    048: PUSH 0
+    054: RETURN
+    056: FUNC C@P::get
+    062: PUSHSTRUCTPAGE
+    064: PUSH 1
+    070: REF
+    072: RETURN
+    074: PUSH 0
+    080: RETURN
+    082: FUNC C@P::set
+    088: PUSHSTRUCTPAGE
+    090: PUSH 1
+    096: PUSHLOCALPAGE
+    098: PUSH 0
+    104: REF
+    106: ASSIGN
+    108: POP
+    110: RETURN
+    112: ENDFUNC C@P::set
+    118: FUNC f
+    124: PUSHLOCALPAGE
+    126: PUSH 0
+    132: DUP2
+    134: REF
+    136: PUSH -1
+    142: EQUALE
+    144: IFNZ 164
+    150: REFREF
+    152: PUSH 0
+    158: JUMP 186
+    164: POP
+    166: POP
+    168: PUSH -1
+    174: PUSH -1
+    180: PUSH -1
+    186: PUSH -1
+    192: EQUALE
+    194: IFNZ 284
+    200: DUP2
+    202: DUP_U2
+    204: PUSH 0
+    210: REF
+    212: SWAP
+    214: PUSH 1
+    220: ADD
+    222: REF
+    224: DUP_X2
+    226: POP
+    228: SWAP
+    230: DUP_U2
+    232: PUSH 0
+    238: REF
+    240: SWAP
+    242: PUSH 0
+    248: ADD
+    250: REF
+    252: CALLMETHOD NULL
+    258: PUSHLOCALPAGE
+    260: PUSH 2
+    266: REF
+    268: ADD
+    270: DUP_X2
+    272: CALLMETHOD I@P::get
+    278: JUMP 298
+    284: POP
+    286: POP
+    288: PUSHLOCALPAGE
+    290: PUSH 2
+    296: REF
+    298: POP
+    300: RETURN
+    302: ENDFUNC f
+    308: EOF test.jaf
+    314: FUNC C@0
+    320: RETURN
+    322: ENDFUNC C@0
+    328: FUNC NULL
+    334: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
