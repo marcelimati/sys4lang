@@ -504,3 +504,107 @@ let%expect_test "return var?.int_method() ?? 42;" =
        is_jump_target = false }
       ]
     |}]
+
+(* v12: a standalone .LOCALDELETE of a user ref/struct local marks the
+   original declaration site (`ref S x;`) — it must lift to a VarDecl so the
+   recompile scopes the variable like the original compiler did. *)
+let%expect_test "ref S var0; (v12 .LOCALDELETE lifts to VarDecl)" =
+  Ain.ain.vers <- 12;
+  decompile_test [ Ref (Struct 0) ]
+    [
+      (0x00000006, PUSHLOCALPAGE);
+      (0x00000008, PUSH 0l);
+      (0x0000000E, DUP2);
+      (0x00000010, REF);
+      (0x00000012, DELETE);
+      (0x00000014, PUSH (-1l));
+      (0x0000001A, ASSIGN);
+      (0x0000001C, POP);
+      (0x0000001E, RETURN);
+    ];
+  Ain.ain.vers <- -1;
+  [%expect {|
+    [{ addr = 6; end_addr = 32; labels = [];
+       code =
+       ({ txt = Seq; addr = -1; end_addr = -1 },
+        [{ txt = (Return None); addr = 30; end_addr = 32 };
+          { txt =
+            (VarDecl (
+               { Ain.Variable.name = "var0"; name2 = "";
+                 type_ = (Type.Ref (Type.Struct 0)); init_val = None;
+                 group_index = 0 },
+               None));
+            addr = 6; end_addr = 30 }
+          ]);
+       is_jump_target = false }
+      ]
+    |}]
+
+let decompile_test_with_var_decls ?(func = [||]) var_types insns =
+  Ain.ain.func <- func;
+  let rev_insns = List.rev insns in
+  let end_addr = fst (List.hd_exn rev_insns) + 2 in
+  let _, code =
+    List.fold rev_insns ~init:(end_addr, [])
+      ~f:(fun (end_addr, acc) (addr, insn) ->
+        (addr, { Loc.txt = insn; addr; end_addr } :: acc))
+  in
+  let vars =
+    Array.of_list_mapi var_types ~f:(fun i type_ ->
+        Ain.Variable.
+          {
+            name = Printf.sprintf "var%d" i;
+            name2 = "";
+            type_;
+            init_val = None;
+            group_index = 0;
+          })
+  in
+  let f = make_function "testfunc" ~vars in
+  let func : CodeSection.function_t =
+    { func = f; name = "testfunc"; owner = None; end_addr; code; parent = None }
+  in
+  let bbs = BasicBlock.create func |> BasicBlock.generate_var_decls f in
+  Stdio.print_endline ([%show: BasicBlock.t list] bbs)
+
+(* v12: only the first .LOCALDELETE of a slot is the declaration; a later one
+   (scope-exit release in the original) must not produce a second VarDecl. *)
+let%expect_test "duplicate v12 .LOCALDELETE collapses to one VarDecl" =
+  Ain.ain.vers <- 12;
+  decompile_test_with_var_decls [ Ref (Struct 0) ]
+    [
+      (0x00000006, PUSHLOCALPAGE);
+      (0x00000008, PUSH 0l);
+      (0x0000000E, DUP2);
+      (0x00000010, REF);
+      (0x00000012, DELETE);
+      (0x00000014, PUSH (-1l));
+      (0x0000001A, ASSIGN);
+      (0x0000001C, POP);
+      (0x0000001E, PUSHLOCALPAGE);
+      (0x00000020, PUSH 0l);
+      (0x00000026, DUP2);
+      (0x00000028, REF);
+      (0x0000002A, DELETE);
+      (0x0000002C, PUSH (-1l));
+      (0x00000032, ASSIGN);
+      (0x00000034, POP);
+      (0x00000036, RETURN);
+    ];
+  Ain.ain.vers <- -1;
+  [%expect {|
+    [{ addr = 6; end_addr = 56; labels = [];
+       code =
+       ({ txt = Seq; addr = -1; end_addr = -1 },
+        [{ txt = (Return None); addr = 54; end_addr = 56 };
+          { txt =
+            (VarDecl (
+               { Ain.Variable.name = "var0"; name2 = "";
+                 type_ = (Type.Ref (Type.Struct 0)); init_val = None;
+                 group_index = 0 },
+               None));
+            addr = 6; end_addr = 30 }
+          ]);
+       is_jump_target = false }
+      ]
+    |}]

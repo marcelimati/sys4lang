@@ -827,14 +827,19 @@ let generate_var_decls (func : Ain.Function.t) bbs =
     in
     let replace_stmt = function
       | VarDecl (var, None) as stmt ->
-          mark_use var;
-          stmt
+          (* v12: a .LOCALDELETE of an already-declared local (lifted to
+             VarDecl by blockEval) is a scope-exit release, not a second
+             declaration — drop it. Keep pre-v12 behavior of preserving
+             every SH_LOCALCREATE-derived decl. *)
+          if is_uninitialized var then Some stmt
+          else if Ain.ain.vers >= 12 then None
+          else Some stmt
       | Expression (AssignOp (insn, Var (LocalPage, var), expr))
         when is_uninitialized var ->
-          VarDecl (var, Some (insn, expr))
+          Some (VarDecl (var, Some (insn, expr)))
       | Expression (Call (Builtin (A_ALLOC, Var (LocalPage, var)), _) as expr)
         when is_uninitialized var ->
-          VarDecl (var, Some (ASSIGN, expr))
+          Some (VarDecl (var, Some (ASSIGN, expr)))
       | Expression
           (Call
              ( HllFunc ("Array", { name = "Alloc"; _ }),
@@ -843,26 +848,29 @@ let generate_var_decls (func : Ain.Function.t) bbs =
           let dims =
             List.take_while dims ~f:(function Number -1l -> false | _ -> true)
           in
-          VarDecl
-            ( var,
-              Some (ASSIGN, Call (Builtin (A_ALLOC, Var (LocalPage, var)), dims))
-            )
+          Some
+            (VarDecl
+               ( var,
+                 Some
+                   (ASSIGN, Call (Builtin (A_ALLOC, Var (LocalPage, var)), dims))
+               ))
       | Expression
           ( Call (Builtin (A_FREE, Var (LocalPage, var)), [])
           | Call
               (HllFunc ("Array", { name = "Free"; _ }), [ Load (Var (_, var)) ])
             )
         when is_uninitialized var && not (Ain.Variable.is_dummy var) ->
-          VarDecl (var, None)
+          Some (VarDecl (var, None))
       | Expression (Call (Builtin2 (DG_CLEAR, Load (Var (LocalPage, var))), []))
         when is_uninitialized var ->
-          VarDecl (var, None)
-      | stmt -> stmt
+          Some (VarDecl (var, None))
+      | stmt -> Some stmt
     in
     List.map bbs ~f:(function { code = terminator, stmts; _ } as bb ->
         let stmts' =
-          List.rev_map (List.rev stmts) ~f:(fun stmt ->
-              { stmt with txt = replace_stmt stmt.txt })
+          List.rev_filter_map (List.rev stmts) ~f:(fun stmt ->
+              Option.map (replace_stmt stmt.txt) ~f:(fun txt ->
+                  { stmt with txt }))
         in
         { bb with code = (terminator, stmts') })
     |> fun bbs ->

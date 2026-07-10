@@ -616,10 +616,22 @@ let analyze (env : env) ~address ~end_address ~instructions (state : state) =
         match pop ctx with
         | AssignOp
             ( ASSIGN,
-              Var (LocalPage, { type_ = Struct _ | Ref _ | IFace _; _ }),
+              Var
+                (LocalPage, ({ type_ = Struct _ | Ref _ | IFace _; _ } as var)),
               Number -1l )
           when Ain.ain.vers >= 12 ->
-            (* .LOCALDELETE, ignore *) ()
+            (* .LOCALDELETE. For a user variable this is the uninitialized
+               declaration of a ref/struct local (`ref T x;`) at its original
+               source position — the original compiler emits it at the decl
+               statement, so a first assignment in a deeper block must not
+               become the declaration site (the recompile would then emit a
+               scope-exit release that nulls the ref while the rest of the
+               function still uses it). Lift it to a plain VarDecl;
+               generate_var_decls drops any later occurrence for the same
+               slot. Compiler dummies remain internal. *)
+            if Ain.Variable.is_dummy var || not (List.is_empty ctx.stack) then
+              ()
+            else emit_statement ctx (VarDecl (var, None))
         | e when is_discardable_by_pop e || is_null_in_this_branch ctx e -> ()
         | e when List.is_empty ctx.stack -> emit_expression ctx e
         | (AssignOp _ | Call _) as e ->
