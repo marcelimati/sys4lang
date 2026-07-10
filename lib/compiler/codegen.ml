@@ -7361,8 +7361,19 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 JUMP 0;
               self#write_address_at if_addr current_address;
               self#compile_statement con;
+              (* Post-con replay covers Ref/Struct call-result dummies
+                 only (orig exemplars SceneQuestMap@ProcessNext /
+                 GetMoveType / CheckNoLeader / RunCurrentObjectEvent).
+                 IFace dummies stay out: their release is deferred by
+                 last-use tracking, and a fresh wrapper result (e.g.
+                 AFL_Parts_Wrap) is kept alive ONLY by the dummy — the
+                 raw replay freed the live wrapper and the next dispatch
+                 read its vtable from a dead page:【 CALLMETHOD 】
+                 存在しない関数番号 -1 at the intro scene transition. *)
               List.iter saved_last ~f:(fun idx ->
-                  self#write_instruction1 SH_LOCALDELETE idx);
+                  match (self#get_local idx).value_type with
+                  | Ain.Type.IFace _ -> ()
+                  | _ -> self#write_instruction1 SH_LOCALDELETE idx);
               (match alt.node with
               | EmptyStatement ->
                   self#write_address_at alt_jump_addr current_address
