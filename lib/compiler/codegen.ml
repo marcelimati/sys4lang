@@ -5283,6 +5283,89 @@ class jaf_compiler ctx debug_info =
             | _ -> false
           in
           match a_inner.node with
+          | OptionalMember (receiver, _, ClassVariable var_no)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && is_variable_ref receiver.node
+                 && (match expr.ty with
+                    | Int | Bool | Float | Enum _ -> true
+                    | _ -> false) ->
+              (* v12 [recv?.field ?? fallback], scalar field, value form.
+                 The original defers the field READ past the merge as a
+                 (page, index) pair + status marker (null = -1;-1;-1):
+                 the null branch pops the pair, evaluates the fallback
+                 and gives it a home — the [<dummy : 右辺値参照化用>]
+                 local (or the fallback's own slot when it's an lvalue) —
+                 so one trailing [REF] dereferences whichever pair
+                 survived. The generic arm instead read the field
+                 in-branch and pushed the scalar default [0] on null,
+                 which the [??] merge's [-1] test never matched — the
+                 fallback silently never applied. Exemplar:
+                 [SceneQuestMap@Run]'s [m_restoreInfo?.IsNeedRunEvent ??
+                 true] evaluated false on fresh quests, skipping the
+                 quest-opening event. *)
+              let is_wrap_ref_local =
+                match receiver.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.Wrap (Ain.Type.Ref _) -> true
+                    | Ain.Type.Wrap (Ain.Type.IFace _) -> true
+                    | _ -> false)
+                | _ -> false
+              in
+              self#compile_variable_ref receiver;
+              if is_wrap_ref_local then self#write_instruction0 REFREF;
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let outer_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 DUP_U2;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let inner_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction1 PUSH 0;
+              let inner_ok_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at inner_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at inner_ok_jump current_address;
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at outer_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_jump current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let deref_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              (match b.node with
+              | DummyRef (dummy_idx, inner) ->
+                  self#compile_expression inner;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH dummy_idx
+              | _ -> self#compile_lvalue b);
+              self#write_address_at deref_addr current_address;
+              self#write_instruction0 REF
           | OptionalMember (receiver, _, ClassMethod (_, method_no))
             when Ain.version ctx.ain > 8 ->
               (* v12 [receiver?.Property ?? fallback].  Like optional

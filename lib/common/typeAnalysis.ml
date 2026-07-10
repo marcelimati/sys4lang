@@ -2215,10 +2215,38 @@ class type_analyze_visitor ctx =
             | Ident (_, GlobalConstant) -> false
             | _ -> is_referenceable b
           in
-          (if a_is_ref_typed && Ain.version ctx.ain > 8
-              && not b_referenceable_for_wrap then
+          (* v12 value-form [recv?.field ?? fallback] on a scalar field:
+             codegen defers the field READ past the null-check merge as
+             a (page, index) pair and dereferences with a single [REF],
+             so the fallback too needs a home to point the pair at —
+             the [<dummy : 右辺値参照化用>] local the original compiler
+             allocates. Wrap a non-referenceable [b] so variableAlloc
+             backs it with that dummy. *)
+          let a_is_deferred_optional_field =
+            (* Codegen's deferred-pair arm additionally requires the
+               receiver to be a variable ref; call-result receivers fall
+               back to the generic protocol but still get the [b] wrap —
+               the original allocates the (then-unused) spill dummy for
+               them too, and matching its vars table keeps slot numbers
+               aligned. *)
+            Ain.version_gte ctx.ain (12, 0)
+            && (match a.node with
+               | OptionalMember (_, _, ClassVariable _) -> true
+               | _ -> false)
+            &&
+            match a.ty with
+            | Int | Bool | Float | Enum _ -> true
+            | _ -> false
+          in
+          (if (a_is_ref_typed || a_is_deferred_optional_field)
+              && Ain.version ctx.ain > 8
+              && not b_referenceable_for_wrap then (
             let inner = clone_expr b in
-            b.node <- RvalueRef inner);
+            b.node <- RvalueRef inner;
+            (* The spill dummy is typed after the FIELD being read
+               (orig: [<dummy : 右辺値参照化用> : bool] for a bool
+               field with a literal fallback), not after the literal. *)
+            if a_is_deferred_optional_field then b.ty <- a.ty));
           expr.ty <- (match a.ty with Ref t -> t | t -> t));
       (* v11 property read: any [Member] still tagged with [ClassProperty]
          after the main resolution pass is being used as an rvalue

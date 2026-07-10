@@ -1660,6 +1660,84 @@ let%expect_test "v12 optional compound assignment fuses getter onto checked rece
     334: EOF
     |}]
 
+(* v12 [recv?.field ?? fallback] on a scalar class field defers the
+   field READ past the ?? merge: the non-null branch pushes the
+   (page, index) pair plus a status marker instead of reading in-branch,
+   the fallback branch spills its value into a [右辺値参照化用] dummy and
+   pushes the dummy's pair, and a single trailing REF performs the read.
+   Regression: the read happened in-branch and null pushed a plain 0
+   while ?? tests the marker against -1 — the fallback never applied
+   (Rance10 [m_restoreInfo?.IsNeedRunEvent ?? true] evaluated false on
+   fresh quests, silently skipping the intro event). *)
+let%expect_test "v12 scalar optional field ?? defers the read past the merge" =
+  compile_test ~ain_version:12
+    {|
+      class R {
+      public:
+        int f;
+      };
+      class C {
+        ref R m_r;
+        int test();
+      };
+      int C::test() { return this.m_r?.f ?? 7; }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@test
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: DUP2
+    046: REF
+    048: PUSH -1
+    054: EQUALE
+    056: IFNZ 126
+    062: REF
+    064: PUSH 0
+    070: DUP_U2
+    072: PUSH -1
+    078: EQUALE
+    080: IFNZ 98
+    086: PUSH 0
+    092: JUMP 120
+    098: POP
+    100: POP
+    102: PUSH -1
+    108: PUSH -1
+    114: PUSH -1
+    120: JUMP 148
+    126: POP
+    128: POP
+    130: PUSH -1
+    136: PUSH -1
+    142: PUSH -1
+    148: PUSH -1
+    154: EQUALE
+    156: IFZ 196
+    162: POP
+    164: POP
+    166: PUSH 7
+    172: PUSHLOCALPAGE
+    174: SWAP
+    176: PUSH 0
+    182: SWAP
+    184: ASSIGN
+    186: POP
+    188: PUSHLOCALPAGE
+    190: PUSH 0
+    196: REF
+    198: RETURN
+    200: PUSH 0
+    206: RETURN
+    208: EOF test.jaf
+    214: FUNC NULL
+    220: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
