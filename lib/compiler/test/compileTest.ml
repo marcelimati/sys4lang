@@ -2136,6 +2136,132 @@ let%expect_test "v12 void-final optional chain stores its dummy 1-slot" =
     218: EOF
     |}]
 
+(* When the condition allocates dummies, the false path must jump TO the
+   else block and the then branch must replay the condition deletes and
+   jump OVER it. The old layout jumped the false path past the else and
+   let the then branch fall through into it: with a non-empty else, true
+   ran BOTH branches and false ran NEITHER (SceneQuestMap@ProcessNext's
+   else is CreateSelection(), so quest-map route choices never appeared). *)
+let%expect_test "v12 if/else with condition dummies routes both branches" =
+  compile_test ~ain_version:12
+    {|
+      class R {
+      public:
+        int P { get; set; }
+      };
+      class C {
+        ref R GetR();
+        void a();
+        void b();
+        void test();
+      };
+      ref R C::GetR() { return NULL; }
+      void C::a() {}
+      void C::b() {}
+      void C::test()
+      {
+        if (this.GetR().P == 1) {
+          this.a();
+        } else {
+          this.b();
+        }
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC R@P::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: RETURN
+    048: PUSH 0
+    054: RETURN
+    056: FUNC R@P::get
+    062: PUSHSTRUCTPAGE
+    064: PUSH 0
+    070: REF
+    072: RETURN
+    074: PUSH 0
+    080: RETURN
+    082: FUNC R@P::set
+    088: PUSHSTRUCTPAGE
+    090: PUSH 0
+    096: PUSHLOCALPAGE
+    098: PUSH 0
+    104: REF
+    106: ASSIGN
+    108: POP
+    110: RETURN
+    112: ENDFUNC R@P::set
+    118: FUNC C@GetR
+    124: PUSH -1
+    130: RETURN
+    132: PUSH -1
+    138: RETURN
+    140: FUNC C@a
+    146: RETURN
+    148: FUNC C@b
+    154: RETURN
+    156: FUNC C@test
+    162: PUSHSTRUCTPAGE
+    164: PUSH 1
+    170: CALLMETHOD NULL
+    176: PUSHLOCALPAGE
+    178: PUSH 0
+    184: REF
+    186: DELETE
+    188: PUSHLOCALPAGE
+    190: SWAP
+    192: PUSH 0
+    198: SWAP
+    200: ASSIGN
+    202: PUSH 5
+    208: CALLMETHOD NULL
+    214: PUSH 1
+    220: EQUALE
+    222: PUSHLOCALPAGE
+    224: PUSH 0
+    230: DUP2
+    232: REF
+    234: DELETE
+    236: PUSH -1
+    242: ASSIGN
+    244: POP
+    246: IFNZ 282
+    252: PUSHLOCALPAGE
+    254: PUSH 0
+    260: DUP2
+    262: REF
+    264: DELETE
+    266: PUSH -1
+    272: ASSIGN
+    274: POP
+    276: JUMP 326
+    282: PUSHSTRUCTPAGE
+    284: PUSH 2
+    290: CALLMETHOD NULL
+    296: PUSHLOCALPAGE
+    298: PUSH 0
+    304: DUP2
+    306: REF
+    308: DELETE
+    310: PUSH -1
+    316: ASSIGN
+    318: POP
+    320: JUMP 340
+    326: PUSHSTRUCTPAGE
+    328: PUSH 3
+    334: CALLMETHOD NULL
+    340: RETURN
+    342: EOF test.jaf
+    348: FUNC NULL
+    354: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)

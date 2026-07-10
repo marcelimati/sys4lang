@@ -382,11 +382,23 @@ class jaf_compiler ctx debug_info =
                     (* v12: skip Array-typed dummies here. They live to
                        [end_scope] and the [Array.Free <slot>] fires
                        there. Per-statement cleanup would double-free
-                       the slot's populated array. *)
+                       the slot's populated array.
+                       Keep ONLY page-holding dummies (the types
+                       [compile_delete_var] actually releases) — the
+                       recorded list replays as raw [SH_LOCALDELETE]s
+                       in if-branch cleanup, and a scalar spill (e.g.
+                       the TitleMenu 右辺値参照化用 enum in SceneTitle@0's
+                       parts lambda) holds a plain value: the 8-op
+                       expansion's [REF; DELETE] frees whatever PAGE ID
+                       that value names (title screen: pages 0..7 →
+                       DG_CALL argument-page death). Original treats
+                       such conditions as cleanup-free and uses the
+                       no-replay if layout. *)
                     List.filter raw ~f:(fun (v : Ain.Variable.t) ->
                         match v.value_type with
                         | Array _ -> false
-                        | _ -> true)
+                        | IFace _ | Ref _ | Struct _ -> true
+                        | _ -> false)
                   else raw
                 in
                 if Ain.version_gte ctx.ain (12, 0) then
@@ -7317,36 +7329,49 @@ class jaf_compiler ctx debug_info =
                   self#write_address_at end_jump_addr current_address)
             else (
               (* Original v12 if-with-cleanup layout (per dasm of original
-                 Rance10):
+                 Rance10 — SceneQuestMap@ProcessNext / GetMoveType /
+                 CheckNoLeader / RunCurrentObjectEvent):
                    cond
-                   [pre-IFZ replay]   (already emitted above)
-                   IFZ con_label      (or IFNZ if peeled LogNot)
-                   [post-IFZ replay]  (saved_last)
-                   JUMP cont_label
+                   [pre-IF replay]    (already emitted above)
+                   IFNZ con_label     (or IFZ if peeled LogNot)
+                   [false-path replay]  (saved_last)
+                   JUMP alt_label       (cont_label when alt is empty)
                    con_label: con
-                   [post-RETURN replay] (dead code; only if con is a
-                                         branch-exit statement —
-                                         emitting it unconditionally
-                                         breaks if con falls through,
-                                         e.g. the cleanup runs as live
-                                         code and corrupts slot state.) *)
-              let con_is_branch_exit = branch_exit_statement con in
+                   [post-con replay]    (saved_last — ALWAYS, even after
+                                         a returning con, where it is
+                                         dead code; the v12 8-op
+                                         LOCALDELETE expansion is
+                                         idempotent so the live case is
+                                         safe too)
+                   [JUMP end_label      only when alt is non-empty
+                   alt_label: alt]
+                   end/cont_label:
+                 The previous version jumped the false path PAST the alt
+                 and compiled alt as con's fallthrough: with a non-empty
+                 else, true executed BOTH branches and false executed
+                 NEITHER — SceneQuestMap@ProcessNext's else branch is
+                 CreateSelection(), so quest-map route choices never
+                 appeared. *)
               let branch_op = if peeled_lognot then IFZ else IFNZ in
               let if_addr = current_address + 2 in
               self#write_instruction1 branch_op 0;
               List.iter saved_last ~f:(fun idx ->
                   self#write_instruction1 SH_LOCALDELETE idx);
-              let cont_jump_addr = current_address + 2 in
+              let alt_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at if_addr current_address;
               self#compile_statement con;
-              if con_is_branch_exit then
-                List.iter saved_last ~f:(fun idx ->
-                    self#write_instruction1 SH_LOCALDELETE idx);
+              List.iter saved_last ~f:(fun idx ->
+                  self#write_instruction1 SH_LOCALDELETE idx);
               (match alt.node with
-              | EmptyStatement -> ()
-              | _ -> self#compile_statement alt);
-              self#write_address_at cont_jump_addr current_address))
+              | EmptyStatement ->
+                  self#write_address_at alt_jump_addr current_address
+              | _ ->
+                  let end_jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at alt_jump_addr current_address;
+                  self#compile_statement alt;
+                  self#write_address_at end_jump_addr current_address)))
           else (
             let ifz_addr = current_address + 2 in
             self#write_instruction1 IFZ 0;
