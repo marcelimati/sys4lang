@@ -1934,6 +1934,175 @@ let%expect_test "v12 optional setter ?? statement balances both arms" =
     358: EOF
     |}]
 
+(* Same protocol for an INTERFACE property receiver (orig exemplar
+   infoview::detail::CInfoText@SetAlpha): the setter arm runs FIRST
+   (IFNZ to the fallback), dispatches through the vtable selector with
+   the assigned value kept below the CALLMETHOD via DUP_X2, both arms
+   yield the value, and the statement POPs once. The old in-branch
+   shape left the fallback value unpopped — one slot leaked per
+   null-receiver execution on the per-frame infoview fades. *)
+let%expect_test "v12 iface optional setter ?? yields on both arms" =
+  compile_test ~ain_version:12
+    {|
+      interface IP {
+        int Alpha::get();
+        void Alpha::set(int value);
+      };
+      interface IB {
+        IP Core::get();
+      };
+      class P2 implements IP {
+        int Alpha { get; set; }
+      };
+      class B2 implements IB {
+        IP Core { get; set; }
+      };
+      class C {
+        IB m_box;
+        void test(int n);
+      };
+      void C::test(int n)
+      {
+        (this.m_box?.Core.Alpha = n) ?? n;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC P2@Alpha::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 1
+    044: REF
+    046: RETURN
+    048: PUSH 0
+    054: RETURN
+    056: FUNC P2@Alpha::get
+    062: PUSHSTRUCTPAGE
+    064: PUSH 1
+    070: REF
+    072: RETURN
+    074: PUSH 0
+    080: RETURN
+    082: FUNC P2@Alpha::set
+    088: PUSHSTRUCTPAGE
+    090: PUSH 1
+    096: PUSHLOCALPAGE
+    098: PUSH 0
+    104: REF
+    106: ASSIGN
+    108: POP
+    110: RETURN
+    112: ENDFUNC P2@Alpha::set
+    118: FUNC B2@Core::get
+    124: PUSHSTRUCTPAGE
+    126: PUSH 1
+    132: REFREF
+    134: DUP_U2
+    136: SP_INC
+    138: RETURN
+    140: ENDFUNC B2@Core::get
+    146: FUNC B2@Core::get
+    152: PUSHSTRUCTPAGE
+    154: PUSH 1
+    160: REFREF
+    162: DUP_U2
+    164: SP_INC
+    166: RETURN
+    168: ENDFUNC B2@Core::get
+    174: FUNC B2@Core::set
+    180: PUSHSTRUCTPAGE
+    182: PUSH 1
+    188: DUP2
+    190: REF
+    192: DELETE
+    194: PUSHLOCALPAGE
+    196: PUSH 0
+    202: REFREF
+    204: R_ASSIGN
+    206: POP
+    208: SP_INC
+    210: RETURN
+    212: ENDFUNC B2@Core::set
+    218: FUNC C@test
+    224: PUSHSTRUCTPAGE
+    226: PUSH 0
+    232: DUP2
+    234: REF
+    236: PUSH -1
+    242: EQUALE
+    244: IFNZ 322
+    250: REFREF
+    252: DUP_U2
+    254: PUSH 0
+    260: REF
+    262: SWAP
+    264: PUSH 0
+    270: ADD
+    272: REF
+    274: CALLMETHOD NULL
+    280: PUSHLOCALPAGE
+    282: PUSH 1
+    288: REF
+    290: DELETE
+    292: PUSHLOCALPAGE
+    294: DUP_X2
+    296: POP
+    298: PUSH 1
+    304: DUP_X2
+    306: POP
+    308: R_ASSIGN
+    310: PUSH 0
+    316: JUMP 344
+    322: POP
+    324: POP
+    326: PUSH -1
+    332: PUSH -1
+    338: PUSH -1
+    344: PUSH -1
+    350: EQUALE
+    352: IFNZ 404
+    358: DUP_U2
+    360: PUSH 0
+    366: REF
+    368: SWAP
+    370: PUSH 1
+    376: ADD
+    378: REF
+    380: PUSHLOCALPAGE
+    382: PUSH 0
+    388: REF
+    390: DUP_X2
+    392: CALLMETHOD IP@Alpha::get
+    398: JUMP 418
+    404: POP
+    406: POP
+    408: PUSHLOCALPAGE
+    410: PUSH 0
+    416: REF
+    418: POP
+    420: PUSHLOCALPAGE
+    422: PUSH 1
+    428: DUP2
+    430: REF
+    432: DELETE
+    434: PUSH -1
+    440: ASSIGN
+    442: POP
+    444: RETURN
+    446: EOF test.jaf
+    452: FUNC P2@0
+    458: RETURN
+    460: ENDFUNC P2@0
+    466: FUNC B2@0
+    472: RETURN
+    474: ENDFUNC B2@0
+    480: FUNC NULL
+    486: EOF
+    |}]
+
 (* v12 [obj?.M1().M2()] discarded statement, non-void tail: ONE receiver
    test guards the whole chain (links run in-branch, stored to their
    dummies, only the FINAL result is null-tested into the discard pair;

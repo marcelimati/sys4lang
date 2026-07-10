@@ -5931,16 +5931,52 @@ class jaf_compiler ctx debug_info =
               self#write_address_at optional_jump_addr current_address;
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 EQUALE;
-              let ifz_addr = current_address + 2 in
-              self#write_instruction1 IFZ 0;
-              self#write_instruction0 POP;
-              self#write_instruction0 POP;
-              self#compile_expression b;
-              let jump_addr = current_address + 2 in
-              self#write_instruction1 JUMP 0;
-              self#write_address_at ifz_addr current_address;
-              self#compile_method_call_for_receiver receiver.ty args method_no;
-              self#write_address_at jump_addr current_address
+              if self#is_value_prop_setter_method method_no args then (
+                (* [(obj?.IfaceProp.Value = rhs) ?? rhs] — orig (FUNC 5655
+                   infoview::detail::CInfoText@SetAlpha) lays the setter
+                   arm FIRST (IFNZ to the fallback), keeps the assigned
+                   value below the vtable CALLMETHOD via DUP_X2, and
+                   yields it on BOTH arms; the statement pops once and
+                   the dummy's LOCALDELETE (last-use tracking) follows.
+                   The old in-branch shape left the fallback value with
+                   no statement POP: one slot leaked per null receiver —
+                   the save-crash class, on the per-frame infoview
+                   fades. *)
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                let fallback_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#compile_method_selector receiver.ty method_no;
+                (let prev = in_prop_setter_arg in
+                 Exn.protect
+                   ~f:(fun () ->
+                     in_prop_setter_arg <- true;
+                     self#compile_function_arguments args f)
+                   ~finally:(fun () -> in_prop_setter_arg <- prev));
+                self#write_instruction0 DUP_X2;
+                (match List.hd (Ain.Function.logical_parameters f) with
+                | Some { value_type = String; _ } ->
+                    self#write_instruction0 A_REF
+                | _ -> ());
+                self#write_instruction1 CALLMETHOD f.nr_args;
+                let end_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at fallback_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#compile_expression b;
+                self#write_address_at end_addr current_address)
+              else (
+                let ifz_addr = current_address + 2 in
+                self#write_instruction1 IFZ 0;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#compile_expression b;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#compile_method_call_for_receiver receiver.ty args
+                  method_no;
+                self#write_address_at jump_addr current_address)
           | Call
               ( {
                   node =
@@ -6930,8 +6966,13 @@ class jaf_compiler ctx debug_info =
         when Ain.version_gte ctx.ain (12, 0)
              && Poly.equal expr.ty Void
              && (match sprop_receiver.ty with
-                | Struct (name, _) | Ref (Struct (name, _)) ->
-                    not (Hashtbl.mem ctx.interface_names name)
+                (* Both receiver shapes yield the assigned value across
+                   the ?? merge now — non-iface via the SWAP-dance arm,
+                   iface via the vtable-selector arm (CInfoText@
+                   SetAlpha protocol) — so the statement pops for
+                   either. This predicate, the two emission arms, and
+                   cleanup_after_pop must stay in lockstep. *)
+                | Struct _ | Ref (Struct _) -> true
                 | _ -> false)
              && self#is_value_prop_setter_method method_no args ->
           self#compile_expression expr;
@@ -7200,8 +7241,11 @@ class jaf_compiler ctx debug_info =
                   when Ain.version_gte ctx.ain (12, 0)
                        && Poly.equal e.ty Void
                        && (match sprop_receiver.ty with
-                          | Struct (name, _) | Ref (Struct (name, _)) ->
-                              not (Hashtbl.mem ctx.interface_names name)
+                          (* iface and non-iface setter-?? both yield
+                             the value and pop after the merge; keep in
+                             lockstep with the emission arms and the
+                             statement-POP predicate. *)
+                          | Struct _ | Ref (Struct _) -> true
                           | _ -> false)
                        && self#is_value_prop_setter_method method_no args ->
                     true
