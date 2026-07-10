@@ -2792,6 +2792,21 @@ class jaf_compiler ctx debug_info =
               self#emit_vtable_method_selector slot
           | None -> self#write_instruction1 PUSH method_no)
 
+    (** True iff [method_no] names a value property setter —
+        [Prop::set] taking one non-ref value parameter and returning
+        void. Optional-chain assignments through such setters yield
+        the assigned value across the ?? merge (kept below the call
+        via DUP_X2), so their statements pop once. *)
+    method private is_value_prop_setter_method method_no args =
+      let f = Ain.get_function_by_index ctx.ain method_no in
+      String.is_suffix f.name ~suffix:"::set"
+      && List.length args = 1
+      && Poly.equal f.return_type Ain.Type.Void
+      &&
+      match List.hd (Ain.Function.logical_parameters f) with
+      | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
+      | _ -> true
+
     method private same_lvalue_shape (a : expression) (b : expression) =
       match (a.node, b.node) with
       | This, This -> true
@@ -5897,6 +5912,104 @@ class jaf_compiler ctx debug_info =
                  above uses 2-slot ops (R_ASSIGN, DUP_X2); this case
                  uses 1-slot ops for plain struct dummies. *)
               self#pre_emit_lambda_args args;
+              let outer_setter =
+                (* [(obj?.Getter(..).Prop = rhs) ?? rhs] — optional
+                   property ASSIGNMENT through a call receiver. The
+                   getter-chain layout below leaves nothing on the
+                   non-null arm (void setter) but the fallback on the
+                   null arm, leaking one stack slot per null receiver
+                   at statement level — consumed later as garbage
+                   (page, index) by an unrelated ASSIGN (the Rance 10
+                   save dialog's 変数代入エラー via SaveObjectView@
+                   ParentPartsNumber::postset). The original yields
+                   the assigned value on BOTH arms: non-null branch
+                   FIRST (IFNZ to the fallback), setter deferred past
+                   the merge with the value kept below the call via
+                   DUP_X2, one statement POP, then the dummy's
+                   LOCALDELETE. *)
+                if
+                  (match receiver.ty with
+                  | Struct (name, _) | Ref (Struct (name, _)) ->
+                      not (Hashtbl.mem ctx.interface_names name)
+                  | _ -> false)
+                  && self#is_value_prop_setter_method method_no args
+                then Some (Ain.get_function_by_index ctx.ain method_no)
+                else None
+              in
+              (match outer_setter with
+              | Some f ->
+                  (* Register the dummy so statement cleanup emits its
+                     LOCALDELETE (after the statement POP, matching
+                     orig). *)
+                  self#scope_add_var (self#get_local dummy_idx);
+                  let obj_is_variable = is_variable_ref obj.node in
+                  if obj_is_variable then (
+                    (* Original keeps the receiver as a (page, index)
+                       pair across the null test and re-REFs it in the
+                       non-null branch. *)
+                    self#compile_variable_ref obj;
+                    self#write_instruction0 DUP2;
+                    self#write_instruction0 REF;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 EQUALE)
+                  else (
+                    self#compile_lvalue obj;
+                    self#write_instruction0 DUP;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 EQUALE);
+                  let recv_null_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  if obj_is_variable then self#write_instruction0 REF;
+                  self#compile_method_call_for_receiver obj.ty opt_args
+                    opt_method_no;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 REF;
+                  self#emit_slot_release;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction1 PUSH 0;
+                  self#write_instruction1 PUSH 0;
+                  let merge_jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at recv_null_addr current_address;
+                  if obj_is_variable then (
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP)
+                  else self#write_instruction0 POP;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction1 PUSH (-1);
+                  self#write_address_at merge_jump_addr current_address;
+                  self#write_instruction1 PUSH (-1);
+                  self#write_instruction0 EQUALE;
+                  let fallback_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction0 POP;
+                  self#compile_method_selector receiver.ty method_no;
+                  (let prev = in_prop_setter_arg in
+                   Exn.protect
+                     ~f:(fun () ->
+                       in_prop_setter_arg <- true;
+                       self#compile_function_arguments args f)
+                     ~finally:(fun () -> in_prop_setter_arg <- prev));
+                  self#write_instruction0 DUP_X2;
+                  (match List.hd (Ain.Function.logical_parameters f) with
+                  | Some { value_type = String; _ } ->
+                      self#write_instruction0 A_REF
+                  | _ -> ());
+                  self#write_instruction1 CALLMETHOD f.nr_args;
+                  let end_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at fallback_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#compile_expression b;
+                  self#write_address_at end_addr current_address
+              | None ->
               self#compile_lvalue obj;
               self#write_instruction0 DUP;
               self#write_instruction1 PUSH (-1);
@@ -5949,7 +6062,7 @@ class jaf_compiler ctx debug_info =
                  still on stack. *)
               self#write_instruction0 POP;
               self#compile_method_call_for_receiver receiver.ty args method_no;
-              self#write_address_at jump_addr current_address
+              self#write_address_at jump_addr current_address)
           | _ ->
           if
             Ain.version ctx.ain > 8
@@ -6609,6 +6722,54 @@ class jaf_compiler ctx debug_info =
           self#compile_expression expr;
           before_pop ();
           self#write_instruction0 POP
+      (* v12 [(obj?.Getter(..).Prop = rhs) ?? rhs] as a statement: the
+         optional-assignment arm yields the assigned value on both
+         paths (DUP_X2 protocol), so the statement pops once. The
+         dispatcher routes this shape through [cleanup_after_pop] so
+         the dummy's LOCALDELETE lands after the POP, matching orig.
+         Non-iface receivers only — the iface ?? arm still compiles
+         its setter branch without the value yield, so popping there
+         would underflow (CInfoText@SetAlpha, every fade frame). *)
+      | NullCoalesce
+          ( {
+              node =
+                Call
+                  ( {
+                      node =
+                        Member
+                          ( ({
+                               node =
+                                 DummyRef
+                                   ( _,
+                                     {
+                                       node =
+                                         Call
+                                           ( { node = OptionalMember _; _ },
+                                             _,
+                                             _ );
+                                       _;
+                                     } );
+                               _;
+                             } as sprop_receiver),
+                            _,
+                            _ );
+                      _;
+                    },
+                    args,
+                    MethodCall (_, method_no) );
+              _;
+            },
+            _ )
+        when Ain.version_gte ctx.ain (12, 0)
+             && Poly.equal expr.ty Void
+             && (match sprop_receiver.ty with
+                | Struct (name, _) | Ref (Struct (name, _)) ->
+                    not (Hashtbl.mem ctx.interface_names name)
+                | _ -> false)
+             && self#is_value_prop_setter_method method_no args ->
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP
       | DummyRef _ ->
           self#compile_lvalue expr;
           before_pop ();
@@ -6830,6 +6991,52 @@ class jaf_compiler ctx debug_info =
                     && (match e.ty with
                         | Int | Bool | Float | LongInt | Enum _ -> true
                         | _ -> false) ->
+                    true
+                (* v12 [(obj?.Getter(..).Prop = rhs) ?? rhs]: the
+                   statement POPs the assigned value the ?? merge
+                   yields; the receiver dummy's LOCALDELETE follows
+                   the POP in orig. *)
+                | NullCoalesce
+                    ( {
+                        node =
+                          Call
+                            ( {
+                                node =
+                                  Member
+                                    ( ({
+                                         node =
+                                           DummyRef
+                                             ( _,
+                                               {
+                                                 node =
+                                                   Call
+                                                     ( {
+                                                         node =
+                                                           OptionalMember _;
+                                                         _;
+                                                       },
+                                                       _,
+                                                       _ );
+                                                 _;
+                                               } );
+                                         _;
+                                       } as sprop_receiver),
+                                      _,
+                                      _ );
+                                _;
+                              },
+                              args,
+                              MethodCall (_, method_no) );
+                        _;
+                      },
+                      _ )
+                  when Ain.version_gte ctx.ain (12, 0)
+                       && Poly.equal e.ty Void
+                       && (match sprop_receiver.ty with
+                          | Struct (name, _) | Ref (Struct (name, _)) ->
+                              not (Hashtbl.mem ctx.interface_names name)
+                          | _ -> false)
+                       && self#is_value_prop_setter_method method_no args ->
                     true
                 | _ -> false)
           in

@@ -1807,6 +1807,133 @@ let%expect_test "v12 nested lambda delegate binds the executing struct page" =
     212: EOF
     |}]
 
+(* v12 optional property assignment under ??, receiver is a call result
+   (DummyRef). The original defers the SETTER past the marker merge with
+   the non-null branch laid out first (IFNZ to the fallback), keeps the
+   assigned value below the CALLMETHOD via DUP_X2 so the ?? expression
+   yields it on both arms, and the statement POPs it. Regression: the
+   null arm evaluated the fallback and RETURNed without popping —
+   leaking one stack slot per call with a null receiver
+   (SaveObjectView@ParentPartsNumber::postset; the save dialog's ASSIGN
+   crash with garbage page/index). *)
+let%expect_test "v12 optional setter ?? statement balances both arms" =
+  compile_test ~ain_version:12
+    {|
+      class R {
+      public:
+        int P { get; set; }
+      };
+      class A2 {
+      public:
+        ref R GetR(string key);
+      };
+      class C {
+        ref A2 m_act;
+        int m_q;
+        void test();
+      };
+      int R::P { get { return this.<P>; } set { this.<P> = value; } }
+      ref R A2::GetR(string key) { return NULL; }
+      void C::test()
+      {
+        (this.m_act?.GetR("").P = this.m_q) ?? this.m_q;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC R@P::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: RETURN
+    048: PUSH 0
+    054: RETURN
+    056: FUNC R@P::get
+    062: PUSHSTRUCTPAGE
+    064: PUSH 0
+    070: REF
+    072: RETURN
+    074: PUSH 0
+    080: RETURN
+    082: FUNC R@P::set
+    088: PUSHSTRUCTPAGE
+    090: PUSH 0
+    096: PUSHLOCALPAGE
+    098: PUSH 0
+    104: REF
+    106: ASSIGN
+    108: POP
+    110: RETURN
+    112: ENDFUNC R@P::set
+    118: FUNC A2@GetR
+    124: PUSH -1
+    130: RETURN
+    132: PUSH -1
+    138: RETURN
+    140: FUNC C@test
+    146: PUSHSTRUCTPAGE
+    148: PUSH 0
+    154: DUP2
+    156: REF
+    158: PUSH -1
+    164: EQUALE
+    166: IFNZ 236
+    172: REF
+    174: PUSH 4
+    180: S_PUSH ""
+    186: CALLMETHOD R@P::get
+    192: PUSHLOCALPAGE
+    194: PUSH 0
+    200: REF
+    202: DELETE
+    204: PUSHLOCALPAGE
+    206: SWAP
+    208: PUSH 0
+    214: SWAP
+    216: ASSIGN
+    218: PUSH 0
+    224: PUSH 0
+    230: JUMP 258
+    236: POP
+    238: POP
+    240: PUSH -1
+    246: PUSH -1
+    252: PUSH -1
+    258: PUSH -1
+    264: EQUALE
+    266: IFNZ 304
+    272: POP
+    274: PUSH 3
+    280: PUSHSTRUCTPAGE
+    282: PUSH 1
+    288: REF
+    290: DUP_X2
+    292: CALLMETHOD R@P::get
+    298: JUMP 318
+    304: POP
+    306: POP
+    308: PUSHSTRUCTPAGE
+    310: PUSH 1
+    316: REF
+    318: POP
+    320: PUSHLOCALPAGE
+    322: PUSH 0
+    328: DUP2
+    330: REF
+    332: DELETE
+    334: PUSH -1
+    340: ASSIGN
+    342: POP
+    344: RETURN
+    346: EOF test.jaf
+    352: FUNC NULL
+    358: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
