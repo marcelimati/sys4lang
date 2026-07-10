@@ -6721,19 +6721,42 @@ class jaf_compiler ctx debug_info =
             self#write_instruction0
               (if receiver_is_iface then REFREF else REF);
           self#compile_method_call_for_receiver obj.ty opt_args opt_method_no;
-          self#write_instruction0 PUSHLOCALPAGE;
-          self#write_instruction1 PUSH dummy_idx;
-          self#write_instruction0 REF;
-          self#write_instruction0 DELETE;
-          self#write_instruction0 PUSHLOCALPAGE;
-          self#write_instruction0 DUP_X2;
-          self#write_instruction0 POP;
-          self#write_instruction1 PUSH dummy_idx;
-          self#write_instruction0 DUP_X2;
-          self#write_instruction0 POP;
-          self#write_instruction0
-            (if receiver_is_iface || is_ref_scalar opt_call.ty then R_ASSIGN
-             else ASSIGN);
+          let stored_two_slots =
+            receiver_is_iface || is_ref_scalar opt_call.ty
+          in
+          if stored_two_slots then (
+            (* 2-slot link result (iface / ref-scalar pair): rotate the
+               pair under [page, index] with [DUP_X2; POP]. *)
+            self#write_instruction0 PUSHLOCALPAGE;
+            self#write_instruction1 PUSH dummy_idx;
+            self#write_instruction0 REF;
+            self#write_instruction0 DELETE;
+            self#write_instruction0 PUSHLOCALPAGE;
+            self#write_instruction0 DUP_X2;
+            self#write_instruction0 POP;
+            self#write_instruction1 PUSH dummy_idx;
+            self#write_instruction0 DUP_X2;
+            self#write_instruction0 POP;
+            self#write_instruction0 R_ASSIGN)
+          else (
+            (* 1-slot link result: the [DUP_X2] rotation reaches one slot
+               BELOW this statement's values, weaving the caller's pending
+               stack slot into the ASSIGN triple — a wild write
+               [page(dummy_idx)[caller_junk] = value] (the save-dialog
+               【 ASSIGN 】 Page:1 crash, SaveObjectView@SetZ/SetIndex/
+               SetShowNewFlat/SetPos). Original stores with the SWAP
+               dance (.STACK_LOCALASSIGN) and releases the dummy after
+               the statement POP. *)
+            self#scope_add_var (self#get_local dummy_idx);
+            self#write_instruction0 PUSHLOCALPAGE;
+            self#write_instruction1 PUSH dummy_idx;
+            self#write_instruction0 REF;
+            self#emit_slot_release;
+            self#write_instruction0 PUSHLOCALPAGE;
+            self#write_instruction0 SWAP;
+            self#write_instruction1 PUSH dummy_idx;
+            self#write_instruction0 SWAP;
+            self#write_instruction0 ASSIGN);
           self#compile_method_call_for_receiver receiver.ty args method_no;
           self#write_instruction1 PUSH 0;
           let jump_addr = current_address + 2 in
@@ -6747,8 +6770,13 @@ class jaf_compiler ctx debug_info =
             self#write_instruction0 POP);
           self#write_instruction1 PUSH (-1);
           self#write_address_at jump_addr current_address;
-          before_pop ();
-          self#write_instruction0 POP)
+          if stored_two_slots then (
+            before_pop ();
+            self#write_instruction0 POP)
+          else (
+            (* orig: statement POP first, then the dummy's LOCALDELETE *)
+            self#write_instruction0 POP;
+            before_pop ()))
       (* v12 [obj?.M1().M2()...Mn()] discarded statement where the final
          call returns a value (DummyRef-wrapped root). The original
          guards the ENTIRE chain on one receiver test: the non-null

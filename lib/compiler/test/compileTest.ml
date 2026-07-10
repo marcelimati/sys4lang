@@ -2050,6 +2050,92 @@ let%expect_test "v12 discarded optional chain guards every link" =
     326: EOF
     |}]
 
+(* The final call returning void leaves the chain root un-wrapped (no
+   DummyRef for a void result), so this takes the [obj?.Prop.Method()]
+   statement arm. Its 1-slot dummy store must use the SWAP dance — the
+   2-slot [DUP_X2; POP] rotation reaches below the statement's stack
+   and turns the ASSIGN into a wild write (save-dialog 【 ASSIGN 】
+   Page:1 crash, SaveObjectView@SetZ/SetIndex/SetShowNewFlat/SetPos) —
+   and the dummy's LOCALDELETE follows the statement POP. *)
+let%expect_test "v12 void-final optional chain stores its dummy 1-slot" =
+  compile_test ~ain_version:12
+    {|
+      class PMT {
+      public:
+        void SetNum(int a);
+      };
+      class P2 {
+      public:
+        ref PMT GetParts(int k);
+      };
+      class C {
+        ref P2 m_p;
+        void test();
+      };
+      void PMT::SetNum(int a) {}
+      ref PMT P2::GetParts(int k) { return NULL; }
+      void C::test()
+      {
+        this.m_p?.GetParts(0).SetNum(3);
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC PMT@SetNum
+    036: RETURN
+    038: FUNC P2@GetParts
+    044: PUSH -1
+    050: RETURN
+    052: PUSH -1
+    058: RETURN
+    060: FUNC C@test
+    066: PUSHSTRUCTPAGE
+    068: PUSH 0
+    074: DUP2
+    076: REF
+    078: PUSH -1
+    084: EQUALE
+    086: IFNZ 168
+    092: REF
+    094: PUSH 2
+    100: PUSH 0
+    106: CALLMETHOD PMT@SetNum
+    112: PUSHLOCALPAGE
+    114: PUSH 0
+    120: REF
+    122: DELETE
+    124: PUSHLOCALPAGE
+    126: SWAP
+    128: PUSH 0
+    134: SWAP
+    136: ASSIGN
+    138: PUSH 1
+    144: PUSH 3
+    150: CALLMETHOD PMT@SetNum
+    156: PUSH 0
+    162: JUMP 178
+    168: POP
+    170: POP
+    172: PUSH -1
+    178: POP
+    180: PUSHLOCALPAGE
+    182: PUSH 0
+    188: DUP2
+    190: REF
+    192: DELETE
+    194: PUSH -1
+    200: ASSIGN
+    202: POP
+    204: RETURN
+    206: EOF test.jaf
+    212: FUNC NULL
+    218: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
