@@ -1738,6 +1738,75 @@ let%expect_test "v12 scalar optional field ?? defers the read past the merge" =
     220: EOF
     |}]
 
+(* v12 delegate builds for lambdas created INSIDE another lambda bind
+   the executing frame's struct page (degrades to -1 at runtime when
+   unbound); only top-level lambdas in plain functions bind -1.
+   Regression: the "@" name heuristic missed our lambda names, so inner
+   builds pushed -1 and the delegate fired on a NULL page from the
+   engine pump (Rance10 RunMapQuest event factories). *)
+let%expect_test "v12 nested lambda delegate binds the executing struct page" =
+  compile_test ~ain_version:12
+    {|
+      delegate void dg();
+      void test() {
+        dg a = () => void {
+          dg b = () => void {
+          };
+          b();
+        };
+        a();
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC test
+    036: JUMP 132
+    042: FUNC <lambda : test()(4, 16)>
+    048: JUMP 68
+    054: FUNC <lambda : <lambda : test()(4, 16)>()(5, 18)>
+    060: RETURN
+    062: ENDFUNC <lambda : <lambda : test()(4, 16)>()(5, 18)>
+    068: PUSHLOCALPAGE
+    070: PUSH 0
+    076: REF
+    078: PUSHSTRUCTPAGE
+    080: PUSH 3
+    086: DG_NEW_FROM_METHOD
+    088: DG_ASSIGN
+    090: DELETE
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: DG_CALLBEGIN delegate(0)
+    108: DG_CALL delegate(0), 124
+    118: JUMP 108
+    124: RETURN
+    126: ENDFUNC <lambda : test()(4, 16)>
+    132: PUSHLOCALPAGE
+    134: PUSH 0
+    140: REF
+    142: PUSH -1
+    148: PUSH 2
+    154: DG_NEW_FROM_METHOD
+    156: DG_ASSIGN
+    158: DELETE
+    160: PUSHLOCALPAGE
+    162: PUSH 0
+    168: REF
+    170: DG_CALLBEGIN delegate(0)
+    176: DG_CALL delegate(0), 192
+    186: JUMP 176
+    192: RETURN
+    194: ENDFUNC test
+    200: EOF test.jaf
+    206: FUNC NULL
+    212: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)

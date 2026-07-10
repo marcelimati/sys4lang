@@ -5116,10 +5116,23 @@ class jaf_compiler ctx debug_info =
       | Lambda f ->
           let lambda_idx = Option.value_exn f.index in
           let emit_lambda_receiver () =
+            (* The delegate's bound page is the executing frame: struct
+               page inside methods, and inside LAMBDA bodies too — a
+               nested lambda must inherit the enclosing lambda's page or
+               its env chain breaks and firing it CALLMETHODs a NULL
+               object (Rance10 quest-map selection events: startEvent /
+               endEvent lambdas built inside the RunMapQuest factory
+               lambda). Lambdas hosted by static functions run with page
+               -1, where PUSHSTRUCTPAGE degrades to -1 at runtime — same
+               encoding the original emits. Our lambda names don't carry
+               the original's [Class@] prefix, so the "@" check alone
+               misses lambdas nested in static-function lambdas — also
+               match the [<lambda] marker every generated name embeds. *)
             match current_function with
             | Some f
               when Option.is_some f.struct_type
-                   || String.is_substring f.name ~substring:"@" ->
+                   || String.is_substring f.name ~substring:"@"
+                   || String.is_substring f.name ~substring:"<lambda" ->
                 self#write_instruction0 PUSHSTRUCTPAGE
             | _ -> self#write_instruction1 PUSH (-1)
           in
