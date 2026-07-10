@@ -498,3 +498,48 @@ let insert_option expr obj =
   match obj with
   | Load lval -> subst expr (RefTo lval) (Option (RefTo lval))
   | _ -> expr
+
+(* Like [insert_option], but substitutes only along the receiver spine
+   of [expr] — the leftmost chain of call/member receivers. Other
+   occurrences of [obj] (e.g. call arguments that reread the checked
+   variable, [p?.Motion().SetPos(p.X, ...)]) stay plain: the original
+   bytecode tests the receiver once and reads it plainly inside the
+   guarded region. Falls back to the blanket [insert_option] when
+   [obj] is not on the spine, so the null check is never dropped. *)
+let insert_option_spine expr obj =
+  let obj' = match obj with Load lval -> Some (RefTo lval) | _ -> None in
+  let found = ref false in
+  let matches e =
+    Poly.equal e obj
+    || match obj' with Some o -> Poly.equal e o | None -> false
+  in
+  let rec walk e =
+    if matches e then (
+      found := true;
+      Option e)
+    else
+      match e with
+      | Call (Method (r, f), args) -> Call (Method (walk r, f), args)
+      | Call (FuncPtr (ft, r), args) -> Call (FuncPtr (ft, walk r), args)
+      | Call (Delegate (ft, r), args) -> Call (Delegate (ft, walk r), args)
+      | Call (Builtin2 (insn, r), args) -> Call (Builtin2 (insn, walk r), args)
+      | Load lv -> Load (walk_lv lv)
+      | RefTo lv -> RefTo (walk_lv lv)
+      | TempRef (v, e) -> TempRef (v, walk e)
+      (* dummy-slot stores ([.STACK_LOCALASSIGN]) wrap each link of a
+         call chain; the spine continues through the stored value *)
+      | AssignOp (op, lv, rhs) -> AssignOp (op, lv, walk rhs)
+      | Copy e -> Copy (walk e)
+      | Option e -> Option (walk e)
+      | _ -> e
+  and walk_lv lv =
+    match lv with
+    | Member (e, v) -> Member (walk e, v)
+    | Slot (e, i) -> Slot (walk e, i)
+    | Elem (e, i) -> Elem (walk e, i)
+    | Pointee e -> Pointee (walk e)
+    | IncDec (fix, op, inner) -> IncDec (fix, op, walk_lv inner)
+    | Var _ | NullPlace -> lv
+  in
+  let spined = walk expr in
+  if !found then spined else insert_option expr obj

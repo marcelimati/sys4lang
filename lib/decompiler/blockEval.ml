@@ -632,6 +632,23 @@ let analyze (env : env) ~address ~end_address ~instructions (state : state) =
             if Ain.Variable.is_dummy var || not (List.is_empty ctx.stack) then
               ()
             else emit_statement ctx (VarDecl (var, None))
+        | Option obj
+          when Ain.ain.vers >= 12
+               && (match (ctx.stack, List.hd ctx.instructions) with
+                  | next :: _, Some { txt = POP; _ } ->
+                      contains_interface_expr next obj
+                  | _ -> false) ->
+            (* A discarded optional chain: [POP; POP] drops the null
+               marker and then the guarded chain itself. The chain
+               still contains the null-checked receiver — weave the
+               check back in so the statement keeps its [?.]
+               (SaveObjectView@SetSortedIndex's [p?.Motion().SetPos]
+               decompiled to an unguarded [p.Motion()], a CALLMETHOD
+               on NULL when the view has no activity). Dropping the
+               marker silently would lose the guard. *)
+            update_stack ctx (function
+              | next :: rest -> insert_option_spine next obj :: rest
+              | stack -> unexpected_stack "POP (Option)" stack)
         | e when is_discardable_by_pop e || is_null_in_this_branch ctx e -> ()
         | e when List.is_empty ctx.stack -> emit_expression ctx e
         | (AssignOp _ | Call _) as e ->
