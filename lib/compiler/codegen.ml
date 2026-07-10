@@ -2807,6 +2807,60 @@ class jaf_compiler ctx debug_info =
       | Some { value_type = IFace _ | Ref _ | Wrap _; _ } -> false
       | _ -> true
 
+    (** Match a discarded optional method chain —
+        [DummyRef(dN, Call(Member(... DummyRef(d1, Call(OptionalMember
+        (obj), a1, m1)) ...), aN, mN))] — returning the checked
+        receiver and the links innermost-first as
+        [(dummy_idx, receiver_ty, args, method_no)]. Only multi-link
+        plain-struct chains: single links and interface receivers keep
+        their existing paths. *)
+    method private match_discarded_optional_chain (expr : expression) =
+      let is_iface (ty : jaf_type) =
+        match ty with
+        | Struct (name, _) | Ref (Struct (name, _)) ->
+            Hashtbl.mem ctx.interface_names name
+        | _ -> false
+      in
+      let rec peel (e : expression) =
+        match e.node with
+        | DummyRef
+            ( idx,
+              {
+                node =
+                  Call
+                    ( { node = OptionalMember (obj, _, _); _ },
+                      args,
+                      MethodCall (_, mno) );
+                _;
+              } ) ->
+            Some (obj, [ (idx, obj.ty, args, mno) ])
+        | DummyRef
+            ( idx,
+              {
+                node =
+                  Call
+                    ( { node = Member (recv, _, ClassMethod _); _ },
+                      args,
+                      MethodCall (_, mno) );
+                _;
+              } ) ->
+            Option.map (peel recv) ~f:(fun (obj, links) ->
+                (obj, links @ [ (idx, recv.ty, args, mno) ]))
+        | _ -> None
+      in
+      match expr.node with
+      | DummyRef _ -> (
+          match peel expr with
+          | Some (obj, links)
+            when List.length links >= 2
+                 && (not (is_iface obj.ty))
+                 && not
+                      (List.exists links ~f:(fun (_, rty, _, _) ->
+                           is_iface rty)) ->
+              Some (obj, links)
+          | _ -> None)
+      | _ -> None
+
     method private same_lvalue_shape (a : expression) (b : expression) =
       match (a.node, b.node) with
       | This, This -> true
@@ -6695,6 +6749,79 @@ class jaf_compiler ctx debug_info =
           self#write_address_at jump_addr current_address;
           before_pop ();
           self#write_instruction0 POP)
+      (* v12 [obj?.M1().M2()...Mn()] discarded statement where the final
+         call returns a value (DummyRef-wrapped root). The original
+         guards the ENTIRE chain on one receiver test: the non-null
+         branch runs every link (each stored to its dummy, no
+         intermediate tests) and null-tests only the FINAL result to
+         build the (value, marker) discard pair; the null branch
+         bypasses everything with a (-1, -1) pair; the merge pops both
+         and the dummies' LOCALDELETEs follow. Compiling the inner
+         [obj?.M1()] as its own optional unit instead normalizes NULL
+         to -1 and runs [.M2()] on it — CALLMETHOD on a NULL page
+         (SaveObjectView@SetSortedIndex [p?.Motion().SetPos(..)] with
+         no activity attached, on the save dialog path). *)
+      | DummyRef _
+        when Ain.version_gte ctx.ain (12, 0)
+             && Option.is_some (self#match_discarded_optional_chain expr) ->
+          (match self#match_discarded_optional_chain expr with
+          | None -> assert false
+          | Some (obj, links) ->
+              List.iter links ~f:(fun (_, _, args, _) ->
+                  self#pre_emit_lambda_args args);
+              let obj_is_variable = is_variable_ref obj.node in
+              (if obj_is_variable then (
+                 self#compile_variable_ref obj;
+                 self#write_instruction0 DUP2;
+                 self#write_instruction0 REF;
+                 self#write_instruction1 PUSH (-1);
+                 self#write_instruction0 EQUALE)
+               else (
+                 self#compile_lvalue obj;
+                 self#write_instruction0 DUP;
+                 self#write_instruction1 PUSH (-1);
+                 self#write_instruction0 EQUALE));
+              let null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              if obj_is_variable then self#write_instruction0 REF;
+              List.iter links ~f:(fun (idx, recv_ty, args, mno) ->
+                  self#compile_method_call_for_receiver recv_ty args mno;
+                  self#scope_add_var (self#get_local idx);
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH idx;
+                  self#write_instruction0 REF;
+                  self#emit_slot_release;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH idx;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN);
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let tail_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction1 PUSH 0;
+              let tail_join = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at tail_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at tail_join current_address;
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at null_addr current_address;
+              (if obj_is_variable then (
+                 self#write_instruction0 POP;
+                 self#write_instruction0 POP)
+               else self#write_instruction0 POP);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_jump current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              before_pop ())
       (* v11 [obj?.Method()] / [obj?.HllCall()] used as a statement: the
          optional chain leaves a fat-null sentinel int on the stack
          (0 for success, -1 for null) that must be discarded. The

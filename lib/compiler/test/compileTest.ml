@@ -1934,6 +1934,122 @@ let%expect_test "v12 optional setter ?? statement balances both arms" =
     358: EOF
     |}]
 
+(* v12 [obj?.M1().M2()] discarded statement, non-void tail: ONE receiver
+   test guards the whole chain (links run in-branch, stored to their
+   dummies, only the FINAL result is null-tested into the discard pair;
+   the null arm bypasses everything). Regression: the inner optional
+   call normalized NULL to -1 and ran .M2() on it — CALLMETHOD on a
+   NULL page (SaveObjectView@SetSortedIndex p?.Motion().SetPos on the
+   save dialog path). *)
+let%expect_test "v12 discarded optional chain guards every link" =
+  compile_test ~ain_version:12
+    {|
+      class PMT {
+      public:
+        ref PMT SetPos(int a, int b);
+      };
+      class P2 {
+      public:
+        ref PMT Motion();
+      };
+      class C {
+        ref P2 m_p;
+        void test();
+      };
+      ref PMT PMT::SetPos(int a, int b) { return NULL; }
+      ref PMT P2::Motion() { return NULL; }
+      void C::test()
+      {
+        this.m_p?.Motion().SetPos(1, 2);
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC PMT@SetPos
+    036: PUSH -1
+    042: RETURN
+    044: PUSH -1
+    050: RETURN
+    052: FUNC P2@Motion
+    058: PUSH -1
+    064: RETURN
+    066: PUSH -1
+    072: RETURN
+    074: FUNC C@test
+    080: PUSHSTRUCTPAGE
+    082: PUSH 0
+    088: DUP2
+    090: REF
+    092: PUSH -1
+    098: EQUALE
+    100: IFNZ 244
+    106: REF
+    108: PUSH 2
+    114: CALLMETHOD NULL
+    120: PUSHLOCALPAGE
+    122: PUSH 0
+    128: REF
+    130: DELETE
+    132: PUSHLOCALPAGE
+    134: SWAP
+    136: PUSH 0
+    142: SWAP
+    144: ASSIGN
+    146: PUSH 1
+    152: PUSH 1
+    158: PUSH 2
+    164: CALLMETHOD P2@Motion
+    170: PUSHLOCALPAGE
+    172: PUSH 1
+    178: REF
+    180: DELETE
+    182: PUSHLOCALPAGE
+    184: SWAP
+    186: PUSH 1
+    192: SWAP
+    194: ASSIGN
+    196: DUP
+    198: PUSH -1
+    204: EQUALE
+    206: IFNZ 224
+    212: PUSH 0
+    218: JUMP 238
+    224: POP
+    226: PUSH -1
+    232: PUSH -1
+    238: JUMP 260
+    244: POP
+    246: POP
+    248: PUSH -1
+    254: PUSH -1
+    260: POP
+    262: POP
+    264: PUSHLOCALPAGE
+    266: PUSH 1
+    272: DUP2
+    274: REF
+    276: DELETE
+    278: PUSH -1
+    284: ASSIGN
+    286: POP
+    288: PUSHLOCALPAGE
+    290: PUSH 0
+    296: DUP2
+    298: REF
+    300: DELETE
+    302: PUSH -1
+    308: ASSIGN
+    310: POP
+    312: RETURN
+    314: EOF test.jaf
+    320: FUNC NULL
+    326: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
