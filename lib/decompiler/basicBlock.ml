@@ -279,6 +279,15 @@ let nullable_member_value ~obj ~conds (ok : state) (null : state) =
        ok: [] stmts = stmt :: S        null: [] stmts = S
      => stmt{obj -> Option obj} *)
 let nullable_member_statement ~obj ~conds (ok : state) (null : state) =
+  (* Spine-only substitution: the original tests the receiver ONCE and
+     reads it plainly inside the guarded region. Blanket-wrapping every
+     occurrence also turned same-receiver ARGUMENT calls into their own
+     optional units — [v?.SetColor(v?.GetColor() != -1 ? ..)] — which
+     recompiles the inner call to a (value, marker) pair whose marker
+     the comparison consumes, leaving the value to be eaten by the
+     outer CALLMETHOD as its function number:【 CALLMETHOD 】
+     存在しない関数番号 -1 (QuestMapObjectViewColletion@SetRouteColor, first
+     route-selection on the quest map). *)
   match (ok.stack, ok.stmts, null.stack) with
   | ( e1 :: es1,
       ({ txt = Expression expr; _ } as stmt) :: stmts1,
@@ -295,7 +304,8 @@ let nullable_member_statement ~obj ~conds (ok : state) (null : state) =
           condition = conds;
           stack = Option obj :: es1;
           stmts =
-            { stmt with txt = Expression (insert_option expr obj) } :: stmts1;
+            { stmt with txt = Expression (insert_option_spine expr obj) }
+            :: stmts1;
         }
   | [], ({ txt = Expression expr; _ } as stmt) :: stmts1, []
     when stmts1 == null.stmts -> (
@@ -306,7 +316,7 @@ let nullable_member_statement ~obj ~conds (ok : state) (null : state) =
               condition = conds;
               stack = [];
               stmts =
-                { stmt with txt = Expression (insert_option expr obj) }
+                { stmt with txt = Expression (insert_option_spine expr obj) }
                 :: stmts1;
             }
       | _ -> None)
