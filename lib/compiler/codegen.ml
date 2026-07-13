@@ -6911,6 +6911,48 @@ class jaf_compiler ctx debug_info =
             self#compile_expression expr;
             before_pop ();
             self#write_instruction0 POP)
+      (* v12 [obj?.Method(...)] / [obj?.Prop.Method(...)] discarded as a
+         statement when the method returns a scalar: the optional
+         protocol merges a (value, marker) pair — the Void arms above
+         pop only the sentinel, but here the ignored return value sits
+         under it and must be popped too. Leaving it leaks one stack
+         slot per execution; the parts framework's DG_CALL loop then
+         consumes the leaked [true] as a delegate page id (survey-open
+         【 DG_CALL 】 ページ番号 = 1 via CEnqueteItemManager@SetEnable /
+         CEnqueteItemCheckIcon@SetEnable). *)
+      | Call ({ node = OptionalMember _; _ }, _, (MethodCall _ | HLLCall _))
+      | Call
+          ( {
+              node =
+                Member
+                  ( {
+                      node =
+                        DummyRef
+                          ( _,
+                            {
+                              node =
+                                Call
+                                  ( { node = OptionalMember _; _ },
+                                    _,
+                                    MethodCall _ );
+                              _;
+                            } );
+                      _;
+                    },
+                    _,
+                    _ );
+              _;
+            },
+            _,
+            MethodCall _ )
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match expr.ty with
+                | Int | Bool | Float | LongInt | Enum _ -> true
+                | _ -> false) ->
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP;
+          self#write_instruction0 POP
       | NullCoalesce
           ( {
               node =

@@ -2305,6 +2305,119 @@ let%expect_test "v12 void-final optional chain stores its dummy 1-slot" =
     218: EOF
     |}]
 
+(* A discarded optional call whose method returns a value merges a
+   (value, marker) pair: the statement must pop BOTH. Popping only the
+   sentinel leaks the ignored return value one stack slot per execution
+   (CEnqueteItemManager@SetEnable / CEnqueteItemCheckIcon@SetEnable each
+   leaked [true] per foreach step; the parts framework's next DG_CALL
+   read the leaked 1 as a delegate page id — survey-open
+   【 DG_CALL 】 ページ番号 = 1). *)
+let%expect_test "v12 discarded non-void optional call pops value and marker" =
+  compile_test ~ain_version:12
+    {|
+      class AB {
+      public:
+        bool SetEnable(int n);
+      };
+      class C {
+        ref AB A { get; set; }
+        void test();
+      };
+      bool AB::SetEnable(int n) { return 1; }
+      void C::test()
+      {
+        this.A?.SetEnable(1);
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@A::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: DUP
+    048: SP_INC
+    050: RETURN
+    052: ENDFUNC C@A::get
+    058: FUNC C@A::get
+    064: PUSHSTRUCTPAGE
+    066: PUSH 0
+    072: REF
+    074: DUP
+    076: SP_INC
+    078: RETURN
+    080: ENDFUNC C@A::get
+    086: FUNC C@A::set
+    092: PUSHSTRUCTPAGE
+    094: PUSH 0
+    100: DUP2
+    102: REF
+    104: DELETE
+    106: PUSHLOCALPAGE
+    108: PUSH 0
+    114: REF
+    116: ASSIGN
+    118: SP_INC
+    120: RETURN
+    122: ENDFUNC C@A::set
+    128: FUNC AB@SetEnable
+    134: PUSH 1
+    140: RETURN
+    142: PUSH 0
+    148: RETURN
+    150: FUNC C@test
+    156: PUSHSTRUCTPAGE
+    158: PUSH 2
+    164: CALLMETHOD NULL
+    170: PUSHLOCALPAGE
+    172: PUSH 0
+    178: REF
+    180: DELETE
+    182: PUSHLOCALPAGE
+    184: SWAP
+    186: PUSH 0
+    192: SWAP
+    194: ASSIGN
+    196: DUP
+    198: PUSH -1
+    204: EQUALE
+    206: IFNZ 242
+    212: PUSH 1
+    218: PUSH 1
+    224: CALLMETHOD AB@SetEnable
+    230: PUSH 0
+    236: JUMP 256
+    242: POP
+    244: PUSH -1
+    250: PUSH -1
+    256: POP
+    258: POP
+    260: PUSHLOCALPAGE
+    262: PUSH 0
+    268: DUP2
+    270: REF
+    272: DELETE
+    274: PUSH -1
+    280: ASSIGN
+    282: POP
+    284: RETURN
+    286: EOF test.jaf
+    292: FUNC C@0
+    298: PUSHSTRUCTPAGE
+    300: PUSH 0
+    306: PUSH -1
+    312: ASSIGN
+    314: POP
+    316: RETURN
+    318: ENDFUNC C@0
+    324: FUNC NULL
+    330: EOF
+    |}]
+
 (* When the condition allocates dummies, the false path must jump TO the
    else block and the then branch must replay the condition deletes and
    jump OVER it. The old layout jumped the false path past the else and
