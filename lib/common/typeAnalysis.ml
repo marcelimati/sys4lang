@@ -2285,14 +2285,24 @@ class type_analyze_visitor ctx =
                back to the generic protocol but still get the [b] wrap —
                the original allocates the (then-unused) spill dummy for
                them too, and matching its vars table keeps slot numbers
-               aligned. *)
+               aligned.
+               String fields take their own protocol (in-branch read +
+               marker merge + [A_REF]) but need the same spill dummy for
+               the fallback: without it the fallback has no home and,
+               worse, the merged string was consumed un-bumped — the
+               assignment's trailing [DELETE] then freed the SOURCE
+               member's own string page ([SpecificBattleSkillConverter@0]
+               freed [g_enemy.CreateId]; the next construction — via
+               [LeaderCard@UpdateSkillCache]'s postset chain at battle
+               entry — read the dead page: ページの取得に失敗２
+               [S_ASSIGN]). *)
             Ain.version_gte ctx.ain (12, 0)
             && (match a.node with
                | OptionalMember (_, _, ClassVariable _) -> true
                | _ -> false)
             &&
             match a.ty with
-            | Int | Bool | Float | Enum _ -> true
+            | Int | Bool | Float | Enum _ | String -> true
             | _ -> false
           in
           (if (a_is_ref_typed || a_is_deferred_optional_field)

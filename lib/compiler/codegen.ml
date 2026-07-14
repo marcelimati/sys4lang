@@ -5377,6 +5377,83 @@ class jaf_compiler ctx debug_info =
             | _ -> false
           in
           match a_inner.node with
+          | Binary (((Equal | NEqual) as cmp_op), cmp_lhs, cmp_rhs)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (let rec strip (e : expression) =
+                       match e.node with
+                       | DummyRef (_, inner)
+                       | Cast (_, inner)
+                       | RvalueRef inner ->
+                           strip inner
+                       | _ -> e
+                     in
+                     match (strip cmp_lhs).node with
+                    | OptionalMember (r, _, ClassMethod _) ->
+                        is_variable_ref r.node
+                    | Call
+                        ( { node = OptionalMember (r, _, ClassMethod _); _ },
+                          _,
+                          MethodCall _ ) ->
+                        is_variable_ref r.node
+                    | _ -> false) ->
+              (* v12 [(recv?.Prop == X) ?? fb] — the null test wraps the
+                 WHOLE comparison: orig tests the receiver, jumps to the
+                 fallback when null, and re-reads the receiver for a
+                 plain getter + compare in the live arm. Routing the
+                 inner optional through the generic (value, marker)
+                 protocol instead EQUALEs the MARKER against X and
+                 strands the value slot — a one-slot VM stack leak per
+                 execution that detonates in the caller's next page
+                 op. Exemplar (only site in Rance10):
+                 [CardApView@Set]'s
+                 [s?.Kind == SkillKind::Action ?? false] leaked during
+                 BattleCardButton construction; the collection's
+                 element store then died as 【 DeletePage 】 at battle
+                 entry. *)
+              let receiver, getter_no =
+                let rec strip (e : expression) =
+                  match e.node with
+                  | DummyRef (_, inner) | Cast (_, inner) | RvalueRef inner ->
+                      strip inner
+                  | _ -> e
+                in
+                match (strip cmp_lhs).node with
+                | OptionalMember (r, _, ClassMethod (_, g)) -> (r, g)
+                | Call ({ node = OptionalMember (r, _, ClassMethod (_, g)); _ },
+                        _, _ ) ->
+                    (r, g)
+                | _ ->
+                    compiler_bug "optional-compare ?? arm: unexpected lhs"
+                      (Some (ASTExpression expr))
+              in
+              let emit_recv_value () =
+                self#compile_variable_ref receiver;
+                (match receiver.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.Wrap (Ain.Type.Ref _)
+                    | Ain.Type.Wrap (Ain.Type.IFace _) ->
+                        self#write_instruction0 REFREF
+                    | _ -> ())
+                | _ -> ());
+                self#write_instruction0 REF
+              in
+              emit_recv_value ();
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let live_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#compile_expression b;
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at live_addr current_address;
+              emit_recv_value ();
+              self#write_instruction1 PUSH getter_no;
+              self#write_instruction1 CALLMETHOD 0;
+              self#compile_expression cmp_rhs;
+              self#write_instruction0
+                (match cmp_op with Equal -> EQUALE | _ -> NOTE);
+              self#write_address_at merge_jump current_address
           | OptionalMember (receiver, _, ClassVariable var_no)
             when Ain.version_gte ctx.ain (12, 0)
                  && is_variable_ref receiver.node
@@ -5460,6 +5537,85 @@ class jaf_compiler ctx debug_info =
               | _ -> self#compile_lvalue b);
               self#write_address_at deref_addr current_address;
               self#write_instruction0 REF
+          | OptionalMember (receiver, _, ClassVariable var_no)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && is_variable_ref receiver.node
+                 && (match expr.ty with String -> true | _ -> false) ->
+              (* v12 [recv?.strfield ?? fallback], string field, value
+                 form. Unlike the scalar deferral above, the original
+                 reads the string page IN the not-null branch (with its
+                 own null test on the string itself), merges a (value,
+                 marker) pair, stores the fallback into the [<dummy :
+                 右辺値参照化用>] spill (releasing the dummy's old value
+                 first), and [A_REF]s the merged result — the read is a
+                 borrowed page ref, and the consumer's trailing [DELETE]
+                 (e.g. after [S_ASSIGN]) must not free the source
+                 member's only reference. Our old in-branch shape
+                 skipped the dummy and the bump: constructing
+                 [SpecificBattleSkillConverter] freed [g_enemy.CreateId]
+                 and the next construction crashed battle entry with
+                 [ページの取得に失敗２：S_ASSIGN]. *)
+              let is_wrap_ref_local =
+                match receiver.node with
+                | Ident (_, LocalVariable (i, _)) -> (
+                    match (self#get_local i).value_type with
+                    | Ain.Type.Wrap (Ain.Type.Ref _) -> true
+                    | Ain.Type.Wrap (Ain.Type.IFace _) -> true
+                    | _ -> false)
+                | _ -> false
+              in
+              self#compile_variable_ref receiver;
+              if is_wrap_ref_local then self#write_instruction0 REFREF;
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let outer_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let inner_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction1 PUSH 0;
+              let inner_ok_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at inner_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at inner_ok_jump current_address;
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at outer_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_jump current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let live_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              (match b.node with
+              | DummyRef (dummy_idx, inner) ->
+                  self#compile_expression inner;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 REF;
+                  self#write_instruction0 DELETE;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN
+              | _ -> self#compile_expression b);
+              self#write_address_at live_addr current_address;
+              self#write_instruction0 A_REF
           | OptionalMember (receiver, _, ClassMethod (_, method_no))
             when Ain.version ctx.ain > 8 ->
               (* v12 [receiver?.Property ?? fallback].  Like optional
