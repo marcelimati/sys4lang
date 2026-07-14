@@ -939,6 +939,20 @@ class type_analyze_visitor ctx =
          21, ours emitted 0). Covers returns and call arguments. *)
       (match (rhs.node, t, rhs.ty) with
       | ArrayLiteral [], Array elem, Array Void -> rhs.ty <- Array elem
+      (* Non-empty literals too: element inference takes the FIRST
+         element's type, so [[this]] into an [array@ref CASTask]
+         parameter came out [array<CASTask>] — PushBack with the
+         VALUE-struct element code 13 DEEP-COPIES the task instead of
+         storing the reference (orig: code 21). CASTask@Next/Join1-5
+         joined COPIES, the real child task never scheduled, and its
+         motion-finish callback never fired: the overkill bar's
+         busy-wait spun forever after the first battle overkill. Trust
+         the declared element type whenever the inferred one is
+         implicitly convertible to it ([type_equal] covers ref<->value
+         struct and int<->enum). *)
+      | ArrayLiteral (_ :: _), Array te, Array ta
+        when (not (Poly.equal te ta)) && type_equal te ta ->
+          rhs.ty <- t
       | _ -> ());
       match (t, rhs.ty) with
       | FuncType _, String -> type_error t (Some rhs) parent
