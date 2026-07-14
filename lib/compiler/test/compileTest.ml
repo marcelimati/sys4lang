@@ -2418,6 +2418,49 @@ let%expect_test "v12 discarded non-void optional call pops value and marker" =
     330: EOF
     |}]
 
+(* [return [];] must type the literal's dummy from the function's return
+   type. The empty literal infers [Array Void], so the dummy page was
+   allocated with element type 0 (Array.Free 0) and returned where the
+   caller expects the declared element type; copying that page faults as
+   [A_ASSIGN 配列のコピーに失敗しました] (form-squad slot drag via
+   CardConstructProcessCache*@Get's NULL early return). orig types the
+   dummy as the return type: ref-struct elements free with code 21. *)
+let%expect_test "v12 empty array literal return takes the declared element type" =
+  compile_test ~ain_version:12
+    ~hlls:[ ("Array.hll", "void Free(ref array self);") ]
+    {|
+      class S {
+        int x;
+      };
+      class C {
+        array@ref S Get();
+      };
+      array@ref S C::Get()
+      {
+        return [];
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@Get
+    036: PUSHLOCALPAGE
+    038: PUSH 0
+    044: REF
+    046: DUP
+    048: CALLHLL library(0), library_function(0), 21
+    062: A_REF
+    064: RETURN
+    066: PUSH -1
+    072: RETURN
+    074: EOF test.jaf
+    080: FUNC NULL
+    086: EOF
+    |}]
+
 (* When the condition allocates dummies, the false path must jump TO the
    else block and the then branch must replay the condition deletes and
    jump OVER it. The old layout jumped the false path past the else and

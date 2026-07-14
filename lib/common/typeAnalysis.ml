@@ -903,6 +903,19 @@ class type_analyze_visitor ctx =
       | _ -> type_check parent t rhs
 
     method check_funarg_or_return parent t (rhs : expression) =
+      (* An empty ArrayLiteral infers [Array Void] (no element to take
+         a type from), but [variableAlloc] types the literal's dummy
+         slot — and the VM types the page it allocates for it — from
+         [rhs.ty]. Take the declared element type instead, as orig
+         does: a void-element page handed to a caller/callee expecting
+         the declared type faults on the next copy with [A_ASSIGN
+         配列のコピーに失敗しました] (form-squad slot drag, via the
+         emptied slot's [CardConstructProcessCache*@Get(NULL)] early
+         [return [];] — orig frees/returns the dummy as element type
+         21, ours emitted 0). Covers returns and call arguments. *)
+      (match (rhs.node, t, rhs.ty) with
+      | ArrayLiteral [], Array elem, Array Void -> rhs.ty <- Array elem
+      | _ -> ());
       match (t, rhs.ty) with
       | FuncType _, String -> type_error t (Some rhs) parent
       | _ -> self#check_assign parent t rhs
@@ -2215,6 +2228,16 @@ class type_analyze_visitor ctx =
             | Ident (_, GlobalConstant) -> false
             | _ -> is_referenceable b
           in
+          (* [a ?? []]: the empty-literal fallback infers [Array Void];
+             type it from the primary branch so its dummy page carries
+             the declared element type (same [A_ASSIGN 配列のコピーに失
+             敗しました] fault as the [check_funarg_or_return] case —
+             e.g. [PlayerCardCollection@GetOrganizationCards]'s
+             [At(i)?.GetAllInstance() ?? []]). Refine before the
+             [RvalueRef] wrap below so the clone inherits it. *)
+          (match (b.node, (match a.ty with Ref t -> t | t -> t), b.ty) with
+          | ArrayLiteral [], (Array _ as arr), Array Void -> b.ty <- arr
+          | _ -> ());
           (* v12 value-form [recv?.field ?? fallback] on a scalar field:
              codegen defers the field READ past the null-check merge as
              a (page, index) pair and dereferences with a single [REF],
@@ -2354,7 +2377,10 @@ class type_analyze_visitor ctx =
                          which makes [CALLHLL Array.PushBack] emit element-
                          type code 92 (Enum) instead of 10 (Int). Crashed
                          start-game in [CommonFrame::InitFramePoint] with
-                         [A_ASSIGN 配列のコピーに失敗しました]. *)
+                         [A_ASSIGN 配列のコピーに失敗しました]. (The
+                         empty literal's [Array Void] is refined inside
+                         [check_funarg_or_return] above, which also
+                         covers call arguments.) *)
                       (match (e.node, f.return.ty, e.ty) with
                       | ArrayLiteral _, Array t, Array Int
                         when (match t with Enum _ -> true | _ -> false) ->
