@@ -5472,6 +5472,82 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0
                 (match cmp_op with Equal -> EQUALE | _ -> NOTE);
               self#write_address_at merge_jump current_address
+          | Call ({ node = OptionalMember _; _ }, _, _)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (match expr.ty with Array _ -> true | _ -> false)
+                 && (match b.node with
+                    | DummyRef
+                        (_, { node = DummyRef (_, { node = ArrayLiteral []; _ });
+                              _ }) ->
+                        true
+                    | _ -> false) ->
+              (* v12 [recv?.GetList() ?? []] value form. orig: run the
+                 optional call's (value, marker) merge, then on null
+                 DELETE the placeholder, CLEAR the [new array<T>] dummy
+                 (Array.Free, keeping one ref via DUP) and release the
+                 receiver-chain call dummy early; on live, store the
+                 result into the [右辺値参照化用] spill (keeping the
+                 value); ONE [A_REF] covers both arms. The old routing
+                 compiled the fallback through the ArrayLiteral-lvalue
+                 emission — its A_REF landed in the NULL arm only, so
+                 the live arm returned a BORROWED array page and the
+                 caller's cleanup freed the collection's real array
+                 (PlayerCardCollection@GetOrganizationCards, fires when
+                 an organization has no instances). *)
+              let rv_no, arr_no =
+                match b.node with
+                | DummyRef (rv, { node = DummyRef (arr, _); _ }) -> (rv, arr)
+                | _ ->
+                    compiler_bug "array ?? [] arm: unexpected fallback"
+                      (Some (ASTExpression expr))
+              in
+              let receiver_spine_dummies =
+                let rec collect (e : expression) acc =
+                  match e.node with
+                  | DummyRef (no, inner) -> collect inner (no :: acc)
+                  | OptionalMember (recv, _, _) | Member (recv, _, _) ->
+                      collect recv acc
+                  | Call ({ node = OptionalMember (recv, _, _); _ }, _, _) ->
+                      collect recv acc
+                  | _ -> acc
+                in
+                collect a_inner []
+              in
+              self#compile_expression a;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let live_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH arr_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 DUP;
+              self#compile_CALLHLL "Array" "Free"
+                (self#array_element_type_code expr.ty)
+                (ASTExpression expr);
+              List.iter receiver_spine_dummies ~f:(fun no ->
+                  self#write_instruction1 SH_LOCALDELETE no;
+                  match Stack.top scopes with
+                  | Some scope ->
+                      scope.vars <-
+                        List.filter scope.vars ~f:(fun sv ->
+                            not (Int.equal sv.index no))
+                  | None -> ());
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at live_addr current_address;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH rv_no;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction0 SWAP;
+              self#write_instruction1 PUSH rv_no;
+              self#write_instruction0 SWAP;
+              self#write_instruction0 ASSIGN;
+              self#write_address_at merge_jump current_address;
+              self#write_instruction0 A_REF
           | OptionalMember (receiver, _, ClassVariable var_no)
             when Ain.version_gte ctx.ain (12, 0)
                  && is_variable_ref receiver.node

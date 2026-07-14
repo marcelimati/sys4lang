@@ -2260,6 +2260,15 @@ class type_analyze_visitor ctx =
           let b_referenceable_for_wrap =
             match b.node with
             | Ident (_, GlobalConstant) -> false
+            (* An array-literal fallback counts as referenceable (it
+               gets its own [new array<T>] dummy) but orig ADDITIONALLY
+               allocates the [右辺値参照化用] spill to home the LIVE
+               value of [call()?.GetList() ?? []] — the live arm stores
+               through it before the merged [A_REF]
+               (PlayerCardCollection@GetOrganizationCards). Force the
+               wrap so variableAlloc creates both slots in orig's
+               order. *)
+            | ArrayLiteral _ -> false
             | _ -> is_referenceable b
           in
           (* [a ?? []]: the empty-literal fallback infers [Array Void];
@@ -2305,7 +2314,19 @@ class type_analyze_visitor ctx =
             | Int | Bool | Float | Enum _ | String -> true
             | _ -> false
           in
-          (if (a_is_ref_typed || a_is_deferred_optional_field)
+          (* [call()?.GetList() ?? []]: the optional call's AIN return
+             type is a plain [Array] (not [Ref]), so neither disjunct
+             above fires — but orig still allocates the spill for the
+             live value (see the ArrayLiteral note above). *)
+          let a_is_optional_array_call =
+            Ain.version_gte ctx.ain (12, 0)
+            && (match a.node with
+               | Call ({ node = OptionalMember _; _ }, _, _) -> true
+               | _ -> false)
+            && (match a.ty with Array _ -> true | _ -> false)
+          in
+          (if (a_is_ref_typed || a_is_deferred_optional_field
+              || a_is_optional_array_call)
               && Ain.version ctx.ain > 8
               && not b_referenceable_for_wrap then (
             let inner = clone_expr b in
