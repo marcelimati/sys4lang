@@ -1992,8 +1992,16 @@ class jaf_compiler ctx debug_info =
          (SceneQuestMapGetCardDialog@CardInstance::get). Dropping it
          returned NULL to callers that immediately dereference. *)
       | NullCoalesce (a, b) -> (
+          (* Lvalue-position [a ?? b] (e.g. [ref T x = call() ?? fallback]):
+             test the primary's page-ref against the -1 null sentinel and
+             fall back to [b]'s page-ref. Every fallback shape
+             compile_lvalue understands takes this protocol — dropping it
+             silently loses the [?? b] (EnemyActionCollection@Require's
+             [At(i) ?? m_defaultAction] assigned NULL act on a miss). *)
           match b.node with
-          | DummyRef (_, { node = New _ | NewCall _; _ })
+          | ( DummyRef (_, { node = New _ | NewCall _; _ })
+            | Member (_, _, ClassVariable _)
+            | Ident (_, (LocalVariable _ | GlobalVariable _)) )
             when Ain.version_gte ctx.ain (12, 0) ->
               self#compile_lvalue a;
               self#write_instruction0 DUP;
