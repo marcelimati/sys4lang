@@ -581,7 +581,7 @@ class variable_alloc_visitor ctx =
       | New ts when suppress_direct_new_dummy = 0 ->
           let varname =
             match ts.ty with
-            | Struct (name, _) -> name
+            | Struct (name, _) -> "new " ^ name
             | _ ->
                 compiler_bug "Non-struct type in new expression"
                   (Some (ASTExpression expr))
@@ -613,7 +613,18 @@ class variable_alloc_visitor ctx =
         when Ain.version_gte ctx.ain (12, 0)
              && suppress_array_literal_dummy = 0
              && not (Stack.is_empty func_vars) ->
-          let v = self#create_dummy_var "new array" expr.ty in
+          (* orig names the literal's dummy with its full element type in
+             the original compiler's angle syntax: [new array<ref T>],
+             [new array<string>] — not the jaf [array@T] form. *)
+          let rec angle_ty (t : jaf_type) =
+            match t with
+            | Array e -> "array<" ^ angle_ty e ^ ">"
+            | Ref e -> "ref " ^ angle_ty e
+            | t -> jaf_type_to_string t
+          in
+          let v =
+            self#create_dummy_var ("new " ^ angle_ty expr.ty) expr.ty
+          in
           expr.node <- DummyRef (v, clone_expr expr)
       | Binary
           ( (RefEqual | RefNEqual),
