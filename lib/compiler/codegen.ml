@@ -1499,7 +1499,18 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 PUSH 2;
               self#write_instruction0 MUL
           | false, _ -> self#compile_expression index);
-          compile_lvalue_after (jaf_to_ain_type e.ty)
+          if elem_is_v12_iface then
+            (* An iface element VALUE is the two-slot fat-ref: orig
+               reads it with [REFREF]. [compile_lvalue_after] can't
+               know (the jaf type is a plain [Struct]; the iface-ness
+               lives in [ctx.interface_names]) and emitted a one-slot
+               [REF] — the dispatch dance then ran one slot short and
+               the CALLMETHOD receiver was garbage
+               ([BattleSkillSelector@ShowCardButton]'s
+               [m_button[m_state].SetShowCardOne(...)]; first battle
+               skill use died 【 REF 】要素数 = -1 inside the callee). *)
+            self#write_instruction0 REFREF
+          else compile_lvalue_after (jaf_to_ain_type e.ty)
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression e))
       | NewCall ({ ty = Struct (struct_name, s_no); _ }, args)
         when Ain.version ctx.ain > 8 ->
