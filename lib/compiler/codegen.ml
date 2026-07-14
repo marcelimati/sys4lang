@@ -358,6 +358,39 @@ class jaf_compiler ctx debug_info =
       | `Owned | `Borrowed -> true
       | `Stable -> false
 
+    (** Push one array-literal element for [Array.PushBack].
+        Per-element A_REF for borrowed-ref / new-T sources: when the
+        element is [new T()] (DummyRef-wrapped) or an HLL
+        ref-returning call, the pushed page-ref must be bumped before
+        PushBack stores it (orig: CGroupInstance@AddBoxLine /
+        CLineInstance@GetOBB / TextButton@Init emit [NEW; ASSIGN;
+        A_REF; PushBack] per element). Struct-typed VARIABLE reads and
+        [this] push BARE borrowed refs — orig's CASTask@Next/Join1-5
+        emit plain [PUSHSTRUCTPAGE] / [REF] into [PushBack 21]; the
+        deref/This wrappers' auto-A_REF leaked one ref per element and
+        diverged from orig. Scalars and S_PUSH literals stay plain. *)
+    method emit_array_literal_element (elem : expression) =
+      let bare_struct_read =
+        Ain.version_gte ctx.ain (12, 0)
+        &&
+        match (elem.node, elem.ty) with
+        | This, _ -> true
+        | (Ident _ | Member (_, _, ClassVariable _)),
+          (Struct _ | Ref (Struct _)) ->
+            is_variable_ref elem.node
+        | _ -> false
+      in
+      if bare_struct_read then (
+        match elem.node with
+        | This -> self#write_instruction0 PUSHSTRUCTPAGE
+        | _ ->
+            self#compile_variable_ref elem;
+            self#write_instruction0 REF)
+      else (
+        self#compile_expression elem;
+        if self#needs_a_ref_for_consume elem then
+          self#write_instruction0 A_REF)
+
     (** v11: release every DummyRef slot allocated since [vars_before]
         in the topmost scope, in LIFO (newest-first) order. Records
         each released index in [inline_deleted_dummies] (so a goto /
@@ -1606,22 +1639,7 @@ class jaf_compiler ctx debug_info =
                 (ASTExpression ref_expr);
               List.iter elems ~f:(fun elem ->
                   self#write_instruction0 DUP;
-                  self#compile_expression elem;
-                  (* Per-element A_REF for borrowed-ref / new-T sources:
-                     when the element is `new T()` (wrapped in DummyRef
-                     during variableAlloc) or an HLL ref-returning call
-                     or a struct/member access, the dummy slot or
-                     pushed page-ref must be bumped before PushBack
-                     stores it. Without A_REF, the per-element dummy's
-                     subsequent reuse / cleanup releases the page that
-                     PushBack just handed to the array.
-                     Evidence: orig at CGroupInstance@AddBoxLine /
-                     CLineInstance@GetOBB end-return / TextButton@Init
-                     consistently emits `NEW; ASSIGN; A_REF; CALLHLL
-                     PushBack` per element. Scalars (Int/Float/Bool/
-                     Enum) and S_PUSH literals don't get this. *)
-                  if self#needs_a_ref_for_consume elem then
-                    self#write_instruction0 A_REF;
+                  self#emit_array_literal_element elem;
                   self#compile_CALLHLL "Array" "PushBack" elem_ty
                     (ASTExpression ref_expr));
               self#write_instruction0 A_REF
@@ -8625,9 +8643,7 @@ class jaf_compiler ctx debug_info =
                     (ASTVariable decl);
                   List.iter elems ~f:(fun elem ->
                       self#write_instruction0 DUP;
-                      self#compile_expression elem;
-                      if self#needs_a_ref_for_consume elem then
-                        self#write_instruction0 A_REF;
+                      self#emit_array_literal_element elem;
                       self#compile_CALLHLL "Array" "PushBack" elem_ty
                         (ASTVariable decl));
                   self#write_instruction0 POP
