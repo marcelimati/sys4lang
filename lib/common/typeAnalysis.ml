@@ -1505,7 +1505,30 @@ class type_analyze_visitor ctx =
                           rhs.ty <- p.type_spec.ty
                       | _ -> ())
                   | None -> ())
-              | _ -> ());
+              | _ -> (
+                  (* Bypassing [check_call] also skips the numeric
+                     argument conversion: [X.IntProp = float_expr] must
+                     [FTOI] before the setter call (orig does) or the
+                     int slot stores raw float bits — battle HP became
+                     garbage via [BattleContext@InitHpPer]'s
+                     [Hp = HpMax * ratioFromPercent(per)]; same family
+                     in Ｐ敵本体追加 / DamageInformation@MulRatio /
+                     LeaderCard@UpdateStatus. Wrap only the float↔int
+                     mismatches — an unconditional [insert_cast] would
+                     wrap every rhs in a no-op [Cast] and break the
+                     node-shape matches of the optional/postset setter
+                     arms. *)
+                  match
+                    Hashtbl.find ctx.functions setter_name
+                    |> Option.bind ~f:(fun (f : fundecl) -> List.hd f.params)
+                  with
+                  | Some (p : variable) -> (
+                      match (p.type_spec.ty, rhs.ty) with
+                      | ((Int | LongInt) as pt), Float -> insert_cast pt rhs
+                      | Float, (Int | LongInt | Enum _) ->
+                          insert_cast Float rhs
+                      | _ -> ())
+                  | None -> ()));
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
@@ -1577,7 +1600,18 @@ class type_analyze_visitor ctx =
                           rhs.ty <- p.type_spec.ty
                       | _ -> ())
                   | None -> ())
-              | _ -> ());
+              | _ -> (
+                  (* Same numeric-argument coercion as the
+                     [Member ClassProperty] write arm above — this
+                     rewrite also bypasses [check_call]. *)
+                  match List.hd f.params with
+                  | Some (p : variable) -> (
+                      match (p.type_spec.ty, rhs.ty) with
+                      | ((Int | LongInt) as pt), Float -> insert_cast pt rhs
+                      | Float, (Int | LongInt | Enum _) ->
+                          insert_cast Float rhs
+                      | _ -> ())
+                  | None -> ()));
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
