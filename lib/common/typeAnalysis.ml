@@ -98,6 +98,16 @@ let rec is_referenceable = function
   | { node = ArrayLiteral _ | New _ | NewCall _; _ } -> true
   | e -> is_lvalue e
 
+(* Compound assignment operators and their binary counterparts, for
+   desugaring read-modify-write on property lvalues. *)
+let compound_assign_binop = function
+  | PlusAssign -> Some Plus
+  | MinusAssign -> Some Minus
+  | TimesAssign -> Some Times
+  | DivideAssign -> Some Divide
+  | ModuloAssign -> Some Modulo
+  | _ -> None
+
 (* Implicit dereference of variables and members. The value of a comma
    expression follows its right operand. *)
 let rec maybe_deref (e : expression) =
@@ -1495,7 +1505,7 @@ class type_analyze_visitor ctx =
          wrapping the property); preserve the optional-receiver shape
          so codegen wraps the setter call with the null guard. *)
       | Assign
-          ( _,
+          ( a_op,
             ({ node = (Member (obj, _, ClassProperty prop)
                       | OptionalMember (obj, _, ClassProperty prop)); _ } as lhs),
             rhs ) ->
@@ -1508,6 +1518,51 @@ class type_analyze_visitor ctx =
               in
               let setter_name =
                 prop.prop_class ^ "@" ^ prop.prop_name ^ "::set"
+              in
+              (* Compound ops ([Prop += 1]) read-modify-write through
+                 BOTH accessors. Wrap the rhs in a [Binary] whose lhs is
+                 an UNCALLED [Member _::get] marker — codegen's setter
+                 arm recognizes it and emits the original's
+                 receiver-juggle (get; op; set; re-get) instead of a
+                 plain [set(rhs)] that would drop the operator (the
+                 [GameChapter@Run] [Turn += 1] / [BattleContext]
+                 [CurseTurn += 1] family). The marker shares [obj] with
+                 the setter callee; it is never compiled itself. *)
+              let compound = not (Poly.equal a_op EqAssign) in
+              let rhs =
+                if not compound then rhs
+                else
+                  match
+                    ( compound_assign_binop a_op,
+                      prop.prop_getter_index,
+                      lhs.node )
+                  with
+                  | Some bop, Some getter_idx, Member _
+                    when Ain.version_gte ctx.ain (12, 0) ->
+                      let getter_name =
+                        prop.prop_class ^ "@" ^ prop.prop_name ^ "::get"
+                      in
+                      let value_ty =
+                        match Hashtbl.find ctx.functions getter_name with
+                        | Some (g : fundecl) -> g.return.ty
+                        | None -> lhs.ty
+                      in
+                      let marker =
+                        make_expr ~ty:value_ty ~loc:lhs.loc
+                          (Member
+                             ( obj,
+                               prop.prop_name ^ "::get",
+                               ClassMethod (getter_name, getter_idx) ))
+                      in
+                      make_expr ~ty:value_ty ~loc:expr.loc
+                        (Binary (bop, marker, rhs))
+                  | _ ->
+                      compile_error
+                        (sprintf
+                           "unsupported compound assignment to property \
+                            `%s.%s`"
+                           prop.prop_class prop.prop_name)
+                        (ASTExpression expr)
               in
               let setter_node =
                 match lhs.node with
@@ -1570,7 +1625,10 @@ class type_analyze_visitor ctx =
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
-              expr.ty <- Void
+              (* Compound form yields the re-read property value (the
+                 statement discard POPs it, matching orig's trailing
+                 [PUSH get; CALLMETHOD 0; POP]). *)
+              expr.ty <- (if compound then rhs.ty else Void)
           | None ->
               compile_error
                 (sprintf "property `%s.%s` has no accessors" prop.prop_class
@@ -1583,7 +1641,7 @@ class type_analyze_visitor ctx =
          keep the null guard. The paired setter has the same prefix with
          [::set]. *)
       | Assign
-          ( _,
+          ( a_op,
             ({
                node =
                  Call
@@ -1605,6 +1663,28 @@ class type_analyze_visitor ctx =
           | Some f ->
               let class_idx = Option.value_exn f.class_index in
               let setter_idx = Option.value_exn f.index in
+              (* Compound ops: same uncalled-getter-marker desugar as
+                 the [Member ClassProperty] write arm above. *)
+              let compound = not (Poly.equal a_op EqAssign) in
+              let rhs =
+                if not compound then rhs
+                else
+                  match (compound_assign_binop a_op, callee.node) with
+                  | Some bop, Member _
+                    when Ain.version_gte ctx.ain (12, 0) ->
+                      let marker =
+                        make_expr ~ty:lhs.ty ~loc:lhs.loc callee.node
+                      in
+                      make_expr ~ty:lhs.ty ~loc:expr.loc
+                        (Binary (bop, marker, rhs))
+                  | _ ->
+                      compile_error
+                        (sprintf
+                           "unsupported compound assignment through \
+                            property `%s`"
+                           getter_name)
+                        (ASTExpression expr)
+              in
               let surface_name =
                 String.rsplit2 setter_name ~on:'@'
                 |> Option.value_map ~default:setter_name ~f:snd
@@ -1653,7 +1733,7 @@ class type_analyze_visitor ctx =
               expr.node <-
                 Call
                   (setter_expr, [ Some rhs ], MethodCall (class_idx, setter_idx));
-              expr.ty <- Void
+              expr.ty <- (if compound then rhs.ty else Void)
           | None ->
               (* v12 sometimes assigns to a property declared as
                  get-only on the interface; the actual setter lives

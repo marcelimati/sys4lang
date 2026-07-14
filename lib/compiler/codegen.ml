@@ -3033,6 +3033,21 @@ class jaf_compiler ctx debug_info =
       | Float, Minus ->
           self#write_instruction0 F_SUB;
           true
+      | (Int | Enum _), Times ->
+          self#write_instruction0 MUL;
+          true
+      | (Int | Enum _), Divide ->
+          self#write_instruction0 DIV;
+          true
+      | (Int | Enum _), Modulo ->
+          self#write_instruction0 MOD;
+          true
+      | Float, Times ->
+          self#write_instruction0 F_MUL;
+          true
+      | Float, Divide ->
+          self#write_instruction0 F_DIV;
+          true
       | _ -> false
 
     method constructor_match struct_name (args : expression option list) =
@@ -4842,6 +4857,54 @@ class jaf_compiler ctx debug_info =
               | Some { value_type; _ } -> Some value_type
               | None -> None
             in
+            (* Compound property assignment ([Prop += rhs], typeAnalysis
+               marks it with an UNCALLED [Member _::get] as the Binary
+               lhs). Original protocol evaluates the receiver once and
+               juggles three copies: get, op, set, then RE-GETS the
+               property as the expression value (statement discard POPs
+               it). Exemplars: GameChapter1/2@Run [Turn += 1],
+               BadCondition::GetDefaultRound [CurseTurn += 1],
+               CFolder@IncrementItem/DecrementItem [NumofItem +-= 1]. *)
+            let compound_prop_arg =
+              match args with
+              | [ Some
+                    { node =
+                        Binary
+                          ( op,
+                            { node = Member (_, _, ClassMethod (gname, getter_no));
+                              ty = getter_ty;
+                              _ },
+                            rhs );
+                      _ } ]
+                when Ain.version_gte ctx.ain (12, 0)
+                     && String.is_suffix gname ~suffix:"::get" ->
+                  Some (op, getter_no, getter_ty, rhs)
+              | _ -> None
+            in
+            match compound_prop_arg with
+            | Some (op, getter_no, getter_ty, rhs) ->
+                self#write_instruction1 PUSH 0;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 POP;
+                self#compile_method_selector ~concrete:concrete_receiver
+                  ~direct_getter_rank e.ty method_no;
+                self#write_instruction0 DUP_X2;
+                self#write_instruction0 POP;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH getter_no;
+                self#write_instruction1 CALLMETHOD 0;
+                self#compile_expression rhs;
+                if not (self#emit_reused_receiver_binary_op getter_ty op)
+                then
+                  compiler_bug "unsupported compound property operator"
+                    (Some (ASTExpression expr));
+                self#write_instruction1 CALLMETHOD 1;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH getter_no;
+                self#write_instruction1 CALLMETHOD 0
+            | None ->
             let reused_receiver_binary_arg =
               match (String.chop_suffix mname ~suffix:"::set", args) with
               | ( Some prop_base,
