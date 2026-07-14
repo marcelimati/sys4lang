@@ -1361,14 +1361,24 @@ class jaf_compiler ctx debug_info =
           self#write_instruction1 PUSH member_no
       | Subscript (obj, index) ->
           self#compile_lvalue obj;
-          self#compile_expression index;
-          (match e.ty with
-          | (Struct (name, _) | Wrap (Struct (name, _)))
-            when Ain.version_gte ctx.ain (12, 0)
-                 && Hashtbl.mem ctx.interface_names name ->
+          let elem_is_v12_iface =
+            match e.ty with
+            | Struct (name, _) | Wrap (Struct (name, _)) ->
+                Ain.version_gte ctx.ain (12, 0)
+                && Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          (* v12 iface arrays are flat two-slot pairs: element [i] lives
+             at slot [2i]. orig folds the doubling for constant indices
+             ([PUSH 0] / [PUSH 2]), scaling at runtime only for computed
+             ones. *)
+          (match (elem_is_v12_iface, index.node) with
+          | true, ConstInt n -> self#write_instruction1 PUSH (2 * n)
+          | true, _ ->
+              self#compile_expression index;
               self#write_instruction1 PUSH 2;
               self#write_instruction0 MUL
-          | _ -> ())
+          | false, _ -> self#compile_expression index)
       (* v12 cast wrappers around a variable / member ref are no-ops at
          codegen — pass through to the inner expression's lvalue. *)
       | Cast (_, inner) -> self#compile_variable_ref inner
@@ -1473,14 +1483,22 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 REFREF;
               self#write_instruction0 REF
           | _ -> ());
-          self#compile_expression index;
-          (match e.ty with
-          | (Struct (name, _) | Wrap (Struct (name, _)))
-            when Ain.version_gte ctx.ain (12, 0)
-                 && Hashtbl.mem ctx.interface_names name ->
+          let elem_is_v12_iface =
+            match e.ty with
+            | Struct (name, _) | Wrap (Struct (name, _)) ->
+                Ain.version_gte ctx.ain (12, 0)
+                && Hashtbl.mem ctx.interface_names name
+            | _ -> false
+          in
+          (* iface pair-slot indexing: fold [2i] for constant indices
+             like orig (see compile_variable_ref). *)
+          (match (elem_is_v12_iface, index.node) with
+          | true, ConstInt n -> self#write_instruction1 PUSH (2 * n)
+          | true, _ ->
+              self#compile_expression index;
               self#write_instruction1 PUSH 2;
               self#write_instruction0 MUL
-          | _ -> ());
+          | false, _ -> self#compile_expression index);
           compile_lvalue_after (jaf_to_ain_type e.ty)
       | New _ -> compiler_bug "bare new expression" (Some (ASTExpression e))
       | NewCall ({ ty = Struct (struct_name, s_no); _ }, args)
@@ -7253,6 +7271,31 @@ class jaf_compiler ctx debug_info =
              self#write_instruction0 DUP2;
              self#write_instruction0 REF;
              self#compile_expression rhs;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DUP_X2;
+             self#write_instruction0 POP;
+             self#write_instruction0 DELETE;
+             self#write_instruction0 R_ASSIGN;
+             self#write_instruction0 POP;
+             self#write_instruction0 SP_INC
+           | DummyRef (_, { node = New _ | NewCall _; _ }) | New _ | NewCall _
+             ->
+             (* A [new T] rhs leaves ONE slot (the page — the dummy
+                dance's ASSIGN keeps the value); the juggle below is
+                written for a two-slot iface pair. orig completes the
+                pair with [PUSH 0] (concrete-class vtable offset)
+                before juggling. Without it every op lands one slot
+                off — DELETE eats the INDEX and R_ASSIGN stores
+                garbage into the element ([BattleSkillSelector@
+                InitCardButton]'s [m_button[i] <- new ...Collection]
+                corrupted the button array; battle entry died at
+                [DeletePage] in the selector init). *)
+             self#compile_variable_ref lhs;
+             self#write_instruction0 DUP2;
+             self#write_instruction0 REF;
+             self#compile_expression rhs;
+             self#write_instruction1 PUSH 0;
              self#write_instruction0 DUP_X2;
              self#write_instruction0 POP;
              self#write_instruction0 DUP_X2;
