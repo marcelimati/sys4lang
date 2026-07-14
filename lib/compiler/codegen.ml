@@ -6465,18 +6465,12 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 SP_INC
           | _ -> compiler_bug "invalid ref-struct backing initializer"
                    (Some (ASTExpression rhs)))
-      | Assign
-          ( EqAssign,
-            ({ ty = Struct (_, lhs_sno); _ } as lhs),
-            { node = New { ty = Struct (_, rhs_sno); _ }; _ } )
-        when Ain.version_gte ctx.ain (12, 0)
-             && Int.equal lhs_sno rhs_sno
-             && is_variable_ref lhs.node ->
-          self#compile_variable_ref lhs;
-          self#write_instruction2 NEW rhs_sno (-1);
-          self#write_instruction0 ASSIGN;
-          before_pop ();
-          self#write_instruction0 POP
+      (* NOTE: a transplanted arm here used to REBIND [struct_var = new T]
+         statements (compile_variable_ref; NEW; ASSIGN; POP). orig deep-
+         copies through a [<dummy : new T>] slot ([A_REF; SR_ASSIGN]) so
+         the destination page keeps its identity — see the matching note
+         in variableAlloc's [visit_expression]. The generic Assign path
+         below emits that shape once the dummy exists. *)
       | Assign (EqAssign, lhs, { node = Null; _ })
         when Ain.version_gte ctx.ain (12, 0)
              && (match lhs.ty with

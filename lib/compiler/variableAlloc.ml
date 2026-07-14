@@ -381,19 +381,17 @@ class variable_alloc_visitor ctx =
          fire the Call case again on the clone, producing a nested
          [DummyRef (_, DummyRef (_, Call ...))] with two dummy slots
          for the same call. *)
-      let suppress_v12_direct_struct_new =
-        Ain.version_gte ctx.ain (12, 0)
-        &&
-        match expr.node with
-        | Assign
-            ( EqAssign,
-              { ty = Struct (_, lhs_sno); _ },
-              { node = New { ty = Struct (_, rhs_sno); _ }; _ } ) ->
-            Int.equal lhs_sno rhs_sno
-        | _ -> false
-      in
-      if suppress_v12_direct_struct_new then
-        suppress_direct_new_dummy <- suppress_direct_new_dummy + 1;
+      (* NOTE: statement-level [struct_var = new T] used to suppress the
+         New dummy here (paired with a codegen arm that REBOUND the
+         variable's page slot: NEW; ASSIGN; POP). orig instead allocates
+         [<dummy : new T>] and DEEP-COPIES via [A_REF; SR_ASSIGN],
+         preserving the destination page's identity. Rebinding
+         [g_battleResult = new BattleResult] (BattleInitializer::Init,
+         the only such statement in Rance10) left every alias of the
+         global's original page stale — first string write through one
+         faulted as [ページの取得に失敗２：S_ASSIGN] at battle entry.
+         Decl-init [Struct x = new T;] (visit_variable below) is the
+         only remaining suppression: orig genuinely rebinds there. *)
       let prop_setter_cache =
         if Ain.version_gte ctx.ain (12, 0) then
           match expr.node with
@@ -449,8 +447,6 @@ class variable_alloc_visitor ctx =
       | _ -> super#visit_expression expr);
       if Option.is_some prop_setter_cache then
         prop_setter_call_dummy_cache <- prev_prop_setter_call_dummy_cache;
-      if suppress_v12_direct_struct_new then
-        suppress_direct_new_dummy <- suppress_direct_new_dummy - 1;
       (* After subexpressions are visited, look for a [Call] or
          [Member.ClassMethod] whose receiver is itself a call result —
          wrap the inner call in a [DummyRef] so its returned struct /
