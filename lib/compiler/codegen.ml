@@ -168,6 +168,17 @@ class jaf_compiler ctx debug_info =
        [SH_LOCALDELETE] without an extra incref. *)
     val mutable in_prop_setter_arg : bool = false
 
+    (* v12 Array-HLL store into a REF-element array ([array<ref T>],
+       [CALLHLL Array PushBack 21]): the runtime stores the page-ref
+       with its own incref, so the pushed value arg stays a bare
+       borrowed read — orig [CASTask@JoinImp] / [CASTaskParts@Next] /
+       [BattleLog@0] push [.LOCALREF v] / getter results straight into
+       [PushBack 21] with no [A_REF]. VALUE-element arrays
+       ([PushBack 13]) keep the bump (orig
+       [PlayerSkillEffectCollection@Add] emits [A_REF]). Set while
+       compiling non-receiver args of such calls. *)
+    val mutable in_ref_elem_hll_store_arg : bool = false
+
     val mutable bare_new_receiver_uses_default_ctor : bool = false
 
     (* The currentl active scopes. *)
@@ -2161,8 +2172,10 @@ class jaf_compiler ctx debug_info =
                 in
                 walk expr
               in
-              if self#needs_a_ref_for_consume expr
-                 || v11_dummy_call_returns_ref
+              if
+                (self#needs_a_ref_for_consume expr
+                && not in_ref_elem_hll_store_arg)
+                || v11_dummy_call_returns_ref
               then self#write_instruction0 A_REF
           | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
               (* v12 interface arg: callee declares 2 slots (IFace +
@@ -2294,10 +2307,24 @@ class jaf_compiler ctx debug_info =
                          data structure. Next access fires
                          [DeletePage Page=N]. Confirmed against orig
                          [PlayerSkillEffectCollection::Add] which
-                         emits [A_REF] here. *)
+                         emits [A_REF] here — but only because that
+                         array is VALUE-element ([PushBack 13]).
+                         REF-element receivers push bare
+                         ([in_ref_elem_hll_store_arg]). *)
                       self#compile_lvalue expr;
-                      if Ain.version_gte ctx.ain (12, 0) then
-                        self#write_instruction0 A_REF
+                      if
+                        Ain.version_gte ctx.ain (12, 0)
+                        && not in_ref_elem_hll_store_arg
+                      then self#write_instruction0 A_REF
+                  | Struct _ when in_ref_elem_hll_store_arg ->
+                      (* Value-struct member/local read pushed into a
+                         REF-element array store: bare borrowed page-ref
+                         (orig [BattleLogCollection@Logs::get] pushes
+                         [.STRUCTREF m_current] straight into
+                         [PushBack 21]); the generic deref protocol's
+                         [REF; A_REF] would leak one ref per store. *)
+                      self#compile_variable_ref expr;
+                      self#write_instruction0 REF
                   | _ -> self#compile_expression expr)
               | _ ->
                   self#compile_expression expr;
@@ -2306,7 +2333,15 @@ class jaf_compiler ctx debug_info =
                     | Some { node = Call _; _ } -> true
                     | _ -> false
                   in
-                  if (dummy_inner_returns_ref && inner_is_call) || bare_new_arg
+                  (* Ref-returning-call results also push bare into
+                     REF-element array stores (orig [BattleLog@0]:
+                     [SacrificeInfo@Effect::get] result straight into
+                     [PushBack 21]). Fresh [new T(...)] keeps its bump
+                     in either case. *)
+                  if
+                    (dummy_inner_returns_ref && inner_is_call
+                    && not in_ref_elem_hll_store_arg)
+                    || bare_new_arg
                   then self#write_instruction0 A_REF)
           | String when Ain.version ctx.ain > 8 ->
               (* Borrow analysis for `string` value-form args.
@@ -2593,6 +2628,22 @@ class jaf_compiler ctx debug_info =
             walk ty)
         | None -> false
       in
+      let receiver_is_ref_elem_array =
+        Ain.version_gte ctx.ain (12, 0)
+        && String.equal lib.Ain.Library.name "Array"
+        &&
+        match args with
+        | Some
+            {
+              ty =
+                ( Array (Ref _ | Wrap (Ref _))
+                | Ref (Array (Ref _ | Wrap (Ref _))) );
+              _;
+            }
+          :: _ ->
+            true
+        | _ -> false
+      in
       let compile_arg ~is_receiver arg (var : Ain.Variable.t) =
         (match (lib.Ain.Library.name, arg, var.value_type, delegate_hint) with
         | ( "Delegate",
@@ -2603,6 +2654,12 @@ class jaf_compiler ctx debug_info =
             self#write_instruction1 PUSH (-1);
             self#write_instruction0 SWAP;
             self#write_instruction1 DG_STR_TO_METHOD dg_i
+        | _ when (not is_receiver) && receiver_is_ref_elem_array ->
+            let prev = in_ref_elem_hll_store_arg in
+            in_ref_elem_hll_store_arg <- true;
+            Exn.protect
+              ~f:(fun () -> self#compile_argument arg var.value_type)
+              ~finally:(fun () -> in_ref_elem_hll_store_arg <- prev)
         | _ -> self#compile_argument arg var.value_type);
         (* IFace 2-slot pad for struct-value args to iface-array HLLs. *)
         if not is_receiver
@@ -5041,7 +5098,27 @@ class jaf_compiler ctx debug_info =
               compiler_bug "invalid assert expression"
                 (Some (ASTExpression expr)));
           let f = Builtin.function_of_builtin ctx builtin !receiver_ty in
-          self#compile_function_arguments args f;
+          (* Same bare-push rule as [compile_hll_function_arguments]:
+             stores into REF-element arrays don't bump the value arg. *)
+          let ref_elem_store =
+            Ain.version_gte ctx.ain (12, 0)
+            && (match builtin with
+               | ArrayPushBack | ArrayInsert | ArrayFill -> true
+               | _ -> false)
+            &&
+            match e.ty with
+            | Array (Ref _ | Wrap (Ref _))
+            | Ref (Array (Ref _ | Wrap (Ref _))) ->
+                true
+            | _ -> false
+          in
+          if ref_elem_store then (
+            let prev = in_ref_elem_hll_store_arg in
+            in_ref_elem_hll_store_arg <- true;
+            Exn.protect
+              ~f:(fun () -> self#compile_function_arguments args f)
+              ~finally:(fun () -> in_ref_elem_hll_store_arg <- prev))
+          else self#compile_function_arguments args f;
           match builtin with
           | IntString -> self#write_instruction0 I_STRING
           | FloatString -> self#write_instruction0 FTOS
