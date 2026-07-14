@@ -2183,6 +2183,22 @@ class jaf_compiler ctx debug_info =
                  slots through [compile_lvalue]; concrete struct values
                  need the implemented interface vtable offset appended. *)
               self#compile_lvalue expr;
+              (* Foreach loop-vars over iface arrays are stored as
+                 [Wrap (IFace _)]: compile_lvalue leaves the
+                 wrap-handle location, and orig adds a second [REFREF]
+                 to materialize the 2-slot fat-ref before the call
+                 consumes it. Without it the delegate/method argument
+                 frame is misaligned — SkillEffectExecuter@
+                 InnerProcess's [PostProcessEvent(p)] degraded the
+                 frame pump after the first battle skill effect and
+                 the attack-effect overlay never finished. *)
+              (match expr.node with
+              | Ident (_, LocalVariable (i, _)) -> (
+                  match (self#get_local i).value_type with
+                  | Ain.Type.Wrap (Ain.Type.IFace _) ->
+                      self#write_instruction0 REFREF
+                  | _ -> ())
+              | _ -> ());
               (match (expr.ty, t) with
               | (Struct (_, actual_sno) | Ref (Struct (_, actual_sno))), IFace iface_sno ->
                   if not (Int.equal actual_sno iface_sno) then
