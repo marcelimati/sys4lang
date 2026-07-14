@@ -660,20 +660,44 @@ class type_analyze_visitor ctx =
              List.filter (primary :: alternates) ~f:param_matches
            with
           | [ fd ] -> fd
-          | fd :: _ as matches -> (
-              match self#env#current_function with
-              | Some current -> (
-                  let current_idx = current.index in
-                  match current_idx with
-                  | Some _ -> (
-                      match
-                        List.find matches ~f:(fun f ->
-                            not (Option.equal Int.equal f.index current_idx))
-                      with
-                      | Some non_current -> non_current
-                      | None -> fd)
-                  | None -> fd)
-              | None -> fd)
+          | _ :: _ as matches ->
+              (* Among multiple compatible candidates: first drop the
+                 current function (a delegating overload like
+                 [GetNextStyle(CardViewStyle) { return GetNextStyle(style); }]
+                 must not resolve to itself), then prefer EXACT
+                 parameter-type matches over implicit-conversion
+                 matches — an int argument must pick [f(int)] over the
+                 first-registered [f(Enum)] (orig calls the int variant:
+                 PartyCardGroup@Flip's [GetNextStyle(this.FlipType)]).
+                 [type_equal]'s int<->enum/bool leniency stays for the
+                 fallback so conversion-only calls keep resolving. *)
+              let non_self =
+                match self#env#current_function with
+                | Some { index = Some _ as current_idx; _ } -> (
+                    match
+                      List.filter matches ~f:(fun f ->
+                          not (Option.equal Int.equal f.index current_idx))
+                    with
+                    | [] -> matches
+                    | rest -> rest)
+                | _ -> matches
+              in
+              let strict_param_match (fd : fundecl) =
+                List.for_all2_exn fd.params arg_types ~f:(fun p at ->
+                    match at with
+                    | None -> true
+                    | Some t -> (
+                        match (p.type_spec.ty, t) with
+                        | Enum (_, a), Enum (_, b) -> a = b
+                        | Enum _, _ | _, Enum _ -> false
+                        | ( (Int | LongInt | Bool | Float),
+                            (Int | LongInt | Bool | Float) ) ->
+                            Poly.equal p.type_spec.ty t
+                        | pt, at -> type_equal pt at))
+              in
+              (match List.filter non_self ~f:strict_param_match with
+              | exact :: _ -> exact
+              | [] -> List.hd_exn non_self)
           | [] -> primary)
 
     (* v11 HLL overload resolution: pick the library function matching
