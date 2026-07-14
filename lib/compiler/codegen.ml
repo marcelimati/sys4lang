@@ -2925,14 +2925,63 @@ class jaf_compiler ctx debug_info =
           true
       | _ -> false
 
-    method constructor_match struct_name nargs =
+    method constructor_match struct_name (args : expression option list) =
       let ctor_name = struct_name ^ "@0" in
       let primary = Hashtbl.find ctx.functions ctor_name in
       let overloads =
         Option.value (Hashtbl.find ctx.overloads ctor_name) ~default:[]
       in
       let all = match primary with Some f -> f :: overloads | None -> overloads in
-      List.find all ~f:(fun (f : fundecl) -> List.length f.params = nargs)
+      let nargs = List.length args in
+      match
+        List.filter all ~f:(fun (f : fundecl) -> List.length f.params = nargs)
+      with
+      | [] -> None
+      | [ f ] -> Some f
+      | candidates ->
+          (* Arity alone is ambiguous — pick by argument types like
+             [resolve_overload] (loose compatibility, then prefer exact
+             matches). Arity-first-match called BattleLog's
+             [(ref BattleRound)] constructor for [new BattleLog(text)]
+             (SceneBattle@ShowLog): the string page went in as the
+             BattleRound ref and the ctor's first member read fired
+             【 REF 】範囲外 (要素数 = -1) on the first battle skill
+             use. orig calls the [(string)] ctor. *)
+          let loose (p : variable) (t : jaf_type) =
+            match (p.type_spec.ty, t) with
+            | Delegate _, (TyMethod _ | TyFunction _) -> true
+            | FuncType _, (TyMethod _ | TyFunction _) -> true
+            | pt, Ref at when TypeAnalysis.type_equal pt at -> true
+            | ( (Delegate _ | FuncType _ | Struct _ | Array _ | Ref _ | String),
+                NullType ) ->
+                true
+            | (Int | LongInt | Bool), (Int | LongInt | Bool | Float) -> true
+            | Float, (Int | LongInt | Bool | Float) -> true
+            | pt, at -> TypeAnalysis.type_equal pt at
+          in
+          let strict (p : variable) (t : jaf_type) =
+            match (p.type_spec.ty, t) with
+            | Enum (_, a), Enum (_, b) -> a = b
+            | Enum _, _ | _, Enum _ -> false
+            | ( (Int | LongInt | Bool | Float),
+                (Int | LongInt | Bool | Float) ) ->
+                Poly.equal p.type_spec.ty t
+            | pt, at -> TypeAnalysis.type_equal pt at
+          in
+          let matches pred (f : fundecl) =
+            List.for_all2_exn f.params args ~f:(fun p a ->
+                match a with
+                | None -> true
+                | Some e -> pred p e.ty)
+          in
+          let compatible =
+            match List.filter candidates ~f:(matches loose) with
+            | [] -> candidates
+            | rest -> rest
+          in
+          (match List.filter compatible ~f:(matches strict) with
+          | exact :: _ -> Some exact
+          | [] -> List.hd compatible)
 
     method private bare_new_ctor s_no =
       if Ain.version_gte ctx.ain (12, 0) then -1
@@ -2954,9 +3003,8 @@ class jaf_compiler ctx debug_info =
         ~finally:(fun () -> bare_new_receiver_uses_default_ctor <- prev)
 
     method compile_newcall struct_name s_no args =
-      let nargs = List.length args in
       let default_ctor = (Ain.get_struct_by_index ctx.ain s_no).constructor in
-      let matching_ctor = self#constructor_match struct_name nargs in
+      let matching_ctor = self#constructor_match struct_name args in
       let ctor_idx =
         match matching_ctor with
         | Some f -> Option.value f.index ~default:default_ctor
