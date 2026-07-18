@@ -2638,6 +2638,199 @@ let%expect_test "v12 delegate subscription re-resolves method-ref overload" =
     090: EOF
     |}]
 
+(* An enum-typed [DummyRef] rvalue (ref-returning call spilled into a
+   [ref E] dummy) must deref the lvalue pair with [REF] like every
+   other scalar. Enums were missing from the deref list: the pair's
+   index slot became the "value" and the page id LEAKED onto the
+   caller's stack — [return list.At(...)] in
+   [GameConfig::GetNextSpeedType] made the caller's next setter
+   CALLMETHOD pop the leaked page id as its method number
+   (【CALLMETHOD】存在しない関数番号 on every game-speed button
+   click). The tail must read [R_ASSIGN; REF; RETURN]. *)
+let%expect_test "v12 enum DummyRef rvalue derefs the ref pair" =
+  compile_test ~ain_version:12
+    ~hlls:
+      [ ( "Array.hll",
+          "void Alloc(ref array self, int Numof, int Numof2, int Numof3, \
+           int Numof4);\n\
+           void Free(ref array self);\n\
+           int Numof(ref array self);\n\
+           void PushBack(ref array self, hll_param Value);\n\
+           ref hll_param At(ref array self, int Index);" );
+        ("String.hll", "int Int(ref string self);")
+      ]
+    {|
+      enum E {
+        A = 0,
+        B = 1,
+      };
+      E next()
+      {
+        array@E list;
+        return list.At(0);
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC E::GetList
+    036: PUSHLOCALPAGE
+    038: PUSH 0
+    044: REF
+    046: DUP
+    048: PUSH 2
+    054: PUSH -1
+    060: PUSH -1
+    066: PUSH -1
+    072: CALLHLL library(0), library_function(0), 92
+    086: DUP
+    088: PUSH 0
+    094: PUSH 0
+    100: ASSIGN
+    102: POP
+    104: DUP
+    106: PUSH 1
+    112: PUSH 1
+    118: ASSIGN
+    120: POP
+    122: DUP
+    124: SP_INC
+    126: RETURN
+    128: ENDFUNC E::GetList
+    134: FUNC E::IsExist
+    140: PUSHLOCALPAGE
+    142: PUSH 0
+    148: REF
+    150: DUP
+    152: PUSH 0
+    158: EQUALE
+    160: IFZ 176
+    166: POP
+    168: PUSH 1
+    174: RETURN
+    176: DUP
+    178: PUSH 1
+    184: EQUALE
+    186: IFZ 202
+    192: POP
+    194: PUSH 1
+    200: RETURN
+    202: POP
+    204: PUSH 0
+    210: RETURN
+    212: ENDFUNC E::IsExist
+    218: FUNC E::Parse
+    224: PUSHLOCALPAGE
+    226: PUSH 0
+    232: REF
+    234: DUP
+    236: A_REF
+    238: S_PUSH "A"
+    244: S_EQUALE
+    246: IFZ 268
+    252: POP
+    254: PUSH 0
+    260: PUSH 0
+    266: RETURN
+    268: DUP
+    270: A_REF
+    272: S_PUSH "B"
+    278: S_EQUALE
+    280: IFZ 302
+    286: POP
+    288: PUSH 1
+    294: PUSH 0
+    300: RETURN
+    302: POP
+    304: PUSH -1
+    310: PUSH -1
+    316: RETURN
+    318: ENDFUNC E::Parse
+    324: FUNC E::Parse
+    330: PUSHLOCALPAGE
+    332: PUSH 0
+    338: REF
+    340: DUP
+    342: PUSH 0
+    348: EQUALE
+    350: IFZ 372
+    356: POP
+    358: PUSH 0
+    364: PUSH 0
+    370: RETURN
+    372: DUP
+    374: PUSH 1
+    380: EQUALE
+    382: IFZ 404
+    388: POP
+    390: PUSH 1
+    396: PUSH 0
+    402: RETURN
+    404: POP
+    406: PUSH -1
+    412: PUSH -1
+    418: RETURN
+    420: ENDFUNC E::Parse
+    426: FUNC E@String
+    432: PUSHLOCALPAGE
+    434: PUSH 0
+    440: REF
+    442: DUP
+    444: PUSH 0
+    450: EQUALE
+    452: IFZ 468
+    458: POP
+    460: S_PUSH "A"
+    466: RETURN
+    468: DUP
+    470: PUSH 1
+    476: EQUALE
+    478: IFZ 494
+    484: POP
+    486: S_PUSH "B"
+    492: RETURN
+    494: POP
+    496: S_PUSH ""
+    502: RETURN
+    504: ENDFUNC E@String
+    510: FUNC next
+    516: PUSHLOCALPAGE
+    518: PUSH 0
+    524: REF
+    526: CALLHLL library(0), library_function(1), 92
+    540: PUSHLOCALPAGE
+    542: PUSH 0
+    548: REF
+    550: PUSH 0
+    556: CALLHLL library(0), library_function(4), 92
+    570: PUSHLOCALPAGE
+    572: PUSH 1
+    578: REF
+    580: DELETE
+    582: PUSHLOCALPAGE
+    584: DUP_X2
+    586: POP
+    588: PUSH 1
+    594: DUP_X2
+    596: POP
+    598: R_ASSIGN
+    600: REF
+    602: RETURN
+    604: PUSH 0
+    610: RETURN
+    612: ENDFUNC next
+    618: EOF test.jaf
+    624: FUNC NULL
+    630: EOF
+    636: FUNC E::Numof
+    642: PUSH 2
+    648: RETURN
+    650: ENDFUNC E::Numof
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)

@@ -5440,10 +5440,19 @@ class jaf_compiler ctx debug_info =
           (* In v11, [compile_lvalue]'s dummy-populate path already emits
              the appropriate deref for struct/array dummies, so the stack
              is already the shape [compile_expression] would have produced
-             via [SR_REF2]. Pre-v11 still needs [SR_REF2]. *)
+             via [SR_REF2]. Pre-v11 still needs [SR_REF2]. Enums are
+             scalars here like everywhere else ([compile_dereference],
+             [is_ref_scalar]) — omitting them left the lvalue's 2-slot
+             (page, index) pair where the consumer expected one value:
+             [return list.At(...)] in the enum-returning
+             [GameConfig::GetNextSpeedType] returned the INDEX and
+             leaked the page id into the caller, whose setter
+             CALLMETHOD then popped the page id as its method number —
+             【CALLMETHOD】存在しない関数番号 on every game-speed
+             button click. *)
           if Ain.version ctx.ain > 8 then
             (match expr.ty with
-            | Int | Float | Bool | LongInt | FuncType _ ->
+            | Int | Float | Bool | LongInt | Enum _ | FuncType _ ->
                 self#write_instruction0 REF
             | _ -> ())
           else
