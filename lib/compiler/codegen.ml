@@ -2349,15 +2349,21 @@ class jaf_compiler ctx debug_info =
                     | Some { node = Call _; _ } -> true
                     | _ -> false
                   in
-                  (* Ref-returning-call results also push bare into
-                     REF-element array stores (orig [BattleLog@0]:
-                     [SacrificeInfo@Effect::get] result straight into
-                     [PushBack 21]). Fresh [new T(...)] keeps its bump
-                     in either case. *)
+                  (* Ref-returning-call results AND fresh [new T(...)]
+                     push bare into REF-element array stores (orig
+                     [BattleLog@0], [QuestMapObjectView@Load]'s
+                     [m_marker.PushBack(new QuestMapObjectMarkerView(..))]).
+                     A_REF is a PAGE COPY (xsystem4 vm.c: pop page id,
+                     push deep-copied page) — with it, the array stored
+                     a COPY while the original died with the dummy slot,
+                     its [Parts] dtor deleting the engine part: every
+                     quest-map marker/figure icon vanished same-frame.
+                     VALUE-element stores ([PushBack 13]) still copy-in
+                     via A_REF like orig. *)
                   if
-                    (dummy_inner_returns_ref && inner_is_call
-                    && not in_ref_elem_hll_store_arg)
-                    || bare_new_arg
+                    ((dummy_inner_returns_ref && inner_is_call)
+                    || bare_new_arg)
+                    && not in_ref_elem_hll_store_arg
                   then self#write_instruction0 A_REF)
           | String when Ain.version ctx.ain > 8 ->
               (* Borrow analysis for `string` value-form args.
