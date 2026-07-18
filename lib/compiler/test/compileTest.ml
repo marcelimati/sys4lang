@@ -2587,6 +2587,57 @@ let%expect_test "v12 if/else with condition dummies routes both branches" =
     354: EOF
     |}]
 
+(* A bare method reference bound to a delegate-typed target must pick
+   the overload matching the delegate's signature, not the primary
+   name match. [Member] resolution alone picks the first overload;
+   without the [check_delegate_compatible] re-resolution the [+=]
+   below binds Show(string) — at dispatch the struct page arrives in
+   the string parameter and the first string op on it faults
+   (Rance10 [p.LogEvent += this.ShowLog] bound ShowLog(string) over
+   ShowLog#1(ref BattleLog): every heal / enemy-debuff log line died
+   with ページの取得に失敗２【S_ASSIGN】). The PUSH before
+   DG_NEW_FROM_METHOD must be method 3 (Show#1, the [ref S] overload),
+   not method 2 (Show(string)). *)
+let%expect_test "v12 delegate subscription re-resolves method-ref overload" =
+  compile_test ~ain_version:12
+    {|
+      struct S { int x; };
+      delegate void dg(ref S v);
+      class C {
+        dg m_dg;
+        void Show(string s);
+        void Show(ref S v);
+        void Sub();
+      };
+      void C::Show(string s) {}
+      void C::Show(ref S v) {}
+      void C::Sub() { this.m_dg += this.Show; }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@Show
+    036: RETURN
+    038: FUNC C@Show
+    044: RETURN
+    046: FUNC C@Sub
+    052: PUSHSTRUCTPAGE
+    054: PUSH 0
+    060: REF
+    062: PUSHSTRUCTPAGE
+    064: PUSH 2
+    070: DG_NEW_FROM_METHOD
+    072: DG_PLUSA
+    074: DELETE
+    076: RETURN
+    078: EOF test.jaf
+    084: FUNC NULL
+    090: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)

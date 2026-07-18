@@ -841,7 +841,64 @@ class type_analyze_visitor ctx =
           ()
       | _ -> type_check parent (FuncType functype) expr
 
+    (* Method-reference overload re-resolution: [Member] resolution
+       picks the primary overload by name only. Whenever the reference
+       feeds a [Delegate (Some (dg_name, _))] target — call argument,
+       [=] / [+=] / [-=] delegate assignment, event subscription —
+       re-resolve to the overload whose param/return types match the
+       delegate's signature, if one exists. A wrong bind is invisible
+       to normalized dumps (the DG_NEW_FROM_METHOD operand folds) and
+       detonates at dispatch: [p.LogEvent += this.ShowLog] bound
+       ShowLog(string) instead of ShowLog#1(ref BattleLog), so the
+       dispatched BattleLog page went in as the string arg and the
+       first [Text::set] read a struct page as a string —
+       ページの取得に失敗２【S_ASSIGN】 on every heal / enemy-debuff
+       log line. *)
+    method resolve_method_ref_overload dg_name (arg : expression) =
+      match arg.node with
+      | Member (obj, method_name, ClassMethod (fname, _))
+        when Hashtbl.mem ctx.delegates dg_name -> (
+          let dg = Hashtbl.find_exn ctx.delegates dg_name in
+          let dg_param_tys =
+            List.map dg.params ~f:(fun p -> p.type_spec.ty)
+          in
+          let dg_ret_ty = dg.return.ty in
+          let sig_matches (f : fundecl) =
+            List.length f.params = List.length dg_param_tys
+            && List.for_all2_exn f.params dg_param_tys ~f:(fun p ty ->
+                   type_equal p.type_spec.ty ty)
+            && type_equal f.return.ty dg_ret_ty
+          in
+          let current_matches =
+            match Hashtbl.find ctx.functions fname with
+            | Some f -> sig_matches f
+            | None -> false
+          in
+          if not current_matches then
+            match Hashtbl.find ctx.overloads fname with
+            | None | Some [] -> ()
+            | Some alternates -> (
+                match List.find alternates ~f:sig_matches with
+                | None -> ()
+                | Some f ->
+                    let new_fname =
+                      match f.class_name with
+                      | Some cls -> cls ^ "@" ^ method_name
+                      | None -> fname
+                    in
+                    arg.node <-
+                      Member
+                        ( obj,
+                          method_name,
+                          ClassMethod (new_fname, Option.value_exn f.index)
+                        );
+                    arg.ty <- TyMethod (ft_of_fundecl f)))
+      | _ -> ()
+
     method check_delegate_compatible parent delegate (expr : expression) =
+      (match delegate with
+      | Some (dg_name, _) -> self#resolve_method_ref_overload dg_name expr
+      | None -> ());
       if Ain.version ctx.ain >= 12 then (
         match (delegate, expr.ty) with
         | Some _, String ->
@@ -1055,47 +1112,12 @@ class type_analyze_visitor ctx =
         if nr_args > nr_params then
           arity_error name nr_params args (ASTExpression expr);
         let check_arg i (a : expression option) v =
-          (* v11 method-reference overload resolution: when the param
-             expects a [Delegate (Some (name, _))] and the arg is a
-             [Member (obj, method_name, ClassMethod (fname, idx))]
-             reference, [Member] resolution picked the primary overload
-             by name only — re-resolve to the overload whose param/return
-             types match the delegate's signature, if one exists. *)
+          (* Method-reference overload re-resolution against the
+             delegate param's signature — see
+             [resolve_method_ref_overload]. *)
           (match (a, v.type_spec.ty) with
-          | Some ({ node = Member (obj, method_name, ClassMethod (fname, _)); _ } as arg),
-            Delegate (Some (dg_name, _))
-            when Hashtbl.mem ctx.delegates dg_name -> (
-              let dg = Hashtbl.find_exn ctx.delegates dg_name in
-              let dg_param_tys = List.map dg.params ~f:(fun p -> p.type_spec.ty) in
-              let dg_ret_ty = dg.return.ty in
-              let sig_matches (f : fundecl) =
-                List.length f.params = List.length dg_param_tys
-                && List.for_all2_exn f.params dg_param_tys
-                     ~f:(fun p ty -> type_equal p.type_spec.ty ty)
-                && type_equal f.return.ty dg_ret_ty
-              in
-              let current_matches =
-                match Hashtbl.find ctx.functions fname with
-                | Some f -> sig_matches f
-                | None -> false
-              in
-              if not current_matches then
-                match Hashtbl.find ctx.overloads fname with
-                | None | Some [] -> ()
-                | Some alternates -> (
-                    match List.find alternates ~f:sig_matches with
-                    | None -> ()
-                    | Some f ->
-                        let new_fname =
-                          match f.class_name with
-                          | Some cls -> cls ^ "@" ^ method_name
-                          | None -> fname
-                        in
-                        arg.node <-
-                          Member (obj, method_name,
-                                  ClassMethod (new_fname,
-                                               Option.value_exn f.index));
-                        arg.ty <- TyMethod (ft_of_fundecl f)))
+          | Some arg, Delegate (Some (dg_name, _)) ->
+              self#resolve_method_ref_overload dg_name arg
           | _ -> ());
           match (a, v.initval) with
           | Some a, _ ->
