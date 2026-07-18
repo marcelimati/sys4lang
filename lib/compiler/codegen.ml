@@ -3519,12 +3519,45 @@ class jaf_compiler ctx debug_info =
              match alice.exe's emission. *)
           | RefEqual | RefNEqual ->
               self#compile_lvalue a;
+              (* v12 iface identity compare narrows each side to its
+                 PAGE half before EQUALE. [iface === NULL] already
+                 dropped the lhs vofs below; [iface === iface] must do
+                 it for BOTH sides — leaving the 2-slot fat-refs and
+                 EQUALE-ing once consumed only two of the four slots:
+                 the compare read vofs-vs-page AND leaked 2 slots per
+                 evaluation. AdvInformationMap@EraseLayer's Erase
+                 predicate [val === obj] runs per element per erased
+                 map layer; the leaked slots (mostly 0-valued vtable
+                 offsets) piled up under the ADV runner's DG_CALL
+                 state, and the prologue scene's return dispatched on
+                 leaked junk: 【DG_CALL】ページ取得エラー ページ番号=0
+                 at the first scene using the war-map arrow layers. *)
+              let v12_iface_struct (t : jaf_type) =
+                Ain.version_gte ctx.ain (12, 0)
+                &&
+                match t with
+                | Struct (n, _) | Ref (Struct (n, _)) ->
+                    Hashtbl.mem ctx.interface_names n
+                | _ -> false
+              in
+              let rhs_iface =
+                (match b.node with Null -> false | _ -> true)
+                &&
+                match b.ty with
+                | Struct (n, _)
+                | Ref (Struct (n, _))
+                | Wrap (Struct (n, _) | Ref (Struct (n, _))) ->
+                    Ain.version_gte ctx.ain (12, 0)
+                    && Hashtbl.mem ctx.interface_names n
+                | _ -> false
+              in
+              let both_iface = v12_iface_struct a.ty && rhs_iface in
               (match (a.ty, b.node) with
               | (Struct (name, _) | Ref (Struct (name, _))), Null
                 when Ain.version_gte ctx.ain (12, 0)
                      && Hashtbl.mem ctx.interface_names name ->
                   self#write_instruction0 POP
-              | _ -> ());
+              | _ -> if both_iface then self#write_instruction0 POP);
               let lhs_is_call_or_dummy =
                 match a.node with
                 | Call _ | DummyRef _ -> true
@@ -3565,7 +3598,35 @@ class jaf_compiler ctx debug_info =
               | _ when (match b.node with This -> true | _ -> false) ->
                   self#compile_lvalue b
               | Ref _ -> self#compile_lvalue b
-              | _ -> self#compile_expression b)
+              | _ -> self#compile_expression b);
+              if both_iface then (
+                (* Narrow the rhs pair to its page too. Wrap-stored
+                   sources ([foreach] loop vars, captured [foreach]
+                   vars) compiled to a single [REFREF] leaving the
+                   WRAP-handle pair — deref once more to the fat-ref
+                   before dropping the vofs (orig: REFREF; REFREF;
+                   POP). Plain iface storage already yielded the
+                   fat-ref pair — just drop the vofs. *)
+                let b_storage_is_wrap =
+                  match b.node with
+                  | Ident (_, LocalVariable (i, _)) -> (
+                      match (self#get_local i).value_type with
+                      | Ain.Type.Wrap _ -> true
+                      | _ -> false)
+                  | Ident (_, CapturedVariable (i, level)) -> (
+                      match List.nth enclosing_functions (level - 1) with
+                      | Some parent -> (
+                          match List.nth parent.vars i with
+                          | Some (v : Ain.Variable.t) -> (
+                              match v.value_type with
+                              | Ain.Type.Wrap _ -> true
+                              | _ -> false)
+                          | None -> false)
+                      | None -> false)
+                  | _ -> false
+                in
+                if b_storage_is_wrap then self#write_instruction0 REFREF;
+                self#write_instruction0 POP)
           | _ ->
               self#compile_expression a;
               (match (op, b.node) with

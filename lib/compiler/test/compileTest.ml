@@ -2930,6 +2930,56 @@ let%expect_test "v12 cast-receiver optional property folds X_ICAST into the null
     286: EOF
     |}]
 
+(* v12 [iface === iface] must narrow both 2-slot fat-refs to their
+   PAGE halves before EQUALE. Leaving the pairs and EQUALE-ing once
+   consumed only two of the four slots: the compare read vofs-vs-page
+   AND leaked 2 stack slots per evaluation
+   (AdvInformationMap@EraseLayer's per-element Erase predicate
+   [val === obj] piled leaked 0-valued vtable offsets under the ADV
+   runner's DG_CALL state — the prologue war-map scene's return
+   dispatched on the junk: 【DG_CALL】ページ取得エラー ページ番号=0). *)
+let%expect_test "v12 iface identity compare narrows both fat-refs to pages" =
+  compile_test ~ain_version:12
+    {|
+      interface I {
+        void F(bool val);
+      };
+      class C implements I {
+        void F(bool val);
+      };
+      bool eq(I a, I b)
+      {
+        return a === b;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC eq
+    036: PUSHLOCALPAGE
+    038: PUSH 0
+    044: REFREF
+    046: POP
+    048: PUSHLOCALPAGE
+    050: PUSH 2
+    056: REFREF
+    058: POP
+    060: EQUALE
+    062: RETURN
+    064: PUSH 0
+    070: RETURN
+    072: ENDFUNC eq
+    078: EOF test.jaf
+    084: FUNC C@0
+    090: RETURN
+    092: ENDFUNC C@0
+    098: FUNC NULL
+    104: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
