@@ -6172,6 +6172,67 @@ class jaf_compiler ctx debug_info =
                     | _ -> false)
                 | _ -> false
               in
+              if
+                receiver_is_casted_from_iface && (not is_dummyref)
+                && Ain.version_gte ctx.ain (12, 0)
+              then (
+                (* v12 [StructType(iface_var)?.Prop ?? fb] — checked
+                   DOWNCAST receiver on a plain variable. orig reads the
+                   variable's page, X_ICASTs it (3 slots, validator on
+                   top), folds a failed cast into the null path, and
+                   defers the getter past the merge like every optional
+                   property read. The generic variable path compiled
+                   only a null test — the cast VANISHED and the getter
+                   ran against whatever class the object really was:
+                   [AdvInformationMap@EraseLayer]'s Where-lambda
+                   [(AdvInfoMapLayer(obj)?.CgName ?? "") == cgName] read
+                   AdvInfoMapLayer.m_cgName (slot 4) off the 4-slot
+                   AdvInfoMapCg base-map page —【REF】範囲外アクセス
+                   Page=<live page> Index=4 要素数=4 during the
+                   prologue war-map arrow animation (■地図／レイヤー削除
+                   mid-cutscene). *)
+                let dst_sno =
+                  match receiver.ty with
+                  | Struct (_, s) | Ref (Struct (_, s)) -> s
+                  | _ -> -1
+                in
+                let inner =
+                  match receiver.node with
+                  | Cast (_, i) -> i
+                  | _ -> receiver
+                in
+                self#compile_variable_ref inner;
+                self#write_instruction0 REF;
+                self#write_instruction1 X_ICAST dst_sno;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifnz_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#write_instruction1 PUSH 0;
+                let pad_jump = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifnz_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_address_at pad_jump current_address;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifz_addr = current_address + 2 in
+                self#write_instruction1 IFZ 0;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#compile_expression b;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#write_instruction0 POP;
+                self#compile_method_call_for_receiver receiver.ty []
+                  method_no;
+                self#write_address_at jump_addr current_address)
+              else (
               if is_dummyref then (
                 self#compile_lvalue receiver;
                 if not receiver_is_casted_from_iface then
@@ -6217,7 +6278,7 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 JUMP 0;
               self#write_address_at ifz_addr current_address;
               self#compile_method_call_for_receiver receiver.ty [] method_no;
-              self#write_address_at jump_addr current_address
+              self#write_address_at jump_addr current_address)
           | Call
               ( { node = OptionalMember (receiver, opt_mname, _); _ },
                 args,
@@ -6342,6 +6403,68 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 POP;
                 self#compile_expression b;
                 self#write_address_at a_have current_address)
+              else if
+                receiver_is_casted_from_iface && (not is_dummyref)
+                && is_property_getter
+                && (not is_value_prop_setter)
+                && Ain.version_gte ctx.ain (12, 0)
+              then (
+                (* v12 [StructType(iface_var)?.Prop ?? fb] — checked
+                   DOWNCAST of a plain variable as the optional
+                   receiver. orig reads the variable's page, X_ICASTs
+                   it (3 slots, validator on top), folds a failed cast
+                   into the null path, and defers the getter past the
+                   merge. The generic variable path below compiles only
+                   a null test — the cast VANISHED and the getter ran
+                   against whatever class the object really was:
+                   [AdvInformationMap@EraseLayer]'s Where-lambda
+                   [(AdvInfoMapLayer(obj)?.CgName ?? "") == cgName]
+                   read AdvInfoMapLayer.m_cgName (slot 4) off the
+                   4-slot AdvInfoMapCg base-map page —【REF】範囲外
+                   アクセス Page=<live page> Index=4 要素数=4 during
+                   the prologue war-map arrow animation
+                   (■地図／レイヤー削除 mid-cutscene). *)
+                let dst_sno =
+                  match receiver.ty with
+                  | Struct (_, s) | Ref (Struct (_, s)) -> s
+                  | _ -> -1
+                in
+                let inner =
+                  match receiver.node with
+                  | Cast (_, i) -> i
+                  | _ -> receiver
+                in
+                self#compile_variable_ref inner;
+                self#write_instruction0 REF;
+                self#write_instruction1 X_ICAST dst_sno;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifnz_addr = current_address + 2 in
+                self#write_instruction1 IFNZ 0;
+                self#write_instruction1 PUSH 0;
+                let pad_jump = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifnz_addr current_address;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction1 PUSH (-1);
+                self#write_address_at pad_jump current_address;
+                self#write_instruction1 PUSH (-1);
+                self#write_instruction0 EQUALE;
+                let ifz_addr = current_address + 2 in
+                self#write_instruction1 IFZ 0;
+                self#write_instruction0 POP;
+                self#write_instruction0 POP;
+                self#compile_expression b;
+                let jump_addr = current_address + 2 in
+                self#write_instruction1 JUMP 0;
+                self#write_address_at ifz_addr current_address;
+                self#write_instruction0 POP;
+                self#compile_method_call_for_receiver receiver.ty args
+                  method_no;
+                self#write_address_at jump_addr current_address)
               else (
               if is_dummyref then (
                 self#compile_lvalue receiver;

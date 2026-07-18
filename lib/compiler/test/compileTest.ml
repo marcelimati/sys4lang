@@ -2831,6 +2831,105 @@ let%expect_test "v12 enum DummyRef rvalue derefs the ref pair" =
     650: ENDFUNC E::Numof
     |}]
 
+(* [StructType(iface_var)?.Prop ?? fb] — a checked DOWNCAST as the
+   optional receiver. The cast must compile as X_ICAST with the failed
+   cast folded into the null path (the validator drives the same
+   (pair, marker) merge as a null receiver); the getter stays deferred
+   past the merge. Regression: the generic variable path compiled only
+   a null test — the cast VANISHED and the getter ran against whatever
+   class the object really was (Rance10 AdvInformationMap@EraseLayer's
+   Where-lambda read AdvInfoMapLayer.m_cgName, slot 4, off the 4-slot
+   AdvInfoMapCg page: 【REF】範囲外アクセス Index=4 要素数=4 during
+   the prologue war-map arrow animation). *)
+let%expect_test "v12 cast-receiver optional property folds X_ICAST into the null path" =
+  compile_test ~ain_version:12
+    {|
+      interface I {
+        void Show(bool val);
+      };
+      class A implements I {
+        string m_cg;
+        string Cg { get; }
+        void Show(bool val);
+      };
+      class B implements I {
+        void Show(bool val);
+      };
+      bool f(I obj, string s) {
+        return (A(obj)?.Cg ?? "") == s;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC A@Cg::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 2
+    044: REF
+    046: A_REF
+    048: RETURN
+    050: ENDFUNC A@Cg::get
+    056: FUNC A@Cg::get
+    062: PUSHSTRUCTPAGE
+    064: PUSH 2
+    070: REF
+    072: A_REF
+    074: RETURN
+    076: ENDFUNC A@Cg::get
+    082: FUNC f
+    088: PUSHLOCALPAGE
+    090: PUSH 0
+    096: REF
+    098: X_ICAST struct(1)
+    104: PUSH -1
+    110: EQUALE
+    112: IFNZ 130
+    118: PUSH 0
+    124: JUMP 152
+    130: POP
+    132: POP
+    134: PUSH -1
+    140: PUSH -1
+    146: PUSH -1
+    152: PUSH -1
+    158: EQUALE
+    160: IFZ 182
+    166: POP
+    168: POP
+    170: S_PUSH ""
+    176: JUMP 196
+    182: POP
+    184: PUSH 5
+    190: CALLMETHOD NULL
+    196: PUSHLOCALPAGE
+    198: PUSH 2
+    204: REF
+    206: A_REF
+    208: S_EQUALE
+    210: RETURN
+    212: PUSH 0
+    218: RETURN
+    220: ENDFUNC f
+    226: EOF test.jaf
+    232: FUNC A@0
+    238: PUSHSTRUCTPAGE
+    240: PUSH 2
+    246: REF
+    248: S_PUSH ""
+    254: S_ASSIGN
+    256: DELETE
+    258: RETURN
+    260: ENDFUNC A@0
+    266: FUNC B@0
+    272: RETURN
+    274: ENDFUNC B@0
+    280: FUNC NULL
+    286: EOF
+    |}]
+
 (* v11 reads strings via REF; A_REF instead of the pre-v11 S_REF — the
    pre-v11 form doesn't incref and the VM panics freeing the returned
    string. *)
