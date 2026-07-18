@@ -402,6 +402,59 @@ class jaf_compiler ctx debug_info =
         if self#needs_a_ref_for_consume elem then
           self#write_instruction0 A_REF)
 
+    (** Destructure [base.G1()....Gk()?.H1()....] — a getter chain with
+        exactly one optional hop: plain zero-arg getters up to the
+        tested receiver, the optional getter, then more plain getters.
+        Each call is DummyRef-backed (variableAlloc). Returns
+        (base, inner plain hops before the test, the optional hop,
+         outer plain hops after it) with hops as (getter fn, dummy)
+        in execution order; None when the shape doesn't match. Used by
+        the ??-deferred scalar-field arm for chain receivers. *)
+    method private optional_getter_field_chain (e : expression) =
+      let rec strip (e : expression) =
+        match e.node with
+        | Cast (_, i) | RvalueRef i -> strip i
+        | _ -> e
+      in
+      let rec walk_outer (e : expression) outer =
+        match (strip e).node with
+        | DummyRef
+            ( dno,
+              { node =
+                  Call
+                    ( { node = Member (inner, _, ClassMethod (_, g)); _ },
+                      [],
+                      MethodCall _ );
+                _ } ) ->
+            walk_outer inner ((g, dno) :: outer)
+        | DummyRef
+            ( dno,
+              { node =
+                  Call
+                    ( { node = OptionalMember (recv, _, ClassMethod (_, g)); _ },
+                      [],
+                      MethodCall _ );
+                _ } ) ->
+            let rec walk_inner (e : expression) inner =
+              match (strip e).node with
+              | DummyRef
+                  ( ino,
+                    { node =
+                        Call
+                          ( { node = Member (deeper, _, ClassMethod (_, ig)); _ },
+                            [],
+                            MethodCall _ );
+                      _ } ) ->
+                  walk_inner deeper ((ig, ino) :: inner)
+              | _ when is_variable_ref (strip e).node -> Some (strip e, inner)
+              | _ -> None
+            in
+            Option.map (walk_inner recv []) ~f:(fun (base, inner) ->
+                (base, inner, (g, dno), outer))
+        | _ -> None
+      in
+      walk_outer e []
+
     (** v11: release every DummyRef slot allocated since [vars_before]
         in the topmost scope, in LIFO (newest-first) order. Records
         each released index in [inline_deleted_dummies] (so a goto /
@@ -5795,6 +5848,108 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 ASSIGN;
               self#write_address_at merge_jump current_address;
               self#write_instruction0 A_REF
+          | Member (field_recv, _, ClassVariable var_no)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (match expr.ty with
+                    | Int | Bool | Float | Enum _ -> true
+                    | _ -> false)
+                 && Option.is_some (self#optional_getter_field_chain field_recv)
+            ->
+              (* v12 [base.Opt?.Getter....field ?? fallback] — scalar
+                 field at the end of an optional GETTER CHAIN. Same
+                 deferred-pair protocol as the variable-receiver arm
+                 below, but the pair's page comes from the chain's last
+                 call result: call the optional getter (spilling each
+                 hop into its 戻り値 dummy), null-test its result, run
+                 the remaining plain getter hops in the live branch,
+                 then juggle (result, field idx, marker) across the
+                 merge; the null paths push (-1,-1,-1) and the fallback
+                 repoints the pair at the 右辺値参照化用 spill. One
+                 trailing [REF] serves both arms. Our generic path left
+                 a bare -1 on the null side and dereferenced it
+                 unconditionally: [act.Leader?.State.IsCritical ??
+                 false] crashed every non-sure-hit ENEMY attack with
+                 【REF】Page=-1 Index=4
+                 (AvoidanceCalculator@IsAttackHitConstantlyBySkillAndState;
+                 same family as the CMotionAlphaData@AddParam follow-up
+                 recorded on c4e983c). *)
+              let base, inner_hops, (opt_g, opt_d), outer_hops =
+                Option.value_exn (self#optional_getter_field_chain field_recv)
+              in
+              let spill dummy_no =
+                self#scope_add_var (self#get_local dummy_no);
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH dummy_no;
+                self#write_instruction0 REF;
+                self#emit_slot_release;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH dummy_no;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ASSIGN
+              in
+              let hop (g, d) =
+                self#write_instruction1 PUSH g;
+                self#write_instruction1 CALLMETHOD 0;
+                spill d
+              in
+              (match base.node with
+              | This -> self#write_instruction0 PUSHSTRUCTPAGE
+              | _ ->
+                  self#compile_variable_ref base;
+                  self#write_instruction0 REF);
+              List.iter inner_hops ~f:hop;
+              self#write_instruction0 DUP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let outer_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              hop (opt_g, opt_d);
+              List.iter outer_hops ~f:hop;
+              self#write_instruction1 PUSH var_no;
+              self#write_instruction0 DUP_U2;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let inner_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              self#write_instruction1 PUSH 0;
+              let inner_ok_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at inner_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at inner_ok_jump current_address;
+              let merge_jump = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at outer_null_addr current_address;
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_jump current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let deref_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              (match b.node with
+              | DummyRef (dummy_idx, inner) ->
+                  self#compile_expression inner;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH dummy_idx;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH dummy_idx
+              | _ -> self#compile_lvalue b);
+              self#write_address_at deref_addr current_address;
+              self#write_instruction0 REF
           | OptionalMember (receiver, _, ClassVariable var_no)
             when Ain.version_gte ctx.ain (12, 0)
                  && is_variable_ref receiver.node

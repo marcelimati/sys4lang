@@ -2423,9 +2423,28 @@ class type_analyze_visitor ctx =
                [LeaderCard@UpdateSkillCache]'s postset chain at battle
                entry — read the dead page: ページの取得に失敗２
                [S_ASSIGN]). *)
+            (* Field reads whose RECEIVER CHAIN contains the optional
+               ([act.Leader?.State.IsCritical ?? false]) defer the same
+               way — the chain's null path substitutes the spill's
+               (page, index) pair before the single [REF]. Without the
+               spill our null path left a bare -1 and the trailing
+               [PUSH idx; REF] read member idx of page -1: every enemy
+               attack whose skill lacks the sure-hit effect crashed
+               AvoidanceCalculator@IsAttackHitConstantlyBySkillAndState
+               with 【REF】Page=-1 Index=4. *)
+            let rec chain_has_optional (e : expression) =
+              match e.node with
+              | OptionalMember _ -> true
+              | Cast (_, i) | RvalueRef i | DummyRef (_, i) ->
+                  chain_has_optional i
+              | Call (callee, _, _) -> chain_has_optional callee
+              | Member (r, _, _) -> chain_has_optional r
+              | _ -> false
+            in
             Ain.version_gte ctx.ain (12, 0)
             && (match a.node with
                | OptionalMember (_, _, ClassVariable _) -> true
+               | Member (r, _, ClassVariable _) -> chain_has_optional r
                | _ -> false)
             &&
             match a.ty with
