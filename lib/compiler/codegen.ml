@@ -3628,7 +3628,27 @@ class jaf_compiler ctx debug_info =
                 if b_storage_is_wrap then self#write_instruction0 REFREF;
                 self#write_instruction0 POP)
           | _ ->
-              self#compile_expression a;
+              (* v12 float binary op whose LEFT operand is an int→float
+                 coercion: the original pushes both operands first and
+                 converts the left one in place afterwards
+                 (SWAP; ITOF; SWAP); a right-operand coercion converts in
+                 place either way. Converting the left operand eagerly
+                 diverged in 134 functions (full-coverage families
+                 [+ITOF] / [-SWAP -ITOF -SWAP], e.g.
+                 CASTimerImp@UpdatePassedTime's [diff * rate]). *)
+              let deferred_left =
+                if Ain.version_gte ctx.ain (12, 0) then
+                  match (a.node, a.ty, b.ty) with
+                  | Cast (Float, inner), Float, Float -> (
+                      match inner.ty with
+                      | Int | LongInt | Enum _ | Bool -> Some inner
+                      | _ -> None)
+                  | _ -> None
+                else None
+              in
+              (match deferred_left with
+              | Some inner -> self#compile_expression inner
+              | None -> self#compile_expression a);
               (match (op, b.node) with
               | (Equal | NEqual), Null
                 when Ain.version_gte ctx.ain (12, 0)
@@ -3651,7 +3671,11 @@ class jaf_compiler ctx debug_info =
                       self#write_instruction0 POP
                   | _ -> ())
               | _ -> ());
-              self#compile_expression b);
+              self#compile_expression b;
+              if Option.is_some deferred_left then (
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ITOF;
+                self#write_instruction0 SWAP));
           match (a.ty, op) with
           | (Int | LongInt | Bool | Enum _), Equal ->
               self#write_instruction0 EQUALE
