@@ -3639,7 +3639,13 @@ class jaf_compiler ctx debug_info =
               let deferred_left =
                 if Ain.version_gte ctx.ain (12, 0) then
                   match (a.node, a.ty, b.ty) with
-                  | Cast (Float, inner), Float, Float -> (
+                  (* Only coercions inserted by typeAnalysis (insert_cast
+                     clones the operand, so the Cast shares its inner's
+                     location); an explicit [float(x)] written in the
+                     source has a wider location and converts in place,
+                     as the original does. *)
+                  | Cast (Float, inner), Float, Float
+                    when Poly.equal inner.loc a.loc -> (
                       match inner.ty with
                       | Int | LongInt | Enum _ | Bool -> Some inner
                       | _ -> None)

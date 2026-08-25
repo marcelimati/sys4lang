@@ -83,6 +83,7 @@ let remove_cast (t : ain_type) e =
   match (t, e) with
   | Int, UnaryOp (FTOI, e) -> e
   | Float, UnaryOp (ITOF, e) -> e
+  | Float, UnaryOp (PSEUDO_IMPLICIT_ITOF, e) -> e
   | LongInt, UnaryOp (ITOLI, e) -> e
   | _, _ -> e
 
@@ -91,8 +92,14 @@ let remove_binop_cast (insn : Instructions.instruction) lhs rhs =
   | F_ADD | F_SUB | F_MUL | F_DIV | F_EQUALE | F_NOTE | F_LT | F_LTE | F_GT
   | F_GTE -> (
       match (lhs, rhs) with
-      | UnaryOp (ITOF, _), UnaryOp (ITOF, _) -> (lhs, rhs)
-      | _, _ -> (remove_cast Float lhs, remove_cast Float rhs))
+      (* Deferred (implicit) left promotion: drop the marker; keep an
+         explicit right cast if there is one (int / float(int)). *)
+      | UnaryOp (PSEUDO_IMPLICIT_ITOF, l), UnaryOp (ITOF, _) -> (l, rhs)
+      | UnaryOp (PSEUDO_IMPLICIT_ITOF, l), _ -> (l, remove_cast Float rhs)
+      (* Eager left conversion = an explicit float() cast in the source
+         (the original compiler defers implicit promotions); keep it. *)
+      | UnaryOp (ITOF, _), _ -> (lhs, rhs)
+      | _, _ -> (lhs, remove_cast Float rhs))
   | LI_ADD | LI_SUB | LI_MUL | LI_DIV | LI_MOD -> (
       match (lhs, rhs) with
       | UnaryOp (ITOLI, _), UnaryOp (ITOLI, _) -> (lhs, rhs)
@@ -403,7 +410,9 @@ class analyzer (func : Ain.Function.t) (struc : Ain.Struct.t option) =
       let t =
         match (insn, auto_deref et) with
         | FTOI, Float -> Int
-        | ITOF, (Int | LongInt | Bool | Char | Enum _) -> Float
+        | (ITOF | PSEUDO_IMPLICIT_ITOF), (Int | LongInt | Bool | Char | Enum _)
+          ->
+            Float
         | ITOLI, (Int | LongInt | Bool | Char | Enum _) -> LongInt
         | ITOB, (Int | LongInt | Bool | Char | Enum _) -> Bool
         | STOI, String -> Int

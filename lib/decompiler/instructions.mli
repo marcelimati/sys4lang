@@ -302,6 +302,7 @@ type instruction =
   | PSEUDO_A_NUMOF1
   | PSEUDO_NULL_COALESCE
   | PSEUDO_ARRAY_ASSIGN
+  | PSEUDO_IMPLICIT_ITOF
 [@@deriving show { with_path = false }]
 
 val width : instruction -> int

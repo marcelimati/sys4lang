@@ -463,6 +463,7 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
           bprintf out "%a?" (self#pr_expr (prec_value PREC_DOT)) (unwrap e)
       | UnaryOp (FTOI, expr) -> bprintf out "int(%a)" (self#pr_expr 0) expr
       | UnaryOp (ITOF, expr) -> bprintf out "float(%a)" (self#pr_expr 0) expr
+      | UnaryOp (PSEUDO_IMPLICIT_ITOF, expr) -> self#pr_expr prec out expr
       | UnaryOp (ITOLI, expr) -> bprintf out "lint(%a)" (self#pr_expr 0) expr
       | UnaryOp (ITOB, Number 0l) -> print_string out "false"
       | UnaryOp (ITOB, Number 1l) -> print_string out "true"

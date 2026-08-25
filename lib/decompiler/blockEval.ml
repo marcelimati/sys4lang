@@ -699,10 +699,25 @@ let analyze (env : env) ~address ~end_address ~instructions (state : state) =
         update_stack ctx (function
           | a :: b :: stack -> b :: a :: b :: stack
           | stack -> unexpected_stack "DUP_U2" stack)
-    | SWAP ->
-        update_stack ctx (function
-          | a :: b :: stack -> b :: a :: stack
-          | stack -> unexpected_stack "SWAP" stack)
+    | SWAP -> (
+        match ctx.instructions with
+        | { txt = ITOF; _ } :: { txt = SWAP; _ } :: rest ->
+            (* v12 implicit int->float promotion of the LEFT operand of a
+               float binary op: both operands are pushed, then the left
+               one is converted in place (SWAP; ITOF; SWAP). Fold the
+               triple into a marker so the explicit-cast form
+               (X; ITOF; Y — printed as float(X)) stays distinguishable:
+               sys4c compiles explicit casts eagerly and implicit
+               promotions deferred. *)
+            ctx.instructions <- rest;
+            update_stack ctx (function
+              | a :: b :: stack ->
+                  a :: UnaryOp (PSEUDO_IMPLICIT_ITOF, b) :: stack
+              | stack -> unexpected_stack "SWAP" stack)
+        | _ ->
+            update_stack ctx (function
+              | a :: b :: stack -> b :: a :: stack
+              | stack -> unexpected_stack "SWAP" stack))
     (* --- Variables --- *)
     | PUSHGLOBALPAGE -> push ctx (Page GlobalPage)
     | PUSHLOCALPAGE -> push ctx (Page LocalPage)

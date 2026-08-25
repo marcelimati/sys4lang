@@ -304,6 +304,11 @@ type instruction =
   | PSEUDO_A_NUMOF1
   | PSEUDO_NULL_COALESCE
   | PSEUDO_ARRAY_ASSIGN
+  (* v12 implicit int->float promotion of a binary op's LEFT operand:
+     the compiler emits SWAP; ITOF; SWAP after pushing both operands.
+     Folded by blockEval so it stays distinguishable from an explicit
+     cast (X; ITOF; Y), which converts in place. *)
+  | PSEUDO_IMPLICIT_ITOF
 [@@deriving show { with_path = false }]
 
 let to_assign_op = function
