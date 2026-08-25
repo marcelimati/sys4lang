@@ -10535,7 +10535,8 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction1 S_PUSH (Ain.add_string ctx.ain s);
                   self#write_instruction0 RETURN
                 in
-                let emit_chain ~string_input ~on_match ~on_default =
+                let emit_chain ?(keep_input = false) ~string_input ~on_match
+                    ~on_default () =
                   local_ref 0;
                   List.iter enum_items ~f:(fun (name, value) ->
                       self#write_instruction0 DUP;
@@ -10549,7 +10550,10 @@ class jaf_compiler ctx debug_info =
                         self#write_instruction0 EQUALE);
                       let ifz_addr = current_address + 2 in
                       self#write_instruction1 IFZ 0;
-                      self#write_instruction0 POP;
+                      (* [Parse(int)] returns the matched input itself:
+                         the DUP'd value stays on the stack as the
+                         result (original: no POP / PUSH value). *)
+                      if not keep_input then self#write_instruction0 POP;
                       on_match name value;
                       self#write_address_at ifz_addr current_address);
                   self#write_instruction0 POP;
@@ -10592,7 +10596,7 @@ class jaf_compiler ctx debug_info =
                     emit_function fdecl (fun () ->
                         emit_chain ~string_input:false
                           ~on_match:(fun _ _ -> emit_int_return 1)
-                          ~on_default:(fun () -> emit_int_return 0)));
+                          ~on_default:(fun () -> emit_int_return 0) ()));
                 Option.iter
                   (Hashtbl.find ctx.functions (enum_name ^ "::Parse"))
                   ~f:(fun fdecl ->
@@ -10600,17 +10604,18 @@ class jaf_compiler ctx debug_info =
                         emit_chain ~string_input:true
                           ~on_match:(fun _ value ->
                             emit_option_enum_return value)
-                          ~on_default:emit_option_enum_null_return));
+                          ~on_default:emit_option_enum_null_return ()));
                 Hashtbl.find ctx.overloads (enum_name ^ "::Parse")
                 |> Option.value ~default:[]
                 |> List.iter ~f:(fun fdecl ->
                        match fdecl.params with
                        | [ { type_spec = { ty = Int; _ }; _ } ] ->
                            emit_function fdecl (fun () ->
-                               emit_chain ~string_input:false
-                                 ~on_match:(fun _ value ->
-                                   emit_option_enum_return value)
-                                 ~on_default:emit_option_enum_null_return)
+                               emit_chain ~keep_input:true ~string_input:false
+                                 ~on_match:(fun _ _ ->
+                                   self#write_instruction1 PUSH 0;
+                                   self#write_instruction0 RETURN)
+                                 ~on_default:emit_option_enum_null_return ())
                        | _ -> ());
                 Option.iter
                   (Hashtbl.find ctx.functions (enum_name ^ "@String"))
@@ -10618,7 +10623,7 @@ class jaf_compiler ctx debug_info =
                     emit_function fdecl (fun () ->
                         emit_chain ~string_input:false
                           ~on_match:(fun name _ -> emit_string_return name)
-                          ~on_default:(fun () -> emit_string_return ""))))
+                          ~on_default:(fun () -> emit_string_return "") ())))
         | Enum _ ->
             (* v12 enum codegen TODO: the auto-generated methods
                (Numof/GetList/IsExist/Parse/String) need real bodies.

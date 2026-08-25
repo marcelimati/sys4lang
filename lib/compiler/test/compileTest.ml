@@ -2748,79 +2748,75 @@ let%expect_test "v12 enum DummyRef rvalue derefs the ref pair" =
     340: DUP
     342: PUSH 0
     348: EQUALE
-    350: IFZ 372
-    356: POP
-    358: PUSH 0
-    364: PUSH 0
-    370: RETURN
-    372: DUP
-    374: PUSH 1
-    380: EQUALE
-    382: IFZ 404
+    350: IFZ 364
+    356: PUSH 0
+    362: RETURN
+    364: DUP
+    366: PUSH 1
+    372: EQUALE
+    374: IFZ 388
+    380: PUSH 0
+    386: RETURN
     388: POP
-    390: PUSH 1
-    396: PUSH 0
+    390: PUSH -1
+    396: PUSH -1
     402: RETURN
-    404: POP
-    406: PUSH -1
-    412: PUSH -1
-    418: RETURN
-    420: ENDFUNC E::Parse
-    426: FUNC E@String
-    432: PUSHLOCALPAGE
-    434: PUSH 0
-    440: REF
-    442: DUP
-    444: PUSH 0
-    450: EQUALE
-    452: IFZ 468
-    458: POP
-    460: S_PUSH "A"
-    466: RETURN
-    468: DUP
-    470: PUSH 1
-    476: EQUALE
-    478: IFZ 494
-    484: POP
-    486: S_PUSH "B"
-    492: RETURN
-    494: POP
-    496: S_PUSH ""
-    502: RETURN
-    504: ENDFUNC E@String
-    510: FUNC next
-    516: PUSHLOCALPAGE
-    518: PUSH 0
-    524: REF
-    526: CALLHLL library(0), library_function(1), 92
-    540: PUSHLOCALPAGE
-    542: PUSH 0
-    548: REF
-    550: PUSH 0
-    556: CALLHLL library(0), library_function(4), 92
-    570: PUSHLOCALPAGE
+    404: ENDFUNC E::Parse
+    410: FUNC E@String
+    416: PUSHLOCALPAGE
+    418: PUSH 0
+    424: REF
+    426: DUP
+    428: PUSH 0
+    434: EQUALE
+    436: IFZ 452
+    442: POP
+    444: S_PUSH "A"
+    450: RETURN
+    452: DUP
+    454: PUSH 1
+    460: EQUALE
+    462: IFZ 478
+    468: POP
+    470: S_PUSH "B"
+    476: RETURN
+    478: POP
+    480: S_PUSH ""
+    486: RETURN
+    488: ENDFUNC E@String
+    494: FUNC next
+    500: PUSHLOCALPAGE
+    502: PUSH 0
+    508: REF
+    510: CALLHLL library(0), library_function(1), 92
+    524: PUSHLOCALPAGE
+    526: PUSH 0
+    532: REF
+    534: PUSH 0
+    540: CALLHLL library(0), library_function(4), 92
+    554: PUSHLOCALPAGE
+    556: PUSH 1
+    562: REF
+    564: DELETE
+    566: PUSHLOCALPAGE
+    568: DUP_X2
+    570: POP
     572: PUSH 1
-    578: REF
-    580: DELETE
-    582: PUSHLOCALPAGE
-    584: DUP_X2
-    586: POP
-    588: PUSH 1
-    594: DUP_X2
-    596: POP
-    598: R_ASSIGN
-    600: REF
-    602: RETURN
-    604: PUSH 0
-    610: RETURN
-    612: ENDFUNC next
-    618: EOF test.jaf
-    624: FUNC NULL
-    630: EOF
-    636: FUNC E::Numof
-    642: PUSH 2
-    648: RETURN
-    650: ENDFUNC E::Numof
+    578: DUP_X2
+    580: POP
+    582: R_ASSIGN
+    584: REF
+    586: RETURN
+    588: PUSH 0
+    594: RETURN
+    596: ENDFUNC next
+    602: EOF test.jaf
+    608: FUNC NULL
+    614: EOF
+    620: FUNC E::Numof
+    626: PUSH 2
+    632: RETURN
+    634: ENDFUNC E::Numof
     |}]
 
 (* [StructType(iface_var)?.Prop ?? fb] — a checked DOWNCAST as the
