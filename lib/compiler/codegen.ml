@@ -8093,6 +8093,19 @@ class jaf_compiler ctx debug_info =
             | _ -> (
                 match e.node with
                 | Assign (EqAssign, { node = DummyRef _; _ }, _) -> true
+                (* v12: orig pops a plain assignment's result BEFORE the
+                   statement's dummy releases only for DummyRef lhs
+                   (above); a plain [x = rhs] releases the rhs dummies
+                   first (orig: ASSIGN; LOCALDELETE...; POP — 400 sites
+                   vs 103). Everything else — discarded calls, spilled
+                   chains — pops first (CALLMETHOD 1,194 / 
+                   STACK_LOCALASSIGN 643 POP-first sites vs none
+                   delete-first): the previous default inverted this
+                   for every Struct/Ref-Struct/Int-typed statement
+                   (full-coverage families [-POP +POP] 516+479 hunks). *)
+                | Assign (EqAssign, _, _) when Ain.version_gte ctx.ain (12, 0) ->
+                    false
+                | _ when Ain.version_gte ctx.ain (12, 0) -> true
                 (* v12 [obj.OptMethod(...)] / [obj?.Method(...)] / chained
                    optional access producing a plain scalar result (Int /
                    Bool / Float / Enum) at statement level: orig pops the
