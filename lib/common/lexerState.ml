@@ -13,6 +13,11 @@ let templated : (string, unit) Hashtbl.t = Hashtbl.create (module String)
 
 let is_templated s = Hashtbl.mem templated s
 let add_templated s = Hashtbl.set templated ~key:s ~data:()
+(* [readonly] is a keyword only for v12 targets; older sources use it
+   as an ordinary identifier (Ixseal: [bool readonly = ...]). Set by
+   [Compile.parse_pass] from the target ain version. *)
+let readonly_keyword = ref true
+
 let clear () = Hashtbl.clear templated
 
 (* Pre-scan a source string to register any identifier immediately followed

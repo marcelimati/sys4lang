@@ -51,6 +51,7 @@ let parse_pass ctx sources read_file =
      `Foo<X, Y>` as a single TEMPLATE_IDENTIFIER token without breaking
      comparison expressions. *)
   LexerState.clear ();
+  LexerState.readonly_keyword := Ain.version_gte ctx.ain (12, 0);
   let read_sources =
     List.map sources ~f:(function
       | (Pje.Jaf f | Pje.Hll (f, _)) as src ->

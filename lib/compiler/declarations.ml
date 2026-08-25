@@ -98,7 +98,7 @@ let expand_property_decl ~(ctx : context) ~(class_name : string)
       name = mangled_name;
       location = loc;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = ClassVar;
       type_spec = backing_ty;
@@ -133,7 +133,7 @@ let expand_property_decl ~(ctx : context) ~(class_name : string)
       name = "value";
       location = loc;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = Parameter;
       type_spec = ty;
@@ -152,7 +152,7 @@ let expand_property_decl ~(ctx : context) ~(class_name : string)
             params = [];
             body = get_body ();
             is_label = false;
-            is_lambda = false;
+            is_lambda = false; is_readonly = false;
             is_private = false;
             index = None;
             class_name = None;
@@ -172,7 +172,7 @@ let expand_property_decl ~(ctx : context) ~(class_name : string)
             params = [ value_param ];
             body = set_body ();
             is_label = false;
-            is_lambda = false;
+            is_lambda = false; is_readonly = false;
             is_private = false;
             index = None;
             class_name = None;
@@ -228,7 +228,7 @@ let expand_event_decl (e : event_decl) : struct_declaration list =
       name = mangled_name;
       location = loc;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = ClassVar;
       type_spec = ty;
@@ -251,7 +251,7 @@ let expand_event_decl (e : event_decl) : struct_declaration list =
       name = "value";
       location = loc;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = Parameter;
       type_spec = ty;
@@ -268,7 +268,7 @@ let expand_event_decl (e : event_decl) : struct_declaration list =
         params = [ value_param ];
         body = None;
         is_label = false;
-        is_lambda = false;
+        is_lambda = false; is_readonly = false;
         is_private = false;
         index = None;
         class_name = None;
@@ -331,7 +331,7 @@ let expand_struct_decls ~(ctx : context) ~(class_name : string)
         name = "<void>";
         location = loc;
         array_dim = [];
-        is_const = false;
+        is_const = false; is_readonly = false;
         is_private = false;
         kind = ClassVar;
         type_spec = { ty = Void; location = loc };
@@ -1047,11 +1047,16 @@ class type_declare_visitor ctx =
             | t -> jaf_type_to_string t
           in
           let param_types = List.map parent.params ~f:(fun p ->
-              name_of_ty p.type_spec.ty) in
+              (if p.is_readonly then "readonly " else "")
+              ^ name_of_ty p.type_spec.ty) in
+          (* [Parent(readonly ref T) readonly(line, col)]: readonly
+             parameters and a readonly parent method are spelled out. *)
           let parent_sig =
-            Printf.sprintf "%s(%s)" (mangled_name parent)
+            Printf.sprintf "%s(%s)%s" (mangled_name parent)
               (String.concat ~sep:", " param_types)
+              (if parent.is_readonly then " readonly" else "")
           in
+          decl.is_readonly <- parent.is_readonly;
           let pos = fst decl.loc in
           let line = pos.pos_lnum in
           let col = pos.pos_cnum - pos.pos_bol + 1 in
@@ -1074,8 +1079,11 @@ class type_declare_visitor ctx =
          match exactly. Return type is not part of the signature
          (matches the C-family / v11 convention). *)
       let same_overload (other : fundecl) =
-        params_compatible decl_param_types
-          (List.map other.params ~f:(fun p -> p.type_spec.ty))
+        (* v12: a [readonly] method is a distinct overload of the same
+           parameter types (its own FUNC slot, readonly [this]). *)
+        Bool.equal decl.is_readonly other.is_readonly
+        && params_compatible decl_param_types
+             (List.map other.params ~f:(fun p -> p.type_spec.ty))
       in
       (* If this body overrides a previously-registered property auto-
          stub, reuse the stub's ain slot rather than allocating a new
@@ -1495,7 +1503,7 @@ class type_declare_visitor ctx =
                             name = "value";
                             location = e.ed_loc;
                             array_dim = [];
-                            is_const = false;
+                            is_const = false; is_readonly = false;
                             is_private = false;
                             kind = Parameter;
                             type_spec = e.ed_typespec;
@@ -1510,7 +1518,7 @@ class type_declare_visitor ctx =
                           params = [ value_param ];
                           body = None;
                           is_label = false;
-                          is_lambda = false;
+                          is_lambda = false; is_readonly = false;
                           is_private = false;
                           index = None;
                           class_name = Some iface_name;
@@ -1651,7 +1659,7 @@ class type_declare_visitor ctx =
                     name = "<vtable>";
                     location = loc;
                     array_dim = [];
-                    is_const = false;
+                    is_const = false; is_readonly = false;
                     is_private = false;
                     kind = ClassVar;
                     type_spec = { ty = Array Int; location = loc };
@@ -1822,7 +1830,7 @@ class type_declare_visitor ctx =
                      params;
                      body;
                      is_label = false;
-                     is_lambda = false;
+                     is_lambda = false; is_readonly = false;
                      is_private = false;
                      index = None;
                      class_name = None;
@@ -1850,7 +1858,7 @@ class type_declare_visitor ctx =
                in
                let mk_param pname pty =
                  { name = pname; location = loc;
-                   array_dim = []; is_const = false;
+                   array_dim = []; is_const = false; is_readonly = false;
                    is_private = false; kind = Parameter;
                    type_spec = { ty = pty; location = loc };
                    initval = None; index = None }
@@ -1902,7 +1910,7 @@ class type_declare_visitor ctx =
                    { name = "values";
                      location = loc;
                      array_dim = [];
-                     is_const = false;
+                     is_const = false; is_readonly = false;
                      is_private = false;
                      kind = LocalVar;
                      type_spec = { ty = Array enum_ty; location = loc };
@@ -1963,7 +1971,7 @@ class type_declare_visitor ctx =
                         (if_value_chain ~param:value_param
                            ~default:(return (int_expr (-1)))
                            ~make_return:(fun value -> return (enum_expr value)));
-                    is_label = false; is_lambda = false;
+                    is_label = false; is_lambda = false; is_readonly = false;
                     is_private = false;
                     index = None;
                     class_name = None; class_index = None }
@@ -2005,7 +2013,7 @@ class type_declare_visitor ctx =
                    params;
                    body = Some [ string_chain enum_items ];
                    is_label = false;
-                   is_lambda = false;
+                   is_lambda = false; is_readonly = false;
                    is_private = false;
                    index = None;
                    class_name = None;

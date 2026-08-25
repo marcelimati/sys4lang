@@ -687,7 +687,14 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       bprintf out "%a" self#pr_type arg.type_
 
     method private pr_vardecl out (arg : Ain.Variable.t) =
-      bprintf out "%a %s" self#pr_type arg.type_ (safe_var_name arg.name)
+      let readonly =
+        match Stack.top current_function with
+        | Some f -> Readonly.is_local_readonly f.func arg
+        | None -> false
+      in
+      bprintf out "%s%a %s"
+        (if readonly then "readonly " else "")
+        self#pr_type arg.type_ (safe_var_name arg.name)
 
     method print_function ?(as_lambda = false) ?(skip_signature = false)
         (func : function_t) =
@@ -869,16 +876,18 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
         bprintf out "(%a)"
           (pr_param_list self#pr_vardecl)
           (Ain.Function.args func.func);
+        if (not as_lambda) && Readonly.is_method_readonly func.func then
+          bprintf out " readonly";
         if as_lambda then bprintf out " => %a " self#pr_type return_type
         else self#print_newline
       in
+      Stack.push current_function func;
       if not skip_signature then print_func_signature func;
       let body =
         match func.body.txt with
         | Block _ -> func.body
         | _ -> { func.body with txt = Block [ func.body ] }
       in
-      Stack.push current_function func;
       print_stmt ~is_lambda_top:as_lambda body;
       Stack.pop_exn current_function |> ignore
 
@@ -1083,6 +1092,8 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
                   | Some name ->
                       bprintf out "event %a %s" self#pr_type v.v.type_ name
                   | None ->
+                      if Readonly.is_member_readonly struc.struc v.v then
+                        print_string out "readonly ";
                       self#pr_vardecl out v.v;
                       pr_array_dims out v.dims;
                       Option.iter v.initval ~f:(fun e ->
@@ -1112,9 +1123,13 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
                 bprintf out "~%s" (strip_qualifiers struc.struc.name)
               else
                 bprintf out "%a %s" self#pr_type func.func.return_type func.name;
-              self#println "(%a);"
+              Stack.push current_function func;
+              self#println "(%a)%s;"
                 (pr_param_list self#pr_vardecl)
-                (Ain.Function.args func.func)));
+                (Ain.Function.args func.func)
+                (if Readonly.is_method_readonly func.func then " readonly"
+                 else "");
+              Stack.pop_exn current_function |> ignore));
       self#println "};"
 
     method print_enum_decl (enum : enum_t) =

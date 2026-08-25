@@ -526,7 +526,7 @@ class type_analyze_visitor ctx =
               name = pname;
               location = dummy_location;
               array_dim = [];
-              is_const = false;
+              is_const = false; is_readonly = false;
               is_private = false;
               kind = Parameter;
               type_spec = { ty; location = dummy_location };
@@ -554,7 +554,7 @@ class type_analyze_visitor ctx =
               params;
               body = None;
               is_label = false;
-              is_lambda = false;
+              is_lambda = false; is_readonly = false;
               is_private = false;
               index = Some (Ain.add_delegate ctx.ain name).index;
               class_name = None;
@@ -630,7 +630,7 @@ class type_analyze_visitor ctx =
             { name; loc = dummy_location;
               return = { ty = HLLParam; location = dummy_location };
               params = []; body = None;
-              is_label = false; is_lambda = false; is_private = false;
+              is_label = false; is_lambda = false; is_readonly = false; is_private = false;
               index = Some 0; class_name = None; class_index = None }
       in
       match Hashtbl.find ctx.overloads name with
@@ -691,6 +691,15 @@ class type_analyze_visitor ctx =
                     | [] -> matches
                     | rest -> rest)
                 | _ -> matches
+              in
+              (* v12: a [readonly] overload shares its parameter types
+                 with the mutable one; name resolution picks the mutable
+                 copy and codegen swaps in the readonly copy when the
+                 receiver is readonly. *)
+              let non_self =
+                match List.filter non_self ~f:(fun f -> not f.is_readonly) with
+                | [] -> non_self
+                | rest -> rest
               in
               let strict_param_match (fd : fundecl) =
                 List.for_all2_exn fd.params arg_types ~f:(fun p at ->

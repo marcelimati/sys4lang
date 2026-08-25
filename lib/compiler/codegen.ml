@@ -138,6 +138,31 @@ class jaf_compiler ctx debug_info =
 
     val mutable v12_current_body_dup_rank : int option = None
 
+    (* v12 readonly receivers. Local slots declared (or inferred from a
+       readonly ref initializer / rebind) readonly in the current body;
+       whether [this] is readonly (a [readonly] method, or the
+       compiler-synthesized readonly copy of a property getter). A
+       readonly receiver selects the readonly ("#1") copy of a property
+       getter / method. *)
+    val mutable v12_readonly_slots : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    val mutable v12_this_readonly : bool = false
+    val mutable v12_this_readonly_override : bool = false
+
+    (* Set while compiling the lambda arguments of an Array HLL call on
+       a readonly receiver: the readonly overload takes a readonly
+       callback, so the lambda's ref parameters are readonly. *)
+    val mutable v12_lambda_params_readonly : bool = false
+
+    val v12_readonly_variant_cache : (int, int) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    val v12_readonly_fn_indices : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
+    val mutable v12_readonly_fn_indices_built : bool = false
+
     val mutable v12_iface_local_init_owns_cast_guard = false
 
     val v12_dummy_slots_initialized : (int, unit) Hashtbl.t =
@@ -1762,7 +1787,7 @@ class jaf_compiler ctx debug_info =
               let ifnz_addr = current_address + 2 in
               self#write_instruction1 IFNZ 0;
               self#compile_method_call_for_receiver ~prefer_first_duplicate:true
-                obj.ty args method_no;
+                ~receiver:obj obj.ty args method_no;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH var_no;
               self#write_instruction0 REF;
@@ -1876,7 +1901,7 @@ class jaf_compiler ctx debug_info =
                   let ifnz_addr = current_address + 2 in
                   self#write_instruction1 IFNZ 0;
                   self#compile_method_call_for_receiver
-                    ~prefer_first_duplicate:true obj.ty args method_no;
+                    ~prefer_first_duplicate:true ~receiver:obj obj.ty args method_no;
                   emit_checkudo_assign ();
                   self#write_instruction0 DUP;
                   self#write_instruction1 PUSH (-1);
@@ -2755,8 +2780,8 @@ class jaf_compiler ctx debug_info =
           else None)
 
     method v12_interface_receiver_method_slot ?(direct_getter_rank = false)
-        ?(prefer_first_duplicate = false) (receiver_ty : Jaf.jaf_type)
-        method_no =
+        ?(prefer_first_duplicate = false) ?(readonly_receiver = false)
+        (receiver_ty : Jaf.jaf_type) method_no =
       if not (Ain.version_gte ctx.ain (12, 0)) then None
       else
         match receiver_ty with
@@ -2817,16 +2842,33 @@ class jaf_compiler ctx debug_info =
               else
                 if prefer_first_duplicate then List.hd matches
                 else
-                  List.find_mapi interface_slots ~f:(fun i fn_idx ->
-                      if Int.equal fn_idx method_no then Some i else None)
+                  let own =
+                    List.find_mapi interface_slots ~f:(fun i fn_idx ->
+                        if Int.equal fn_idx method_no then Some i else None)
+                  in
+                  (* A readonly receiver dispatches through the slot
+                     after the method's own (its readonly copy). *)
+                  if readonly_receiver then
+                    match own with
+                    | Some slot -> (
+                        match
+                          List.findi matches ~f:(fun _ m -> Int.equal m slot)
+                        with
+                        | Some (pos, _) -> (
+                            match List.nth matches (pos + 1) with
+                            | Some next -> Some next
+                            | None -> Some slot)
+                        | None -> Some slot)
+                    | None -> None
+                  else own
             else
             List.find_mapi interface_slots ~f:(fun i fn_idx ->
                 if Int.equal fn_idx method_no then Some i else None)
         | _ -> None
 
     method v12_concrete_interface_method_slot ?(direct_getter_rank = false)
-        ?(prefer_first_duplicate = false) (receiver_ty : Jaf.jaf_type)
-        method_no =
+        ?(prefer_first_duplicate = false) ?(readonly_receiver = false)
+        (receiver_ty : Jaf.jaf_type) method_no =
       if not (Ain.version_gte ctx.ain (12, 0)) then None
       else
         let method_fn = Ain.get_function_by_index ctx.ain method_no in
@@ -2908,6 +2950,8 @@ class jaf_compiler ctx debug_info =
                           | true, None -> 0
                           | _, Some dup_rank ->
                               Int.min (group_count - 1) (r + dup_rank)
+                          | _ when readonly_receiver ->
+                              Int.min (group_count - 1) (r + 1)
                           | _ ->
                               r)
                   in
@@ -2932,6 +2976,159 @@ class jaf_compiler ctx debug_info =
       self#write_instruction1 PUSH slot;
       self#write_instruction0 ADD;
       self#write_instruction0 REF
+
+    (* Function index of the readonly copy of [method_no] (itself when
+       there is none): the pre-allocated property-getter duplicate, or
+       an explicit same-signature [readonly] overload. *)
+    method v12_readonly_variant method_no =
+      match Hashtbl.find v12_readonly_variant_cache method_no with
+      | Some v -> v
+      | None ->
+          let v =
+            match
+              Hashtbl.find ctx.v12_property_getter_dup_indices method_no
+            with
+            | Some (dup :: _) -> dup
+            | _ -> (
+                let f = Ain.get_function_by_index ctx.ain method_no in
+                let candidates =
+                  Option.to_list (Hashtbl.find ctx.functions f.name)
+                  @ Option.value ~default:[]
+                      (Hashtbl.find ctx.overloads f.name)
+                in
+                match
+                  List.find candidates ~f:(fun d ->
+                      Option.equal Int.equal d.index (Some method_no))
+                with
+                | None -> method_no
+                | Some base -> (
+                    let same_params (d : fundecl) =
+                      List.length d.params = List.length base.params
+                      && List.for_all2_exn d.params base.params
+                           ~f:(fun a b ->
+                             jaf_type_equal a.type_spec.ty b.type_spec.ty)
+                    in
+                    match
+                      List.find candidates ~f:(fun d ->
+                          d.is_readonly && Option.is_some d.index
+                          && same_params d)
+                    with
+                    | Some d -> Option.value_exn d.index
+                    | None ->
+                        (* Getter copies allocated at emission time (not
+                           preallocated): the next same-signature entry
+                           of the function table. *)
+                        let same_sig (g : Ain.Function.t) =
+                          String.equal g.name f.name
+                          && g.index > method_no
+                          && Int.equal g.nr_args f.nr_args
+                          && Poly.equal g.return_type f.return_type
+                          && Poly.equal
+                               (List.map (Ain.Function.logical_parameters g)
+                                  ~f:(fun v -> v.value_type))
+                               (List.map (Ain.Function.logical_parameters f)
+                                  ~f:(fun v -> v.value_type))
+                        in
+                        let found = ref None in
+                        Ain.function_iter ctx.ain ~f:(fun g ->
+                            if Option.is_none !found && same_sig g then
+                              found := Some g.index);
+                        Option.value !found ~default:method_no))
+          in
+          (* Never cache a miss: the copy may be allocated later. *)
+          if v <> method_no then
+            Hashtbl.set v12_readonly_variant_cache ~key:method_no ~data:v;
+          v
+
+    (* Readonly overload of an Array HLL method: the next same-name,
+       same-arity entry after [fun_no] in the library (e.g. [At#1]
+       returning a readonly ref). Used when the receiver is readonly. *)
+    method v12_readonly_hll_overload lib_no fun_no =
+      let lib = Ain.get_library_by_index ctx.ain lib_no in
+      if
+        fun_no >= 0
+        && fun_no < Array.length lib.functions
+        && String.equal lib.name "Array"
+      then
+        let base = lib.functions.(fun_no) in
+        let same_signature (f : Ain.Library.Function.t) =
+          Poly.equal f.return_type base.return_type
+          && List.length f.arguments = List.length base.arguments
+          && List.for_all2_exn f.arguments base.arguments
+               ~f:(fun (a : Ain.Library.Argument.t)
+                       (b : Ain.Library.Argument.t) ->
+                 Poly.equal a.value_type b.value_type)
+        in
+        (* Only an entry with the identical signature is the readonly
+           twin ([At]/[At#1]); [Erase#1] etc. are ordinary overloads. *)
+        Array.find_mapi lib.functions ~f:(fun i f ->
+            if i > fun_no && String.equal f.name base.name && same_signature f
+            then Some i
+            else None)
+        |> Option.value ~default:fun_no
+      else fun_no
+
+    method private v12_function_is_readonly no =
+      if not v12_readonly_fn_indices_built then (
+        v12_readonly_fn_indices_built <- true;
+        let add (d : fundecl) =
+          if d.is_readonly then
+            Option.iter d.index ~f:(fun i ->
+                Hashtbl.set v12_readonly_fn_indices ~key:i ~data:())
+        in
+        Hashtbl.iter ctx.functions ~f:add;
+        Hashtbl.iter ctx.overloads ~f:(List.iter ~f:add));
+      Hashtbl.mem v12_readonly_fn_indices no
+
+    method private v12_member_is_readonly (ty : jaf_type) name =
+      let sname =
+        match ty with
+        | Struct (n, _)
+        | Ref (Struct (n, _))
+        | Wrap (Struct (n, _))
+        | Wrap (Ref (Struct (n, _))) ->
+            Some n
+        | _ -> None
+      in
+      match Option.bind sname ~f:(Hashtbl.find ctx.structs) with
+      | Some s -> (
+          match Hashtbl.find s.members name with
+          | Some (v : variable) -> v.is_readonly
+          | None -> false)
+      | None -> false
+
+    (* Readonly-ness of a receiver expression: readonly [this], a
+       readonly local/param, a readonly member or any member reached
+       through a readonly object, the result of a readonly getter/method
+       copy, elements of a readonly array. *)
+    method v12_expr_is_readonly (e : expression) =
+      Ain.version_gte ctx.ain (12, 0)
+      &&
+      let rec ro (e : expression) =
+        match e.node with
+        | This -> v12_this_readonly
+        | Ident (_, LocalVariable (i, _)) -> Hashtbl.mem v12_readonly_slots i
+        | Member (obj, name, ClassVariable _)
+        | OptionalMember (obj, name, ClassVariable _) ->
+            ro obj || self#v12_member_is_readonly obj.ty name
+        | Call
+            ( { node =
+                  ( Member (obj, _, ClassMethod (_, no))
+                  | OptionalMember (obj, _, ClassMethod (_, no)) );
+                _;
+              },
+              _,
+              _ ) ->
+            (ro obj && self#v12_readonly_variant no <> no)
+            || self#v12_function_is_readonly no
+        | Call ({ node = Member (obj, _, _) | OptionalMember (obj, _, _); _ }, _, HLLCall _) ->
+            ro obj
+        | Subscript (arr, _) -> ro arr
+        | Cast (_, x) | DummyRef (_, x) | RvalueRef x -> ro x
+        | Ternary (_, a, b) | NullCoalesce (a, b) -> ro a && ro b
+        | _ -> false
+      in
+      ro e
 
     method private current_body_duplicate_rank =
       match current_function with
@@ -2972,10 +3169,10 @@ class jaf_compiler ctx debug_info =
 
     method compile_method_selector ?(concrete = false)
         ?(direct_getter_rank = false) ?(prefer_first_duplicate = false)
-        receiver_ty method_no =
+        ?(readonly_receiver = false) receiver_ty method_no =
       match
-        self#v12_interface_receiver_method_slot
-          ~direct_getter_rank ~prefer_first_duplicate receiver_ty method_no
+        self#v12_interface_receiver_method_slot ~direct_getter_rank
+          ~prefer_first_duplicate ~readonly_receiver receiver_ty method_no
       with
       | Some slot -> self#emit_vtable_method_selector slot
       | None -> (
@@ -2983,13 +3180,17 @@ class jaf_compiler ctx debug_info =
             if concrete || self#v12_concrete_receiver_has_interfaces receiver_ty
             then
               self#v12_concrete_interface_method_slot ~direct_getter_rank
-                ~prefer_first_duplicate receiver_ty method_no
+                ~prefer_first_duplicate ~readonly_receiver receiver_ty
+                method_no
             else None
           with
           | Some slot ->
               self#write_instruction1 PUSH 0;
               self#emit_vtable_method_selector slot
-          | None -> self#write_instruction1 PUSH method_no)
+          | None ->
+              self#write_instruction1 PUSH
+                (if readonly_receiver then self#v12_readonly_variant method_no
+                 else method_no))
 
     (** True iff [method_no] names a value property setter —
         [Prop::set] taking one non-ref value parameter and returning
@@ -3242,7 +3443,10 @@ class jaf_compiler ctx debug_info =
 
     method compile_method_call_for_receiver ?(concrete = false)
         ?(direct_getter_rank = false) ?(prefer_first_duplicate = false)
-        receiver_ty args method_no =
+        ?receiver receiver_ty args method_no =
+      let readonly_receiver =
+        Option.value_map receiver ~default:false ~f:self#v12_expr_is_readonly
+      in
       let f = Ain.get_function_by_index ctx.ain method_no in
       let emitted_self_event_accessor_update =
         Ain.version_gte ctx.ain (12, 0)
@@ -3291,7 +3495,7 @@ class jaf_compiler ctx debug_info =
       if emitted_self_event_accessor_update then ()
       else if Ain.version ctx.ain > 8 then (
         self#compile_method_selector ~concrete ~direct_getter_rank receiver_ty
-          ~prefer_first_duplicate method_no;
+          ~prefer_first_duplicate ~readonly_receiver method_no;
         self#compile_function_arguments args f;
         self#write_instruction1 CALLMETHOD f.nr_args)
       else (
@@ -4718,7 +4922,7 @@ class jaf_compiler ctx debug_info =
             let ifnz_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
             self#compile_method_call_for_receiver ~prefer_first_duplicate:true
-              e.ty args method_no;
+              ~receiver:e e.ty args method_no;
             self#write_instruction1 PUSH 0;
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
@@ -4757,7 +4961,7 @@ class jaf_compiler ctx debug_info =
             self#write_instruction1 IFNZ 0;
             self#write_instruction0 (if receiver_is_iface then REFREF else REF);
             self#compile_method_call_for_receiver ~prefer_first_duplicate:true
-              e.ty args method_no;
+              ~receiver:e e.ty args method_no;
             self#write_instruction1 PUSH 0;
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
@@ -5038,7 +5242,8 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 DUP2;
                 self#write_instruction0 POP;
                 self#compile_method_selector ~concrete:concrete_receiver
-                  ~direct_getter_rank e.ty method_no;
+                  ~direct_getter_rank
+                  ~readonly_receiver:(self#v12_expr_is_readonly e) e.ty method_no;
                 self#write_instruction0 DUP_X2;
                 self#write_instruction0 POP;
                 self#write_instruction0 SWAP;
@@ -5106,13 +5311,15 @@ class jaf_compiler ctx debug_info =
                     self#write_instruction0 DUP2;
                     self#write_instruction0 POP);
                   self#compile_method_selector ~concrete:concrete_receiver
-                    ~direct_getter_rank e.ty method_no;
+                    ~direct_getter_rank
+                    ~readonly_receiver:(self#v12_expr_is_readonly e) e.ty method_no;
                   self#write_instruction0 DUP_X2;
                   self#write_instruction0 POP;
                   self#write_instruction0 SWAP;
                   if not interface_receiver then self#write_instruction0 POP;
                   if interface_receiver then
-                    self#compile_method_selector ~direct_getter_rank e.ty
+                    self#compile_method_selector ~direct_getter_rank
+                      ~readonly_receiver:(self#v12_expr_is_readonly e) e.ty
                       getter_no
                   else self#write_instruction1 PUSH getter_no;
                   self#write_instruction1 CALLMETHOD 0;
@@ -5122,7 +5329,8 @@ class jaf_compiler ctx debug_info =
             in
             if not emitted_reused_receiver_arg then (
               self#compile_method_selector ~concrete:concrete_receiver e.ty
-                ~direct_getter_rank method_no;
+                ~direct_getter_rank
+                ~readonly_receiver:(self#v12_expr_is_readonly e) method_no;
               let prev = in_prop_setter_arg in
               Exn.protect
                 ~f:(fun () ->
@@ -5160,7 +5368,7 @@ class jaf_compiler ctx debug_info =
             self#compile_method_call_for_receiver
               ~concrete:concrete_receiver ~direct_getter_rank
               ~prefer_first_duplicate:(prefer_first_duplicate_receiver e)
-              e.ty args method_no)
+              ~receiver:e e.ty args method_no)
       (* v11 optional HLL/method call: [array?.Duplicate(x)] etc. lower
          to [CALLHLL] rather than [CALLMETHOD], so the OptionalMember
          method-call arm above doesn't catch them. *)
@@ -5262,10 +5470,23 @@ class jaf_compiler ctx debug_info =
                 self#write_address_at jump_addr current_address))
       (* HLL function call *)
       | Call (_, args, HLLCall (lib_no, fun_no)) ->
+          let readonly_receiver =
+            match args with
+            | Some receiver :: _ -> self#v12_expr_is_readonly receiver
+            | _ -> false
+          in
+          let fun_no =
+            if readonly_receiver then self#v12_readonly_hll_overload lib_no fun_no
+            else fun_no
+          in
+          let prev_lambda_ro = v12_lambda_params_readonly in
+          v12_lambda_params_readonly <- readonly_receiver;
           self#pre_emit_lambda_args args;
           let f = Ain.function_of_hll_function_index ctx.ain lib_no fun_no in
           let lib = Ain.get_library_by_index ctx.ain lib_no in
-          self#compile_hll_function_arguments lib args f;
+          Exn.protect
+            ~f:(fun () -> self#compile_hll_function_arguments lib args f)
+            ~finally:(fun () -> v12_lambda_params_readonly <- prev_lambda_ro);
           if Ain.version ctx.ain > 8 then
             (* v11 [CALLHLL] carries an extra type-id operand. For Array
                library methods it's the element type of the receiver;
@@ -6320,7 +6541,7 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 JUMP 0;
                 self#write_address_at ifz_addr current_address;
                 self#write_instruction0 POP;
-                self#compile_method_call_for_receiver receiver.ty []
+                self#compile_method_call_for_receiver ~receiver receiver.ty []
                   method_no;
                 self#write_address_at jump_addr current_address)
               else (
@@ -6368,7 +6589,7 @@ class jaf_compiler ctx debug_info =
               let jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at ifz_addr current_address;
-              self#compile_method_call_for_receiver receiver.ty [] method_no;
+              self#compile_method_call_for_receiver ~receiver receiver.ty [] method_no;
               self#write_address_at jump_addr current_address)
           | Call
               ( { node = OptionalMember (receiver, opt_mname, _); _ },
@@ -6477,7 +6698,7 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction0 EQUALE;
                 let a_null = current_address + 2 in
                 self#write_instruction1 IFNZ 0;
-                self#compile_method_call_for_receiver receiver.ty args
+                self#compile_method_call_for_receiver ~receiver receiver.ty args
                   method_no;
                 self#write_instruction1 PUSH 0;
                 let a_merge = current_address + 2 in
@@ -6553,7 +6774,7 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 JUMP 0;
                 self#write_address_at ifz_addr current_address;
                 self#write_instruction0 POP;
-                self#compile_method_call_for_receiver receiver.ty args
+                self#compile_method_call_for_receiver ~receiver receiver.ty args
                   method_no;
                 self#write_address_at jump_addr current_address)
               else (
@@ -6658,11 +6879,15 @@ class jaf_compiler ctx debug_info =
                 match reused_optional_getter with
                 | Some (op, getter_no, getter_ty, tail) ->
                     self#write_instruction0 DUP2;
-                    self#compile_method_selector receiver.ty method_no;
+                    self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                      receiver.ty method_no;
                     self#write_instruction0 DUP_X2;
                     self#write_instruction0 POP;
                     self#write_instruction0 SWAP;
-                    self#compile_method_selector receiver.ty getter_no;
+                    self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                      receiver.ty getter_no;
                     self#write_instruction1 CALLMETHOD 0;
                     self#compile_expression tail;
                     ignore
@@ -6671,7 +6896,9 @@ class jaf_compiler ctx debug_info =
                     self#write_instruction0 DUP_X2;
                     self#write_instruction1 CALLMETHOD f.nr_args
                 | None ->
-                    self#compile_method_selector receiver.ty method_no;
+                    self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                      receiver.ty method_no;
                     let prev = in_prop_setter_arg in
                     Exn.protect
                       ~f:(fun () ->
@@ -6714,7 +6941,7 @@ class jaf_compiler ctx debug_info =
                 if pad_plain_receiver then self#write_instruction0 POP;
                 if is_value_prop_setter then compile_setter_call ()
                 else
-                  self#compile_method_call_for_receiver receiver.ty args
+                  self#compile_method_call_for_receiver ~receiver receiver.ty args
                     method_no;
                 self#write_address_at jump_addr current_address))
           | Call
@@ -6777,7 +7004,7 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 IFNZ 0;
               if not obj_is_dummyref then
                 self#write_instruction0 (if obj_is_iface then REFREF else REF);
-              self#compile_method_call_for_receiver obj.ty opt_args
+              self#compile_method_call_for_receiver ~receiver:obj obj.ty opt_args
                 opt_method_no;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH dummy_idx;
@@ -6820,7 +7047,9 @@ class jaf_compiler ctx debug_info =
                 let f = Ain.get_function_by_index ctx.ain method_no in
                 let fallback_addr = current_address + 2 in
                 self#write_instruction1 IFNZ 0;
-                self#compile_method_selector receiver.ty method_no;
+                self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                      receiver.ty method_no;
                 (let prev = in_prop_setter_arg in
                  Exn.protect
                    ~f:(fun () ->
@@ -6849,7 +7078,7 @@ class jaf_compiler ctx debug_info =
                 let jump_addr = current_address + 2 in
                 self#write_instruction1 JUMP 0;
                 self#write_address_at ifz_addr current_address;
-                self#compile_method_call_for_receiver receiver.ty args
+                self#compile_method_call_for_receiver ~receiver receiver.ty args
                   method_no;
                 self#write_address_at jump_addr current_address)
           | Call
@@ -6937,7 +7166,7 @@ class jaf_compiler ctx debug_info =
                   let recv_null_addr = current_address + 2 in
                   self#write_instruction1 IFNZ 0;
                   if obj_is_variable then self#write_instruction0 REF;
-                  self#compile_method_call_for_receiver obj.ty opt_args
+                  self#compile_method_call_for_receiver ~receiver:obj obj.ty opt_args
                     opt_method_no;
                   self#write_instruction0 PUSHLOCALPAGE;
                   self#write_instruction1 PUSH dummy_idx;
@@ -6966,7 +7195,9 @@ class jaf_compiler ctx debug_info =
                   let fallback_addr = current_address + 2 in
                   self#write_instruction1 IFNZ 0;
                   self#write_instruction0 POP;
-                  self#compile_method_selector receiver.ty method_no;
+                  self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                      receiver.ty method_no;
                   (let prev = in_prop_setter_arg in
                    Exn.protect
                      ~f:(fun () ->
@@ -6997,7 +7228,7 @@ class jaf_compiler ctx debug_info =
                  [obj], store the result in [dummy_idx] via the
                  standard [SWAP; ASSIGN] dance, then push the (0, 0)
                  non-null marker pair. *)
-              self#compile_method_call_for_receiver obj.ty opt_args opt_method_no;
+              self#compile_method_call_for_receiver ~receiver:obj obj.ty opt_args opt_method_no;
               self#write_instruction0 PUSHLOCALPAGE;
               self#write_instruction1 PUSH dummy_idx;
               self#write_instruction0 REF;
@@ -7038,7 +7269,7 @@ class jaf_compiler ctx debug_info =
                  outer getter (e.g. Atk::get) on the dummy-slot value
                  still on stack. *)
               self#write_instruction0 POP;
-              self#compile_method_call_for_receiver receiver.ty args method_no;
+              self#compile_method_call_for_receiver ~receiver receiver.ty args method_no;
               self#write_address_at jump_addr current_address)
           | _ ->
           if
@@ -7232,7 +7463,7 @@ class jaf_compiler ctx debug_info =
             let ifnz2_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
             self#compile_method_call_for_receiver ~prefer_first_duplicate:true
-              e.ty args method_no;
+              ~receiver:e e.ty args method_no;
             let jump_end_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
             self#write_address_at ifnz2_addr current_address;
@@ -7637,7 +7868,7 @@ class jaf_compiler ctx debug_info =
           if not obj_is_dummyref then
             self#write_instruction0
               (if receiver_is_iface then REFREF else REF);
-          self#compile_method_call_for_receiver obj.ty opt_args opt_method_no;
+          self#compile_method_call_for_receiver ~receiver:obj obj.ty opt_args opt_method_no;
           let stored_two_slots =
             receiver_is_iface || is_ref_scalar opt_call.ty
           in
@@ -7674,7 +7905,7 @@ class jaf_compiler ctx debug_info =
             self#write_instruction1 PUSH dummy_idx;
             self#write_instruction0 SWAP;
             self#write_instruction0 ASSIGN);
-          self#compile_method_call_for_receiver receiver.ty args method_no;
+          self#compile_method_call_for_receiver ~receiver receiver.ty args method_no;
           self#write_instruction1 PUSH 0;
           let jump_addr = current_address + 2 in
           self#write_instruction1 JUMP 0;
@@ -8660,6 +8891,10 @@ class jaf_compiler ctx debug_info =
           let msg_no = Ain.add_message ctx.ain msg in
           self#write_instruction1 MSG msg_no
       | RefAssign (lhs, rhs) ->
+          (match lhs.node with
+          | Ident (_, LocalVariable (i, _)) when self#v12_expr_is_readonly rhs ->
+              Hashtbl.set v12_readonly_slots ~key:i ~data:()
+          | _ -> ());
           self#pre_emit_v12_rhs_lambdas rhs;
           self#compile_lock_peek;
           self#compile_variable_ref lhs;
@@ -8906,6 +9141,16 @@ class jaf_compiler ctx debug_info =
       else
         let v = self#get_local (Option.value_exn decl.index) in
         self#scope_add_var v;
+        (if
+           decl.is_readonly
+           ||
+           match (v.value_type, decl.initval) with
+           | Ref _, Some init -> self#v12_expr_is_readonly init
+           | _ -> false
+         then
+           Hashtbl.set v12_readonly_slots
+             ~key:(Option.value_exn decl.index)
+             ~data:());
         match v.value_type with
         | Ref _ when Ain.version ctx.ain > 8 -> (
             (* v11 ref-init paths. Each handles a specific shape; the
@@ -9490,6 +9735,24 @@ class jaf_compiler ctx debug_info =
       in
       let prev_function = current_function in
       current_function <- Some func;
+      let prev_readonly_slots = v12_readonly_slots in
+      let prev_this_readonly = v12_this_readonly in
+      v12_readonly_slots <- Hashtbl.create (module Int);
+      let lambda_ref_params_readonly =
+        func.is_lambda && v12_lambda_params_readonly
+      in
+      List.iteri decl.params ~f:(fun i p ->
+          if
+            p.is_readonly
+            || lambda_ref_params_readonly
+               && (match p.type_spec.ty with Ref _ -> true | _ -> false)
+          then
+            Hashtbl.set v12_readonly_slots
+              ~key:(Option.value p.index ~default:i)
+              ~data:());
+      (* Lambdas inherit the enclosing body's [this]. *)
+      if not func.is_lambda then
+        v12_this_readonly <- decl.is_readonly || v12_this_readonly_override;
       let prev_enclosing_functions = enclosing_functions in
       (if func.is_lambda then
          match self#find_lambda_parents func.name with
@@ -9620,6 +9883,8 @@ class jaf_compiler ctx debug_info =
       self#resolve_gotos;
       Ain.write_function ctx.ain func;
       current_function <- prev_function;
+      v12_readonly_slots <- prev_readonly_slots;
+      v12_this_readonly <- prev_this_readonly;
       enclosing_functions <- prev_enclosing_functions;
       inline_deleted_dummies <- prev_inline_deleted_dummies;
       last_condition_deleted_dummies <- prev_last_condition_deleted_dummies;
@@ -9790,6 +10055,7 @@ class jaf_compiler ctx debug_info =
             | _ -> false
           in
           if not is_object_return then 0
+          else if self#v12_readonly_variant index <> index then 0
           else
             let qname = Jaf.mangled_name decl in
             let one_dup_names =
@@ -9998,7 +10264,11 @@ class jaf_compiler ctx debug_info =
               body = Option.map decl.body ~f:(List.map ~f:clone_stmt);
             }
           in
-          self#compile_function dup_decl
+          let prev = v12_this_readonly_override in
+          v12_this_readonly_override <- true;
+          Exn.protect
+            ~f:(fun () -> self#compile_function dup_decl)
+            ~finally:(fun () -> v12_this_readonly_override <- prev)
         done;
       (* v12 property getter duplication: original Rance10 emits declared
          property getters twice (byte-identical bodies, separate
@@ -10069,8 +10339,12 @@ class jaf_compiler ctx debug_info =
           |> Option.value ~default:[]
         in
         let dup_indices =
-          if List.is_empty dup_indices then
-            [ (Ain.add_function ctx.ain mangled).index ]
+          if List.is_empty dup_indices then (
+            let allocated = [ (Ain.add_function ctx.ain mangled).index ] in
+            Hashtbl.set ctx.v12_property_getter_dup_indices
+              ~key:(Option.value_exn decl.index)
+              ~data:allocated;
+            allocated)
           else dup_indices
         in
         List.iter dup_indices ~f:(fun dup_idx ->
@@ -10085,7 +10359,11 @@ class jaf_compiler ctx debug_info =
                 vars = func.vars;
                 is_label = func.is_label };
             let dup_decl = { decl with index = Some dup_idx } in
-            self#compile_function dup_decl));
+            let prev = v12_this_readonly_override in
+            v12_this_readonly_override <- true;
+            Exn.protect
+              ~f:(fun () -> self#compile_function dup_decl)
+              ~finally:(fun () -> v12_this_readonly_override <- prev)));
       (* v12 lambda drain: after the outer (non-lambda) function's
          ENDFUNC is written, emit any lambdas queued during its body
          compilation as separate top-level FUNC entries. Each

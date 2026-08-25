@@ -29,7 +29,7 @@ let make_params (params : (string * jaf_type) list) defaults =
         name;
         location = dummy_location;
         array_dim = [];
-        is_const = false;
+        is_const = false; is_readonly = false;
         is_private = false;
         kind = Parameter;
         type_spec = { ty = t; location = dummy_location };
@@ -46,7 +46,7 @@ let fundecl_of_syscall sys =
       params = make_params params [];
       body = None;
       is_label = false;
-      is_lambda = false;
+      is_lambda = false; is_readonly = false;
       is_private = false;
       index = Some (int_of_syscall sys);
       class_name = None;
@@ -138,7 +138,7 @@ let fundecl_of_builtin ctx builtin receiver_ty node_opt =
       params = make_params params defaults;
       body = None;
       is_label = false;
-      is_lambda = false;
+      is_lambda = false; is_readonly = false;
       is_private = false;
       index = None;
       class_name = None;

@@ -615,7 +615,7 @@ let assert_fundecl : Jaf.fundecl =
       name = "condition";
       location = Jaf.dummy_location;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = Parameter;
       type_spec = { ty = Int; location = Jaf.dummy_location };
@@ -630,7 +630,7 @@ let assert_fundecl : Jaf.fundecl =
     params = [ int_param ];
     body = None;
     is_label = false;
-    is_lambda = false;
+    is_lambda = false; is_readonly = false;
     is_private = false;
     index = None;
     class_name = None;

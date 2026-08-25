@@ -278,6 +278,7 @@ and variable = {
   location : location;
   array_dim : expression list;
   is_const : bool;
+  is_readonly : bool;
   mutable is_private : bool;
   kind : variable_type;
   type_spec : type_specifier;
@@ -300,6 +301,7 @@ and fundecl = {
   mutable body : statement list option;
   is_label : bool;
   is_lambda : bool;
+  mutable is_readonly : bool;
   mutable is_private : bool;
   mutable index : int option;
   mutable class_name : string option;
@@ -1531,7 +1533,7 @@ let ain_to_jaf_variable ain kind (v : Ain.Variable.t) =
     name = v.name;
     location = dummy_location;
     array_dim = [] (* FIXME *);
-    is_const = false;
+    is_const = false; is_readonly = false;
     is_private = false;
     kind;
     type_spec =
@@ -1582,7 +1584,7 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
       name;
       location = dl;
       array_dim = [];
-      is_const = false;
+      is_const = false; is_readonly = false;
       is_private = false;
       kind = LocalVar;
       type_spec = mk_ts ty;
@@ -1778,7 +1780,7 @@ let context_from_ain ?(constants : variable list = []) ain =
             ain_to_jaf_variable ain Parameter v);
       body = None;
       is_label = false;
-      is_lambda = false;
+      is_lambda = false; is_readonly = false;
       is_private = false;
       index = Some f.index;
       class_name = None;
@@ -1837,7 +1839,7 @@ let context_from_ain ?(constants : variable list = []) ain =
                 ain_to_jaf_variable ain Parameter v);
           body = None;
           is_label = f.is_label;
-          is_lambda = f.is_lambda;
+          is_lambda = f.is_lambda; is_readonly = false;
           is_private = false;
           index = Some f.index;
           class_name;
@@ -1877,7 +1879,7 @@ let context_from_ain ?(constants : variable list = []) ain =
                       name = v.name;
                       location = dummy_location;
                       array_dim = [] (* FIXME *);
-                      is_const = false;
+                      is_const = false; is_readonly = false;
                       is_private = false;
                       kind = Parameter;
                       type_spec =
@@ -1890,7 +1892,7 @@ let context_from_ain ?(constants : variable list = []) ain =
                     });
               body = None;
               is_label = false;
-              is_lambda = false;
+              is_lambda = false; is_readonly = false;
               is_private = false;
               index = Some f.index;
               class_name = None;
@@ -1933,7 +1935,7 @@ let context_from_ain ?(constants : variable list = []) ain =
                     ~f:(ain_to_jaf_variable ref_ain Parameter);
                 body = None;
                 is_label = false;
-                is_lambda = false;
+                is_lambda = false; is_readonly = false;
                 is_private = false;
                 index = None;
                 class_name = None;

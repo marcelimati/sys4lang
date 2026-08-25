@@ -3008,3 +3008,253 @@ let%expect_test "v11 string local deref uses REF + A_REF" =
     072: EOF
     |}]
 
+
+(* v12 readonly: a [readonly ref] parameter selects the readonly ("#1")
+   copy of a property getter; the copy itself is the compiler-synthesized
+   duplicate of [X::get]. *)
+let%expect_test "v12 readonly parameter selects the readonly getter copy" =
+  compile_test ~ain_version:12
+    {|
+      class C {
+        int X { get; set; } = 0;
+      };
+      int f(readonly ref C c)
+      {
+        return c.X;
+      }
+      int g(ref C c)
+      {
+        return c.X;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@X::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: RETURN
+    048: ENDFUNC C@X::get
+    054: FUNC C@X::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 0
+    068: REF
+    070: RETURN
+    072: ENDFUNC C@X::get
+    078: FUNC C@X::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 0
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC C@X::set
+    114: FUNC f
+    120: PUSHLOCALPAGE
+    122: PUSH 0
+    128: REF
+    130: PUSH 6
+    136: CALLMETHOD NULL
+    142: RETURN
+    144: PUSH 0
+    150: RETURN
+    152: ENDFUNC f
+    158: FUNC g
+    164: PUSHLOCALPAGE
+    166: PUSH 0
+    172: REF
+    174: PUSH 3
+    180: CALLMETHOD NULL
+    186: RETURN
+    188: PUSH 0
+    194: RETURN
+    196: ENDFUNC g
+    202: EOF test.jaf
+    208: FUNC C@0
+    214: PUSHSTRUCTPAGE
+    216: PUSH 0
+    222: PUSH 0
+    228: ASSIGN
+    230: POP
+    232: RETURN
+    234: ENDFUNC C@0
+    240: FUNC NULL
+    246: EOF
+    |}]
+
+(* v12 readonly: inside a [readonly] method [this] is readonly, so its
+   own getters resolve to the readonly copies; the mutable overload of
+   the same signature keeps the base copies. *)
+let%expect_test "v12 readonly method reads its getters through readonly this" =
+  compile_test ~ain_version:12
+    {|
+      class C {
+        int X { get; set; } = 0;
+        int GetX();
+        int GetX() readonly;
+      };
+      int C::GetX()
+      {
+        return this.X;
+      }
+      int C::GetX() readonly
+      {
+        return this.X;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@X::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: RETURN
+    048: ENDFUNC C@X::get
+    054: FUNC C@X::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 0
+    068: REF
+    070: RETURN
+    072: ENDFUNC C@X::get
+    078: FUNC C@X::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 0
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC C@X::set
+    114: FUNC C@GetX
+    120: PUSHSTRUCTPAGE
+    122: PUSH 1
+    128: CALLMETHOD NULL
+    134: RETURN
+    136: PUSH 0
+    142: RETURN
+    144: FUNC C@GetX
+    150: PUSHSTRUCTPAGE
+    152: PUSH 2
+    158: CALLMETHOD NULL
+    164: RETURN
+    166: PUSH 0
+    172: RETURN
+    174: EOF test.jaf
+    180: FUNC C@0
+    186: PUSHSTRUCTPAGE
+    188: PUSH 0
+    194: PUSH 0
+    200: ASSIGN
+    202: POP
+    204: RETURN
+    206: ENDFUNC C@0
+    212: FUNC NULL
+    218: EOF
+    |}]
+
+(* v12 readonly: a [readonly ref] member makes every getter reached
+   through it readonly, even from a mutable [this]. *)
+let%expect_test "v12 readonly member selects readonly getters through it" =
+  compile_test ~ain_version:12
+    {|
+      class C {
+        int X { get; set; } = 0;
+      };
+      class D {
+        readonly ref C m_c;
+        int G();
+      };
+      int D::G()
+      {
+        return this.m_c.X;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@X::get
+    036: PUSHSTRUCTPAGE
+    038: PUSH 0
+    044: REF
+    046: RETURN
+    048: ENDFUNC C@X::get
+    054: FUNC C@X::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 0
+    068: REF
+    070: RETURN
+    072: ENDFUNC C@X::get
+    078: FUNC C@X::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 0
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC C@X::set
+    114: FUNC D@G
+    120: PUSHSTRUCTPAGE
+    122: PUSH 0
+    128: REF
+    130: PUSH 5
+    136: CALLMETHOD NULL
+    142: RETURN
+    144: PUSH 0
+    150: RETURN
+    152: EOF test.jaf
+    158: FUNC C@0
+    164: PUSHSTRUCTPAGE
+    166: PUSH 0
+    172: PUSH 0
+    178: ASSIGN
+    180: POP
+    182: RETURN
+    184: ENDFUNC C@0
+    190: FUNC NULL
+    196: EOF
+    |}]
+
+(* Pre-v12 sources may use [readonly] as an identifier (Ixseal does). *)
+let%expect_test "v11 keeps readonly as an ordinary identifier" =
+  compile_test ~ain_version:11
+    {|
+      int f()
+      {
+        int readonly = 1;
+        return readonly;
+      }
+    |};
+  [%expect {|
+    000: FUNC f
+    006: PUSHLOCALPAGE
+    008: PUSH 0
+    014: PUSH 1
+    020: ASSIGN
+    022: POP
+    024: PUSHLOCALPAGE
+    026: PUSH 0
+    032: REF
+    034: RETURN
+    036: PUSH 0
+    042: RETURN
+    044: ENDFUNC f
+    050: EOF test.jaf
+    056: FUNC NULL
+    062: EOF
+    |}]

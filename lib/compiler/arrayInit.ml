@@ -218,7 +218,7 @@ class visitor ctx =
             name;
             location = dummy_location;
             array_dim = [];
-            is_const = false;
+            is_const = false; is_readonly = false;
             is_private = false;
             kind;
             type_spec = type_spec ty;
@@ -271,7 +271,7 @@ class visitor ctx =
                 params = [ lambda_param ];
                 body = Some lambda_body;
                 is_label = false;
-                is_lambda = true;
+                is_lambda = true; is_readonly = false;
                 is_private = false;
                 index = Some lambda_index;
                 class_name = Some s.name;
@@ -722,7 +722,7 @@ class visitor ctx =
             params = [];
             body = Some (List.rev !initialize_stmts);
             is_label = false;
-            is_lambda = false;
+            is_lambda = false; is_readonly = false;
             is_private = false;
             index = Some f_index;
             class_name = Some s.name;
@@ -782,7 +782,7 @@ class visitor ctx =
             params = [];
             body = Some [];
             is_label = false;
-            is_lambda = false;
+            is_lambda = false; is_readonly = false;
             is_private = false;
             index = Some 0;
             class_name = None;
@@ -801,7 +801,7 @@ class visitor ctx =
               params = [];
               body = Some (List.rev global_init_stmts);
               is_label = false;
-              is_lambda = false;
+              is_lambda = false; is_readonly = false;
               is_private = false;
               index = Some (Ain.add_function ctx.ain "0").index;
               class_name = None;

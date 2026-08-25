@@ -37,12 +37,13 @@ type varinit = {
   initval: expression option;
 }
 
-let vardecl kind is_const type_spec vi =
+let vardecl ?(is_readonly=false) kind is_const type_spec vi =
   {
     name = vi.name;
     location = vi.loc;
     array_dim = List.rev vi.dims;
     is_const;
+    is_readonly;
     is_private = false;
     kind;
     type_spec;
@@ -50,8 +51,8 @@ let vardecl kind is_const type_spec vi =
     index = None;
   }
 
-let vardecls kind is_const type_spec var_list =
-  let vars = List.map (vardecl kind is_const type_spec) var_list in
+let vardecls ?(is_readonly=false) kind is_const type_spec var_list =
+  let vars = List.map (vardecl ~is_readonly kind is_const type_spec) var_list in
   match is_const, type_spec.ty with
   | true, Int ->
     (* If initval is omitted, set it to 0 (for the first constant) or the
@@ -64,7 +65,7 @@ let vardecls kind is_const type_spec var_list =
             ((base, delta + 1), { v with initval = Some value }))
   | _ -> vars
 
-let func ?(is_lambda = false) loc typespec name params body =
+let func ?(is_lambda = false) ?(is_readonly = false) loc typespec name params body =
   (* XXX: hack for `functype name(void)` *)
   let plist =
     match params with
@@ -79,6 +80,7 @@ let func ?(is_lambda = false) loc typespec name params body =
     body;
     is_label = false;
     is_lambda;
+    is_readonly;
     is_private = false;
     index = None;
     class_name = None;
@@ -121,7 +123,7 @@ let rec multidim_array dims t =
 /* keywords */
 %token IF ELSE WHILE DO FOR FOREACH FOREACH_R SWITCH CASE DEFAULT NULL THIS NEW
 %token GOTO CONTINUE BREAK RETURN JUMP JUMPS ASSERT
-%token CONST REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM EVENT
+%token CONST READONLY REF ARRAY WRAP FUNCTYPE DELEGATE STRUCT CLASS PRIVATE PUBLIC ENUM EVENT
 %token IMPLEMENTS INTERFACE
 %token FILE_MACRO LINE_MACRO DATE_MACRO TIME_MACRO GLOBALGROUP UNKNOWN_FUNCTYPE
 %token UNKNOWN_DELEGATE
@@ -526,12 +528,19 @@ declaration(X)
     { { decl_loc = $sloc; typespec = $2; is_const_decls = true; vars = vardecls LocalVar true $2 $3 } }
   | declaration_specifiers separated_nonempty_list(COMMA, init_declarator(X)) SEMICOLON
     { { decl_loc = $sloc; typespec = $1; is_const_decls = false; vars = vardecls LocalVar false $1 $2 } }
+  | READONLY declaration_specifiers separated_nonempty_list(COMMA, init_declarator(X)) SEMICOLON
+    { { decl_loc = $sloc; typespec = $2; is_const_decls = false; vars = vardecls ~is_readonly:true LocalVar false $2 $3 } }
   ;
 
 declaration_specifiers
   : REF type_specifier { { location = $sloc; ty = Ref $2 } }
   | type_specifier { { location = $sloc; ty = $1 } }
   ;
+
+(* v12: [readonly] qualifier on a declaration ([readonly ref T p],
+   [readonly string s]). Not part of the ain type; it selects the
+   readonly ([#1]) copies of property getters / methods invoked through
+   the declared variable. *)
 
 init_declarator(X)
   : declarator(X) ASSIGN assign_expression { { $1 with initval = Some $3; loc = $sloc } }
@@ -552,8 +561,8 @@ array_allocation(X)
 external_declaration
   : declaration(qualified_name)
     { [ Global { $1 with vars = (List.map (fun d -> { d with kind = GlobalVar }) $1.vars) } ] }
-  | ioption(declaration_specifiers) qualified_funcname parameter_list(init_declarator(IDENTIFIER)) block
-    { [ Function (func $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $4)) ] }
+  | ioption(declaration_specifiers) qualified_funcname parameter_list(init_declarator(IDENTIFIER)) opt_readonly block
+    { [ Function (func ~is_readonly:$4 $sloc (Option.value $1 ~default:(implicit_void $symbolstartpos)) $2 $3 (Some $5)) ] }
   | HASH qualified_name LPAREN VOID? RPAREN block
     { [ Function { (func $sloc (implicit_void $symbolstartpos) $2 [] (Some $6)) with is_label=true } ] }
   | FUNCTYPE declaration_specifiers qualified_name functype_parameter_list SEMICOLON
@@ -673,6 +682,7 @@ enumerator
 
 parameter_declaration(X)
   : declaration_specifiers X { vardecl Parameter false $1 { $2 with loc=$sloc } }
+  | READONLY declaration_specifiers X { vardecl ~is_readonly:true Parameter false $2 { $3 with loc=$sloc } }
   ;
 
 parameter_list(X)
@@ -682,6 +692,7 @@ parameter_list(X)
 
 functype_parameter_declaration
   : declaration_specifiers { vardecl Parameter false $1 { name="<anonymous>"; dims=[]; initval=None; loc=$sloc } }
+  | READONLY declaration_specifiers { vardecl ~is_readonly:true Parameter false $2 { name="<anonymous>"; dims=[]; initval=None; loc=$sloc } }
   | parameter_declaration(declarator(IDENTIFIER)) { $1 }
   ;
 
@@ -695,6 +706,9 @@ struct_declaration
   | CONST declaration_specifiers separated_nonempty_list(COMMA, init_declarator(IDENTIFIER)) SEMICOLON
     { let vars = vardecls ClassVar true $2 $3 in
       MemberDecl { decl_loc=$sloc; typespec=$2; is_const_decls = true; vars } }
+  | READONLY declaration_specifiers separated_nonempty_list(COMMA, init_declarator(IDENTIFIER)) SEMICOLON
+    { let vars = vardecls ~is_readonly:true ClassVar false $2 $3 in
+      MemberDecl { decl_loc=$sloc; typespec=$2; is_const_decls = false; vars } }
   | declaration_specifiers separated_nonempty_list(COMMA, init_declarator(IDENTIFIER)) SEMICOLON
     (* v12: non-const class members can carry an initializer
        (e.g. `IUserComponent UserComponent = NULL;`). v11 only allowed
@@ -725,13 +739,13 @@ struct_declaration
        [obj.Name -= h] dispatch through delegate-add/remove on the
        backing field. *)
     { EventDecl { ed_loc = $sloc; ed_typespec = $2; ed_name = $3 } }
-  | declaration_specifiers qualified_funcname parameter_list(init_declarator(IDENTIFIER)) opt_body
+  | declaration_specifiers qualified_funcname parameter_list(init_declarator(IDENTIFIER)) opt_readonly opt_body
     (* v12 interface/class member declarations may use qualified names
        for property accessor signatures, e.g. `string Handle::get();`.
        v11 only used bare identifiers; allowing qualified names is a
        superset. The LBRACE-following property declaration rule below
        still matches first when its tokens fit. *)
-    { Method (func $sloc $1 $2 $3 $4) }
+    { Method (func ~is_readonly:$4 $sloc $1 $2 $3 $5) }
   | qualified_segment parameter_list(init_declarator(IDENTIFIER)) opt_body
     (* v12 allows constructors with parameters, e.g.
        `CActivityWrap(string ActivityName);`. v11 only had the no-arg
@@ -755,6 +769,13 @@ implements_clause
 opt_body
   : SEMICOLON { None }
   | block { Some $1 }
+  ;
+
+(* v12: [T Name(params) readonly] — the method body is compiled with a
+   readonly [this] (see fundecl.is_readonly). *)
+opt_readonly
+  : READONLY { true }
+  | { false }
   ;
 
 property_accessor_decl

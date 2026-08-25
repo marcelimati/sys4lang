@@ -107,6 +107,7 @@ let () =
               "this",         THIS;
               "new",          NEW;
               "const",        CONST;
+              "readonly",     READONLY;
               "ref",          REF;
               "array",        ARRAY;
               "wrap",         WRAP;
@@ -230,6 +231,8 @@ rule token = parse
                             }
   | (l a*) as s             {
                               match Hashtbl.find keyword_table s with
+                              | Some READONLY when not !LexerState.readonly_keyword ->
+                                  IDENTIFIER(s)
                               | Some kw -> kw
                               | None ->
                                   if LexerState.is_templated s then maybe_template s lexbuf

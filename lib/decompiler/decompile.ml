@@ -559,6 +559,12 @@ let decompile ~move_to_original_file ~continue_on_error =
         (fname, List.rev !decompiled_funcs))
   in
   let srcs = synthesize_scenario_labels code srcs in
+  (* v12: recover [readonly] declarations from the getter-copy choices
+     before the per-class emission decides what to print. *)
+  (let rec tree (f : CodeGen.function_t) =
+     Readonly.{ func = f.func; body = f.body; lambdas = List.map f.lambdas ~f:tree }
+   in
+   Readonly.infer (List.concat_map srcs ~f:(fun (_, fs) -> List.map fs ~f:tree)));
   let dropped_func_ids = Hash_set.create (module Int) in
   Array.iter structs ~f:(fun s ->
       let methods_in_order = List.rev s.methods in
@@ -585,9 +591,14 @@ let decompile ~move_to_original_file ~continue_on_error =
               in
               m.name ^ "(" ^ arg_types ^ ")"
             in
-            if Hashtbl.mem seen_sig sig_key then (
-              Hash_set.add dedup_dup_ids m.func.id;
-              false)
+            if Hashtbl.mem seen_sig sig_key then
+              (* The second copy of a duplicated method is its readonly
+                 overload — kept and printed with the [readonly]
+                 qualifier (see Readonly). *)
+              if Readonly.is_readonly_copy m.func.id then true
+              else (
+                Hash_set.add dedup_dup_ids m.func.id;
+                false)
             else (
               Hashtbl.set seen_sig ~key:sig_key ~data:();
               true))

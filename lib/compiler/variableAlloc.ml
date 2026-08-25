@@ -271,7 +271,7 @@ class variable_alloc_visitor ctx =
                name = "<void>";
                location = v.location;
                array_dim = [];
-               is_const = false;
+               is_const = false; is_readonly = false;
                is_private = false;
                kind = v.kind;
                type_spec = { ty = Void; location = v.type_spec.location };
@@ -298,7 +298,7 @@ class variable_alloc_visitor ctx =
           name = v_name;
           location = dummy_location;
           array_dim = [];
-          is_const = false;
+          is_const = false; is_readonly = false;
           is_private = false;
           kind = LocalVar;
           type_spec = { ty; location = dummy_location };

@@ -46,7 +46,7 @@ let predefined_constants =
         name = "true";
         location = dummy_location;
         array_dim = [];
-        is_const = true;
+        is_const = true; is_readonly = false;
         is_private = false;
         kind = GlobalVar;
         type_spec = { ty = Bool; location = dummy_location };
@@ -57,7 +57,7 @@ let predefined_constants =
         name = "false";
         location = dummy_location;
         array_dim = [];
-        is_const = true;
+        is_const = true; is_readonly = false;
         is_private = false;
         kind = GlobalVar;
         type_spec = { ty = Bool; location = dummy_location };
