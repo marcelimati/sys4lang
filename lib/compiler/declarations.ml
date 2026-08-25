@@ -663,13 +663,18 @@ let expand_struct_decls ~(ctx : context) ~(class_name : string)
    auto-stub without triggering a "Duplicate function definition"
    error. *)
 let is_property_stub (f : fundecl) =
-  let is_mangled_member_access (e : expression) =
+  let rec is_mangled_member_access (e : expression) =
     match e.node with
     | Member ({ node = This; _ }, name, _) ->
         let n = String.length name in
         n >= 3
         && Char.equal name.[0] '<'
         && Char.equal name.[n - 1] '>'
+    (* TypeAnalysis / variableAlloc may wrap the backing read (numeric
+       coercion, ref spill); the accessor is still the auto-generated
+       stub shape underneath. *)
+    | Cast (_, inner) | DummyRef (_, inner) | RvalueRef inner ->
+        is_mangled_member_access inner
     | _ -> false
   in
   (* TypeAnalysis may wrap a setter's [value] RHS in a Cast to convert
