@@ -2818,27 +2818,17 @@ class jaf_compiler ctx debug_info =
                   let fn = Ain.get_function_by_index ctx.ain fn_idx in
                   if same_shape fn then Some i else None)
             in
-            let current_duplicate_rank () =
-              match v12_current_body_dup_rank with
-              | Some _ as rank -> rank
-              | None -> self#current_body_duplicate_rank
-            in
             if List.length matches > 1 then
               if
                 String.is_suffix method_short ~suffix:"::get"
                 || String.is_suffix method_short ~suffix:"::set"
-              then
-                match current_duplicate_rank () with
-                | _ when direct_getter_rank -> List.hd matches
-                | Some dup_rank ->
-                    let wanted =
-                      Int.max 0 (List.length matches - 1 - dup_rank)
-                    in
-                    (match List.nth matches wanted with
-                    | Some slot -> Some slot
-                    | None -> List.hd matches)
-                | None ->
-                    List.last matches
+              then (
+                (* Accessor slots come in [readonly; mutable] pairs (the
+                   class vtable lists [get#1] before [get]): a readonly
+                   receiver dispatches through the first. *)
+                ignore direct_getter_rank;
+                if readonly_receiver then List.hd matches
+                else List.last matches)
               else
                 if prefer_first_duplicate then List.hd matches
                 else
@@ -2869,6 +2859,7 @@ class jaf_compiler ctx debug_info =
     method v12_concrete_interface_method_slot ?(direct_getter_rank = false)
         ?(prefer_first_duplicate = false) ?(readonly_receiver = false)
         (receiver_ty : Jaf.jaf_type) method_no =
+      ignore direct_getter_rank;
       if not (Ain.version_gte ctx.ain (12, 0)) then None
       else
         let method_fn = Ain.get_function_by_index ctx.ain method_no in
@@ -2907,17 +2898,18 @@ class jaf_compiler ctx debug_info =
                 String.equal (short_name s f) method_short
                 && Int.equal f.nr_args method_fn.nr_args
               in
-              let concrete_rank =
+              let concrete_rank_of target_no =
                 let rank = ref 0 in
                 let found = ref None in
                 List.iter receiver.vmethods ~f:(fun fn_idx ->
                     if Option.is_none !found then
                       let f = Ain.get_function_by_index ctx.ain fn_idx in
                       if same_method_shape receiver f then (
-                        if Int.equal fn_idx method_no then found := Some !rank;
+                        if Int.equal fn_idx target_no then found := Some !rank;
                         Int.incr rank));
                 !found
               in
+              let concrete_rank = concrete_rank_of method_no in
               List.find_map receiver.interfaces
                 ~f:(fun (iface : Ain.Struct.interface) ->
                   let iface_s =
@@ -2937,12 +2929,12 @@ class jaf_compiler ctx debug_info =
                           String.is_suffix method_short ~suffix:"::get"
                           || String.is_suffix method_short ~suffix:"::set"
                         then
-                          match self#current_body_duplicate_rank with
-                          | Some dup_rank ->
-                              Int.max 0 (group_count - 1 - dup_rank)
-                          | None ->
-                              if direct_getter_rank then r
-                              else Int.max 0 (group_count - 1 - r)
+                          (* The emitted vtable holds accessor pairs as
+                             [readonly; mutable] (the struct's own method
+                             list carries only the mutable entry). *)
+                          if group_count > 1 then
+                            if readonly_receiver then 0 else group_count - 1
+                          else r
                         else
                           if prefer_first_duplicate then 0
                           else
@@ -3000,7 +2992,6 @@ class jaf_compiler ctx debug_info =
                   List.find candidates ~f:(fun d ->
                       Option.equal Int.equal d.index (Some method_no))
                 with
-                | None -> method_no
                 | Some base -> (
                     let same_params (d : fundecl) =
                       List.length d.params = List.length base.params
@@ -3008,10 +2999,21 @@ class jaf_compiler ctx debug_info =
                            ~f:(fun a b ->
                              jaf_type_equal a.type_spec.ty b.type_spec.ty)
                     in
-                    match
+                    let twin ~f =
                       List.find candidates ~f:(fun d ->
-                          d.is_readonly && Option.is_some d.index
-                          && same_params d)
+                          Option.is_some d.index && same_params d && f d)
+                    in
+                    match
+                      (* explicit readonly overload, else the duplicate
+                         prototype (interface pairs: either index may be
+                         the one name resolution handed us) *)
+                      Option.first_some
+                        (twin ~f:(fun d -> d.is_readonly))
+                        (Option.first_some
+                           (twin ~f:(fun d ->
+                                Option.value_exn d.index > method_no))
+                           (twin ~f:(fun d ->
+                                Option.value_exn d.index <> method_no)))
                     with
                     | Some d -> Option.value_exn d.index
                     | None ->
@@ -3033,7 +3035,23 @@ class jaf_compiler ctx debug_info =
                         Ain.function_iter ctx.ain ~f:(fun g ->
                             if Option.is_none !found && same_sig g then
                               found := Some g.index);
-                        Option.value !found ~default:method_no))
+                        Option.value !found ~default:method_no)
+                | None -> (
+                    (* [method_no] may already be the second prototype of
+                       an interface pair: any other same-signature entry
+                       is its twin. *)
+                    let f = Ain.get_function_by_index ctx.ain method_no in
+                    let same_sig (g : Ain.Function.t) =
+                      g.index <> method_no
+                      && String.equal g.name f.name
+                      && Int.equal g.nr_args f.nr_args
+                      && Poly.equal g.return_type f.return_type
+                    in
+                    let found = ref None in
+                    Ain.function_iter ctx.ain ~f:(fun g ->
+                        if Option.is_none !found && same_sig g then
+                          found := Some g.index);
+                    match !found with Some v -> v | None -> method_no))
           in
           (* Never cache a miss: the copy may be allocated later. *)
           if v <> method_no then
@@ -3112,15 +3130,21 @@ class jaf_compiler ctx debug_info =
         | OptionalMember (obj, name, ClassVariable _) ->
             ro obj || self#v12_member_is_readonly obj.ty name
         | Call
-            ( { node =
-                  ( Member (obj, _, ClassMethod (_, no))
-                  | OptionalMember (obj, _, ClassMethod (_, no)) );
-                _;
-              },
+            ( { node = Member (obj, _, mt) | OptionalMember (obj, _, mt); _ },
               _,
-              _ ) ->
-            (ro obj && self#v12_readonly_variant no <> no)
-            || self#v12_function_is_readonly no
+              ct )
+          when (match (mt, ct) with
+                | ClassMethod _, _ | _, MethodCall _ -> true
+                | _ -> false) ->
+            let no =
+              match (ct, mt) with
+              | MethodCall (_, no), _ -> no
+              | _, ClassMethod (_, no) -> no
+              | _ -> -1
+            in
+            no >= 0
+            && ((ro obj && self#v12_readonly_variant no <> no)
+               || self#v12_function_is_readonly no)
         | Call ({ node = Member (obj, _, _) | OptionalMember (obj, _, _); _ }, _, HLLCall _) ->
             ro obj
         | Subscript (arr, _) -> ro arr
@@ -9940,13 +9964,16 @@ class jaf_compiler ctx debug_info =
                 is_label = source_obj.is_label;
                 is_lambda = source_obj.is_lambda };
             let prev_dup_rank = v12_current_body_dup_rank in
+            let prev_ro = v12_this_readonly_override in
             Exn.protect
               ~f:(fun () ->
                 v12_current_body_dup_rank <- Some (dup_rank + 1);
+                v12_this_readonly_override <- true;
                 self#compile_function
                   { decl with index = Some dup_idx; params = decl.params })
               ~finally:(fun () ->
-                v12_current_body_dup_rank <- prev_dup_rank)));
+                v12_current_body_dup_rank <- prev_dup_rank;
+                v12_this_readonly_override <- prev_ro)));
       (* v12 interface-backed concrete duplicate emission: some interfaces
          contain duplicate exact prototypes, while their implementing class
          only declares one concrete prototype. Original Rance10 still emits
@@ -10024,12 +10051,15 @@ class jaf_compiler ctx debug_info =
                   is_label = source_obj.is_label;
                   is_lambda = source_obj.is_lambda };
               let prev_dup_rank = v12_current_body_dup_rank in
+              let prev_ro = v12_this_readonly_override in
               Exn.protect
                 ~f:(fun () ->
                   v12_current_body_dup_rank <- Some (class_count + dup_i);
+                  v12_this_readonly_override <- true;
                   self#compile_function { decl with index = Some new_f.index })
                 ~finally:(fun () ->
-                  v12_current_body_dup_rank <- prev_dup_rank)
+                  v12_current_body_dup_rank <- prev_dup_rank;
+                  v12_this_readonly_override <- prev_ro)
             ));
       (* v12 object-return helper duplication: original Rance10 emits
          repeated concrete FUNC bodies for a small family of ref/iface/array

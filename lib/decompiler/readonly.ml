@@ -46,8 +46,10 @@ let sig_key (f : Ain.Function.t) =
 let build_ranks () =
   Hashtbl.clear copy_rank;
   let fam = Hashtbl.create (module String) in
+  (* Interface prototypes (no body) are duplicated too — vtable calls
+     through an interface resolve to them. *)
   Array.iter Ain.ain.func ~f:(fun f ->
-      if f.address > 0 then Hashtbl.add_multi fam ~key:(sig_key f) ~data:f.id);
+      Hashtbl.add_multi fam ~key:(sig_key f) ~data:f.id);
   Hashtbl.iter fam ~f:(fun ids ->
       let ids = List.rev ids in
       let n = List.length ids in
