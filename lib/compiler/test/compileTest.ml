@@ -1580,84 +1580,82 @@ let%expect_test "v12 optional compound assignment fuses getter onto checked rece
     038: PUSH 1
     044: REF
     046: RETURN
-    048: PUSH 0
-    054: RETURN
-    056: FUNC C@P::get
-    062: PUSHSTRUCTPAGE
-    064: PUSH 1
-    070: REF
-    072: RETURN
-    074: PUSH 0
-    080: RETURN
-    082: FUNC C@P::set
-    088: PUSHSTRUCTPAGE
-    090: PUSH 1
-    096: PUSHLOCALPAGE
-    098: PUSH 0
-    104: REF
-    106: ASSIGN
-    108: POP
-    110: RETURN
-    112: ENDFUNC C@P::set
-    118: FUNC f
-    124: PUSHLOCALPAGE
-    126: PUSH 0
-    132: DUP2
-    134: REF
-    136: PUSH -1
-    142: EQUALE
-    144: IFNZ 164
-    150: REFREF
-    152: PUSH 0
-    158: JUMP 186
-    164: POP
-    166: POP
-    168: PUSH -1
-    174: PUSH -1
-    180: PUSH -1
-    186: PUSH -1
-    192: EQUALE
-    194: IFNZ 284
-    200: DUP2
-    202: DUP_U2
-    204: PUSH 0
-    210: REF
-    212: SWAP
-    214: PUSH 1
-    220: ADD
-    222: REF
-    224: DUP_X2
-    226: POP
-    228: SWAP
-    230: DUP_U2
-    232: PUSH 0
-    238: REF
-    240: SWAP
-    242: PUSH 0
-    248: ADD
-    250: REF
-    252: CALLMETHOD NULL
-    258: PUSHLOCALPAGE
-    260: PUSH 2
-    266: REF
-    268: ADD
-    270: DUP_X2
-    272: CALLMETHOD I@P::get
-    278: JUMP 298
-    284: POP
-    286: POP
-    288: PUSHLOCALPAGE
-    290: PUSH 2
-    296: REF
-    298: POP
-    300: RETURN
-    302: ENDFUNC f
-    308: EOF test.jaf
-    314: FUNC C@0
-    320: RETURN
-    322: ENDFUNC C@0
-    328: FUNC NULL
-    334: EOF
+    048: ENDFUNC C@P::get
+    054: FUNC C@P::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 1
+    068: REF
+    070: RETURN
+    072: ENDFUNC C@P::get
+    078: FUNC C@P::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 1
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC C@P::set
+    114: FUNC f
+    120: PUSHLOCALPAGE
+    122: PUSH 0
+    128: DUP2
+    130: REF
+    132: PUSH -1
+    138: EQUALE
+    140: IFNZ 160
+    146: REFREF
+    148: PUSH 0
+    154: JUMP 182
+    160: POP
+    162: POP
+    164: PUSH -1
+    170: PUSH -1
+    176: PUSH -1
+    182: PUSH -1
+    188: EQUALE
+    190: IFNZ 280
+    196: DUP2
+    198: DUP_U2
+    200: PUSH 0
+    206: REF
+    208: SWAP
+    210: PUSH 1
+    216: ADD
+    218: REF
+    220: DUP_X2
+    222: POP
+    224: SWAP
+    226: DUP_U2
+    228: PUSH 0
+    234: REF
+    236: SWAP
+    238: PUSH 0
+    244: ADD
+    246: REF
+    248: CALLMETHOD NULL
+    254: PUSHLOCALPAGE
+    256: PUSH 2
+    262: REF
+    264: ADD
+    266: DUP_X2
+    268: CALLMETHOD I@P::get
+    274: JUMP 294
+    280: POP
+    282: POP
+    284: PUSHLOCALPAGE
+    286: PUSH 2
+    292: REF
+    294: POP
+    296: RETURN
+    298: ENDFUNC f
+    304: EOF test.jaf
+    310: FUNC C@0
+    316: RETURN
+    318: ENDFUNC C@0
+    324: FUNC NULL
+    330: EOF
     |}]
 
 (* v12 [recv?.field ?? fallback] on a scalar class field defers the
@@ -1850,88 +1848,86 @@ let%expect_test "v12 optional setter ?? statement balances both arms" =
     038: PUSH 0
     044: REF
     046: RETURN
-    048: PUSH 0
-    054: RETURN
-    056: FUNC R@P::get
-    062: PUSHSTRUCTPAGE
-    064: PUSH 0
-    070: REF
-    072: RETURN
-    074: PUSH 0
-    080: RETURN
-    082: FUNC R@P::set
-    088: PUSHSTRUCTPAGE
-    090: PUSH 0
-    096: PUSHLOCALPAGE
-    098: PUSH 0
-    104: REF
-    106: ASSIGN
-    108: POP
-    110: RETURN
-    112: ENDFUNC R@P::set
-    118: FUNC A2@GetR
-    124: PUSH -1
-    130: RETURN
-    132: PUSH -1
-    138: RETURN
-    140: FUNC C@test
-    146: PUSHSTRUCTPAGE
-    148: PUSH 0
-    154: DUP2
-    156: REF
-    158: PUSH -1
-    164: EQUALE
-    166: IFNZ 236
-    172: REF
-    174: PUSH 4
-    180: S_PUSH ""
-    186: CALLMETHOD R@P::get
-    192: PUSHLOCALPAGE
-    194: PUSH 0
-    200: REF
-    202: DELETE
-    204: PUSHLOCALPAGE
-    206: SWAP
-    208: PUSH 0
-    214: SWAP
-    216: ASSIGN
-    218: PUSH 0
-    224: PUSH 0
-    230: JUMP 258
-    236: POP
-    238: POP
-    240: PUSH -1
-    246: PUSH -1
-    252: PUSH -1
-    258: PUSH -1
-    264: EQUALE
-    266: IFNZ 304
-    272: POP
-    274: PUSH 3
-    280: PUSHSTRUCTPAGE
-    282: PUSH 1
-    288: REF
-    290: DUP_X2
-    292: CALLMETHOD R@P::get
-    298: JUMP 318
-    304: POP
-    306: POP
-    308: PUSHSTRUCTPAGE
-    310: PUSH 1
-    316: REF
-    318: POP
-    320: PUSHLOCALPAGE
-    322: PUSH 0
-    328: DUP2
-    330: REF
-    332: DELETE
-    334: PUSH -1
-    340: ASSIGN
-    342: POP
-    344: RETURN
-    346: EOF test.jaf
-    352: FUNC NULL
-    358: EOF
+    048: ENDFUNC R@P::get
+    054: FUNC R@P::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 0
+    068: REF
+    070: RETURN
+    072: ENDFUNC R@P::get
+    078: FUNC R@P::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 0
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC R@P::set
+    114: FUNC A2@GetR
+    120: PUSH -1
+    126: RETURN
+    128: PUSH -1
+    134: RETURN
+    136: FUNC C@test
+    142: PUSHSTRUCTPAGE
+    144: PUSH 0
+    150: DUP2
+    152: REF
+    154: PUSH -1
+    160: EQUALE
+    162: IFNZ 232
+    168: REF
+    170: PUSH 4
+    176: S_PUSH ""
+    182: CALLMETHOD R@P::get
+    188: PUSHLOCALPAGE
+    190: PUSH 0
+    196: REF
+    198: DELETE
+    200: PUSHLOCALPAGE
+    202: SWAP
+    204: PUSH 0
+    210: SWAP
+    212: ASSIGN
+    214: PUSH 0
+    220: PUSH 0
+    226: JUMP 254
+    232: POP
+    234: POP
+    236: PUSH -1
+    242: PUSH -1
+    248: PUSH -1
+    254: PUSH -1
+    260: EQUALE
+    262: IFNZ 300
+    268: POP
+    270: PUSH 3
+    276: PUSHSTRUCTPAGE
+    278: PUSH 1
+    284: REF
+    286: DUP_X2
+    288: CALLMETHOD R@P::get
+    294: JUMP 314
+    300: POP
+    302: POP
+    304: PUSHSTRUCTPAGE
+    306: PUSH 1
+    312: REF
+    314: POP
+    316: PUSHLOCALPAGE
+    318: PUSH 0
+    324: DUP2
+    326: REF
+    328: DELETE
+    330: PUSH -1
+    336: ASSIGN
+    338: POP
+    340: RETURN
+    342: EOF test.jaf
+    348: FUNC NULL
+    354: EOF
     |}]
 
 (* Same protocol for an INTERFACE property receiver (orig exemplar
@@ -1977,130 +1973,128 @@ let%expect_test "v12 iface optional setter ?? yields on both arms" =
     038: PUSH 1
     044: REF
     046: RETURN
-    048: PUSH 0
-    054: RETURN
-    056: FUNC P2@Alpha::get
-    062: PUSHSTRUCTPAGE
-    064: PUSH 1
-    070: REF
-    072: RETURN
-    074: PUSH 0
-    080: RETURN
-    082: FUNC P2@Alpha::set
-    088: PUSHSTRUCTPAGE
-    090: PUSH 1
-    096: PUSHLOCALPAGE
-    098: PUSH 0
-    104: REF
-    106: ASSIGN
-    108: POP
-    110: RETURN
-    112: ENDFUNC P2@Alpha::set
-    118: FUNC B2@Core::get
-    124: PUSHSTRUCTPAGE
-    126: PUSH 1
-    132: REFREF
-    134: DUP_U2
-    136: SP_INC
-    138: RETURN
-    140: ENDFUNC B2@Core::get
-    146: FUNC B2@Core::get
-    152: PUSHSTRUCTPAGE
-    154: PUSH 1
-    160: REFREF
-    162: DUP_U2
-    164: SP_INC
-    166: RETURN
-    168: ENDFUNC B2@Core::get
-    174: FUNC B2@Core::set
-    180: PUSHSTRUCTPAGE
-    182: PUSH 1
-    188: DUP2
-    190: REF
-    192: DELETE
-    194: PUSHLOCALPAGE
-    196: PUSH 0
-    202: REFREF
-    204: R_ASSIGN
-    206: POP
-    208: SP_INC
-    210: RETURN
-    212: ENDFUNC B2@Core::set
-    218: FUNC C@test
-    224: PUSHSTRUCTPAGE
-    226: PUSH 0
-    232: DUP2
-    234: REF
-    236: PUSH -1
-    242: EQUALE
-    244: IFNZ 322
-    250: REFREF
-    252: DUP_U2
-    254: PUSH 0
-    260: REF
-    262: SWAP
-    264: PUSH 0
-    270: ADD
-    272: REF
-    274: CALLMETHOD NULL
-    280: PUSHLOCALPAGE
-    282: PUSH 1
-    288: REF
-    290: DELETE
-    292: PUSHLOCALPAGE
-    294: DUP_X2
-    296: POP
-    298: PUSH 1
-    304: DUP_X2
-    306: POP
-    308: R_ASSIGN
-    310: PUSH 0
-    316: JUMP 344
-    322: POP
-    324: POP
-    326: PUSH -1
-    332: PUSH -1
-    338: PUSH -1
-    344: PUSH -1
-    350: EQUALE
-    352: IFNZ 404
-    358: DUP_U2
-    360: PUSH 0
-    366: REF
-    368: SWAP
-    370: PUSH 1
-    376: ADD
-    378: REF
-    380: PUSHLOCALPAGE
-    382: PUSH 0
-    388: REF
-    390: DUP_X2
-    392: CALLMETHOD IP@Alpha::get
-    398: JUMP 418
-    404: POP
-    406: POP
-    408: PUSHLOCALPAGE
-    410: PUSH 0
-    416: REF
-    418: POP
-    420: PUSHLOCALPAGE
-    422: PUSH 1
-    428: DUP2
-    430: REF
-    432: DELETE
-    434: PUSH -1
-    440: ASSIGN
-    442: POP
-    444: RETURN
-    446: EOF test.jaf
-    452: FUNC P2@0
-    458: RETURN
-    460: ENDFUNC P2@0
-    466: FUNC B2@0
-    472: RETURN
-    474: ENDFUNC B2@0
-    480: FUNC NULL
-    486: EOF
+    048: ENDFUNC P2@Alpha::get
+    054: FUNC P2@Alpha::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 1
+    068: REF
+    070: RETURN
+    072: ENDFUNC P2@Alpha::get
+    078: FUNC P2@Alpha::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 1
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC P2@Alpha::set
+    114: FUNC B2@Core::get
+    120: PUSHSTRUCTPAGE
+    122: PUSH 1
+    128: REFREF
+    130: DUP_U2
+    132: SP_INC
+    134: RETURN
+    136: ENDFUNC B2@Core::get
+    142: FUNC B2@Core::get
+    148: PUSHSTRUCTPAGE
+    150: PUSH 1
+    156: REFREF
+    158: DUP_U2
+    160: SP_INC
+    162: RETURN
+    164: ENDFUNC B2@Core::get
+    170: FUNC B2@Core::set
+    176: PUSHSTRUCTPAGE
+    178: PUSH 1
+    184: DUP2
+    186: REF
+    188: DELETE
+    190: PUSHLOCALPAGE
+    192: PUSH 0
+    198: REFREF
+    200: R_ASSIGN
+    202: POP
+    204: SP_INC
+    206: RETURN
+    208: ENDFUNC B2@Core::set
+    214: FUNC C@test
+    220: PUSHSTRUCTPAGE
+    222: PUSH 0
+    228: DUP2
+    230: REF
+    232: PUSH -1
+    238: EQUALE
+    240: IFNZ 318
+    246: REFREF
+    248: DUP_U2
+    250: PUSH 0
+    256: REF
+    258: SWAP
+    260: PUSH 0
+    266: ADD
+    268: REF
+    270: CALLMETHOD NULL
+    276: PUSHLOCALPAGE
+    278: PUSH 1
+    284: REF
+    286: DELETE
+    288: PUSHLOCALPAGE
+    290: DUP_X2
+    292: POP
+    294: PUSH 1
+    300: DUP_X2
+    302: POP
+    304: R_ASSIGN
+    306: PUSH 0
+    312: JUMP 340
+    318: POP
+    320: POP
+    322: PUSH -1
+    328: PUSH -1
+    334: PUSH -1
+    340: PUSH -1
+    346: EQUALE
+    348: IFNZ 400
+    354: DUP_U2
+    356: PUSH 0
+    362: REF
+    364: SWAP
+    366: PUSH 1
+    372: ADD
+    374: REF
+    376: PUSHLOCALPAGE
+    378: PUSH 0
+    384: REF
+    386: DUP_X2
+    388: CALLMETHOD IP@Alpha::get
+    394: JUMP 414
+    400: POP
+    402: POP
+    404: PUSHLOCALPAGE
+    406: PUSH 0
+    412: REF
+    414: POP
+    416: PUSHLOCALPAGE
+    418: PUSH 1
+    424: DUP2
+    426: REF
+    428: DELETE
+    430: PUSH -1
+    436: ASSIGN
+    438: POP
+    440: RETURN
+    442: EOF test.jaf
+    448: FUNC P2@0
+    454: RETURN
+    456: ENDFUNC P2@0
+    462: FUNC B2@0
+    468: RETURN
+    470: ENDFUNC B2@0
+    476: FUNC NULL
+    482: EOF
     |}]
 
 (* v12 [obj?.M1().M2()] discarded statement, non-void tail: ONE receiver
@@ -2503,88 +2497,86 @@ let%expect_test "v12 if/else with condition dummies routes both branches" =
     038: PUSH 0
     044: REF
     046: RETURN
-    048: PUSH 0
-    054: RETURN
-    056: FUNC R@P::get
-    062: PUSHSTRUCTPAGE
-    064: PUSH 0
-    070: REF
-    072: RETURN
-    074: PUSH 0
-    080: RETURN
-    082: FUNC R@P::set
-    088: PUSHSTRUCTPAGE
-    090: PUSH 0
-    096: PUSHLOCALPAGE
-    098: PUSH 0
-    104: REF
-    106: ASSIGN
-    108: POP
-    110: RETURN
-    112: ENDFUNC R@P::set
-    118: FUNC C@GetR
-    124: PUSH -1
-    130: RETURN
-    132: PUSH -1
-    138: RETURN
-    140: FUNC C@a
-    146: RETURN
-    148: FUNC C@b
-    154: RETURN
-    156: FUNC C@test
-    162: PUSHSTRUCTPAGE
-    164: PUSH 1
-    170: CALLMETHOD NULL
-    176: PUSHLOCALPAGE
-    178: PUSH 0
-    184: REF
-    186: DELETE
-    188: PUSHLOCALPAGE
-    190: SWAP
-    192: PUSH 0
-    198: SWAP
-    200: ASSIGN
-    202: PUSH 5
-    208: CALLMETHOD NULL
-    214: PUSH 1
-    220: EQUALE
-    222: PUSHLOCALPAGE
-    224: PUSH 0
-    230: DUP2
-    232: REF
-    234: DELETE
-    236: PUSH -1
-    242: ASSIGN
-    244: POP
-    246: IFNZ 282
-    252: PUSHLOCALPAGE
-    254: PUSH 0
-    260: DUP2
-    262: REF
-    264: DELETE
-    266: PUSH -1
-    272: ASSIGN
-    274: POP
-    276: JUMP 326
-    282: PUSHSTRUCTPAGE
-    284: PUSH 2
-    290: CALLMETHOD NULL
-    296: PUSHLOCALPAGE
-    298: PUSH 0
-    304: DUP2
-    306: REF
-    308: DELETE
-    310: PUSH -1
-    316: ASSIGN
-    318: POP
-    320: JUMP 340
-    326: PUSHSTRUCTPAGE
-    328: PUSH 3
-    334: CALLMETHOD NULL
-    340: RETURN
-    342: EOF test.jaf
-    348: FUNC NULL
-    354: EOF
+    048: ENDFUNC R@P::get
+    054: FUNC R@P::get
+    060: PUSHSTRUCTPAGE
+    062: PUSH 0
+    068: REF
+    070: RETURN
+    072: ENDFUNC R@P::get
+    078: FUNC R@P::set
+    084: PUSHSTRUCTPAGE
+    086: PUSH 0
+    092: PUSHLOCALPAGE
+    094: PUSH 0
+    100: REF
+    102: ASSIGN
+    104: POP
+    106: RETURN
+    108: ENDFUNC R@P::set
+    114: FUNC C@GetR
+    120: PUSH -1
+    126: RETURN
+    128: PUSH -1
+    134: RETURN
+    136: FUNC C@a
+    142: RETURN
+    144: FUNC C@b
+    150: RETURN
+    152: FUNC C@test
+    158: PUSHSTRUCTPAGE
+    160: PUSH 1
+    166: CALLMETHOD NULL
+    172: PUSHLOCALPAGE
+    174: PUSH 0
+    180: REF
+    182: DELETE
+    184: PUSHLOCALPAGE
+    186: SWAP
+    188: PUSH 0
+    194: SWAP
+    196: ASSIGN
+    198: PUSH 5
+    204: CALLMETHOD NULL
+    210: PUSH 1
+    216: EQUALE
+    218: PUSHLOCALPAGE
+    220: PUSH 0
+    226: DUP2
+    228: REF
+    230: DELETE
+    232: PUSH -1
+    238: ASSIGN
+    240: POP
+    242: IFNZ 278
+    248: PUSHLOCALPAGE
+    250: PUSH 0
+    256: DUP2
+    258: REF
+    260: DELETE
+    262: PUSH -1
+    268: ASSIGN
+    270: POP
+    272: JUMP 322
+    278: PUSHSTRUCTPAGE
+    280: PUSH 2
+    286: CALLMETHOD NULL
+    292: PUSHLOCALPAGE
+    294: PUSH 0
+    300: DUP2
+    302: REF
+    304: DELETE
+    306: PUSH -1
+    312: ASSIGN
+    314: POP
+    316: JUMP 336
+    322: PUSHSTRUCTPAGE
+    324: PUSH 3
+    330: CALLMETHOD NULL
+    336: RETURN
+    338: EOF test.jaf
+    344: FUNC NULL
+    350: EOF
     |}]
 
 (* A bare method reference bound to a delegate-typed target must pick
