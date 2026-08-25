@@ -37,28 +37,31 @@ let write_to_file out_dir fname buf =
     Stdlib.Buffer.output_buffer outc buf;
     Out_channel.close outc
 
-let sys4dc output_dir inspect_function print_addr move_to_original_file
-    continue_on_error ain_file =
+let sys4dc output_dir print_addr move_to_original_file continue_on_error
+    disassemble disassemble_raw func ain_file =
   let output_dir = Option.value output_dir ~default:"." in
   Ain.load ain_file;
-  match inspect_function with
-  | None ->
-      let decompiled =
-        Decompile.decompile ~move_to_original_file ~continue_on_error
-      in
-      (* reroot ain_file to output_dir if possible *)
-      let ain_path =
-        Fpath.(
-          let root =
-            v @@ if String.(output_dir = "-") then "." else output_dir
-          in
-          match relativize ~root (v ain_file) with
-          | Some p -> to_string @@ normalize p
-          | None -> ain_file)
-      in
-      Decompile.export ~print_addr decompiled ain_path
-        (write_to_file output_dir)
-  | Some funcname -> Decompile.inspect funcname ~print_addr
+  if disassemble || disassemble_raw then
+    Disassemble.disassemble ~raw:disassemble_raw ?func ()
+  else
+    match func with
+    | Some funcname -> Decompile.inspect funcname ~print_addr
+    | None ->
+        let decompiled =
+          Decompile.decompile ~move_to_original_file ~continue_on_error
+        in
+        (* reroot ain_file to output_dir if possible *)
+        let ain_path =
+          Fpath.(
+            let root =
+              v @@ if String.(output_dir = "-") then "." else output_dir
+            in
+            match relativize ~root (v ain_file) with
+            | Some p -> to_string @@ normalize p
+            | None -> ain_file)
+        in
+        Decompile.export ~print_addr decompiled ain_path
+          (write_to_file output_dir)
 
 let cmd =
   let version =
@@ -70,12 +73,6 @@ let cmd =
     let doc = "Output directory. Use '-' to print everything to stdout." in
     let docv = "DIRECTORY" in
     Cmdliner.Arg.(value & opt (some string) None & info [ "o" ] ~docv ~doc)
-  in
-  let inspect_function =
-    let doc = "Inspect the decompilation process of a function" in
-    let docv = "FUNCTION" in
-    Cmdliner.Arg.(
-      value & opt (some string) None & info [ "inspect" ] ~docv ~doc)
   in
   let print_addr =
     let doc = "Print addresses" in
@@ -92,14 +89,37 @@ let cmd =
     let doc = "Continue decompilation even if an error is encountered." in
     Cmdliner.Arg.(value & flag & info [ "continue-on-error" ] ~doc)
   in
+  let disassemble =
+    let doc =
+      "Disassemble the code section instead of decompiling.  Pass a FUNCTION \
+       name to restrict the output to a single function."
+    in
+    Cmdliner.Arg.(value & flag & info [ "disassemble" ] ~doc)
+  in
+  let disassemble_raw =
+    let doc =
+      "Like --disassemble, but without resolving identifiers or generating \
+       labels (raw listing with addresses)."
+    in
+    Cmdliner.Arg.(value & flag & info [ "disassemble-raw" ] ~doc)
+  in
   let ain_file =
     let doc = "The .ain file to decompile" in
     let docv = "AIN_FILE" in
     Cmdliner.Arg.(required & pos 0 (some string) None & info [] ~docv ~doc)
   in
+  let func =
+    let doc =
+      "Restrict the output to a single function.  With \
+       --disassemble/--disassemble-raw, disassemble only this function; \
+       otherwise inspect its decompilation process."
+    in
+    let docv = "FUNCTION" in
+    Cmdliner.Arg.(value & pos 1 (some string) None & info [] ~docv ~doc)
+  in
   Cmd.v info
     Term.(
-      const sys4dc $ output_dir $ inspect_function $ print_addr
-      $ move_to_original_file $ continue_on_error $ ain_file)
+      const sys4dc $ output_dir $ print_addr $ move_to_original_file
+      $ continue_on_error $ disassemble $ disassemble_raw $ func $ ain_file)
 
 let () = Stdlib.exit (Cmd.eval cmd)
