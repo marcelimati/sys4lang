@@ -331,11 +331,80 @@ let resolve () =
             mark_readonly a
         | [] -> ())
 
+(* The original compiler names lambdas after their parent's signature,
+   spelling readonly parameters and a readonly parent:
+   [<lambda : Parent(readonly ref T, int) readonly(line, col)>]. That
+   is direct evidence for declarations no call site reveals. *)
+let split_top_level (s : string) =
+  let parts = ref [] and buf = Buffer.create 32 and depth = ref 0 in
+  String.iter s ~f:(fun c ->
+      match c with
+      | '<' | '(' -> Int.incr depth; Buffer.add_char buf c
+      | '>' | ')' -> Int.decr depth; Buffer.add_char buf c
+      | ',' when !depth = 0 -> parts := Buffer.contents buf :: !parts; Buffer.clear buf
+      | c -> Buffer.add_char buf c);
+  if Buffer.length buf > 0 then parts := Buffer.contents buf :: !parts;
+  List.rev_map !parts ~f:String.strip
+
+let lambda_name_evidence () =
+  let by_name = Hashtbl.create (module String) in
+  Array.iter Ain.ain.func ~f:(fun f -> Hashtbl.add_multi by_name ~key:f.name ~data:f);
+  let marked = ref 0 in
+  Array.iter Ain.ain.func ~f:(fun f ->
+      (* innermost [<lambda : SIG(line, col)>] *)
+      match String.substr_index_all f.name ~may_overlap:false ~pattern:"<lambda : " with
+      | [] -> ()
+      | idxs -> (
+          let start = List.last_exn idxs + String.length "<lambda : " in
+          let rest = String.drop_prefix f.name start in
+          (* strip trailing "(line, col)>..." *)
+          match String.rsplit2 rest ~on:'(' with
+          | None -> ()
+          | Some (sig_, _) -> (
+              let sig_, readonly_parent =
+                match String.chop_suffix sig_ ~suffix:" readonly" with
+                | Some s -> (s, true)
+                | None -> (sig_, false)
+              in
+              match String.lsplit2 sig_ ~on:'(' with
+              | None -> ()
+              | Some (pname, params) -> (
+                  let params = String.chop_suffix_exn params ~suffix:")" in
+                  let ptypes =
+                    if String.is_empty params then [] else split_top_level params
+                  in
+                  let n = List.length ptypes in
+                  match
+                    List.filter (Hashtbl.find_multi by_name pname) ~f:(fun p ->
+                        List.length (Ain.Function.args p) = n)
+                  with
+                  | [ parent ] | parent :: _ as _l when true ->
+                      if readonly_parent && not (is_readonly_copy parent.id) then (
+                        Hashtbl.set readonly_this ~key:parent.id ~data:();
+                        Int.incr marked);
+                      List.iteri ptypes ~f:(fun i t ->
+                          if String.is_prefix t ~prefix:"readonly " then (
+                            let args = Ain.Function.args parent in
+                            match List.nth args i with
+                            | Some v -> (
+                                match var_index parent v with
+                                | Some vi ->
+                                    Hashtbl.set readonly_locals ~key:(local_key parent vi) ~data:();
+                                    Int.incr marked
+                                | None -> ())
+                            | None -> ()))
+                  | _ -> ()))));
+  !marked
+
 let infer (funcs : fn_tree list) =
   build_ranks ();
   clauses := [];
   contradictions := 0;
   heuristic_picks := 0;
+  let from_names = lambda_name_evidence () in
+  if from_names > 0 then
+    Stdio.eprintf "readonly inference: %d declarations from lambda names
+" from_names;
   List.iter funcs ~f:(fun f -> collect [] f.func.id false f);
   let n_clauses = List.length !clauses in
   resolve ();
