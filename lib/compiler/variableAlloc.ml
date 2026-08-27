@@ -820,8 +820,11 @@ class variable_alloc_visitor ctx =
         && Poly.equal v.kind LocalVar
         && (match v.type_spec.ty with Struct _ -> true | _ -> false)
         &&
+        (* Only a default-constructed [new T] rebinds in place; a
+           constructor call with arguments ([new T(args)]) goes through
+           a [<dummy : new T>] and is A_REF/SR_ASSIGN-copied. *)
         match v.initval with
-        | Some { node = New _ | NewCall _; _ } -> true
+        | Some { node = New _ | NewCall (_, []); _ } -> true
         | _ -> false
       in
       if suppress then suppress_direct_new_dummy <- suppress_direct_new_dummy + 1;
