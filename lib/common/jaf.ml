@@ -1557,12 +1557,16 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
     foreach_counter := !foreach_counter + 1;
     !foreach_counter
   in
+  (* Reverse loops carry an [r] marker so the Ain-level names can be
+     spelled [<dummy : foreach_r文の...>] (variableAlloc). Nothing
+     parses the numeric id; every consumer matches the prefix. *)
+  let tag = if rev then Printf.sprintf "r%d" id else Int.to_string id in
   let counter_name =
     match ivar_name with
     | Some name -> name
-    | None -> Printf.sprintf "<foreach_i_%d>" id
+    | None -> Printf.sprintf "<foreach_i_%s>" tag
   in
-  let container_name = Printf.sprintf "<foreach_container_%d>" id in
+  let container_name = Printf.sprintf "<foreach_container_%s>" tag in
   let dl = dummy_location in
   let mk_expr node = { ty = Untyped; node; loc = dl } in
   let mk_stmt node = { node; delete_vars = []; loc } in

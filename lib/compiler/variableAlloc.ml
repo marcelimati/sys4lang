@@ -1009,6 +1009,24 @@ class variable_alloc_visitor ctx =
               && Char.equal v.name.[0] '_'
               && String.for_all (String.drop_prefix v.name 1) ~f:Char.is_digit
             then "<" ^ String.drop_prefix v.name 1 ^ ">"
+            else if
+              Ain.version_gte ctx.ain (12, 0)
+              && (String.is_prefix v.name ~prefix:"<foreach_container_"
+                 || String.is_prefix v.name ~prefix:"<foreach_i_")
+            then
+              (* The original names the foreach desugar locals
+                 [<dummy : foreach文のコンテナ>] / [<dummy : foreach文の
+                 インデックス>] ([foreach_r文] for reverse loops); our
+                 internal [<foreach_container_N>] / [<foreach_i_N>]
+                 stay for the prefix checks. *)
+              let rev =
+                String.is_prefix v.name ~prefix:"<foreach_container_r"
+                || String.is_prefix v.name ~prefix:"<foreach_i_r"
+              in
+              let kw = if rev then "foreach_r" else "foreach" in
+              if String.is_prefix v.name ~prefix:"<foreach_container_" then
+                "<dummy : " ^ kw ^ "文のコンテナ>"
+              else "<dummy : " ^ kw ^ "文のインデックス>"
             else v.name
           in
           Ain.Variable.make ~index name ain_type
