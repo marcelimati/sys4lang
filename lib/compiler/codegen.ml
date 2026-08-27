@@ -9623,6 +9623,19 @@ class jaf_compiler ctx debug_info =
                    slot is already empty, so skip the delete-old-value
                    path and use rhs-first CHECKUDO + ASSIGN + SP_INC. *)
                 let vb = vars_before () in
+                (* v12 foreach over a BY-VALUE array call result: the fresh
+                   array is moved into the container slot (ASSIGN; POP);
+                   a borrowed ref result is claimed with SP_INC. *)
+                let owned_value_array =
+                  Ain.version_gte ctx.ain (12, 0)
+                  &&
+                  match e.node with
+                  | RvalueRef ({ node = Call _; _ } as c) -> (
+                      match self#ain_call_return_type c with
+                      | Some (Ain.Type.Array _) -> true
+                      | _ -> false)
+                  | _ -> false
+                in
                 self#compile_lvalue e;
                 self#write_instruction0 PUSHLOCALPAGE;
                 self#write_instruction1 PUSH v.index;
@@ -9633,7 +9646,8 @@ class jaf_compiler ctx debug_info =
                 self#write_instruction1 PUSH v.index;
                 self#write_instruction0 SWAP;
                 self#write_instruction0 ASSIGN;
-                self#write_instruction0 SP_INC;
+                if owned_value_array then self#write_instruction0 POP
+                else self#write_instruction0 SP_INC;
                 self#cleanup_condition_dummyrefs vb
             | Some e
               when match v.value_type with
