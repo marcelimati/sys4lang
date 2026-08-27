@@ -168,6 +168,16 @@ class jaf_compiler ctx debug_info =
        implicit RETURN does (orig: 212 of 227 straight-line lambdas). *)
     val mutable v12_lambda_last_stmt : bool = false
 
+    (* v12: temps released inline by a struct-copy assignment statement
+       ([x = call();] -> A_REF; SR_ASSIGN; DELETE; LOCALDELETE d) are
+       NOT replayed at the end of a FALL-THROUGH branch block (an
+       else-less then-block, or an else-block): orig 62 single vs 0
+       replayed before the end label; a then-block that JUMPs over an
+       else still replays (15/15). Other statement kinds replay in
+       both. *)
+    val mutable v12_struct_assign_released : int list = []
+    val mutable v12_pending_fallthrough : bool = false
+
     (* v12 foreach header: the original lowers [container = call(), i = -1]
        as one comma expression, so the container call's temps are
        released just before the counter assignment's POP. The container
@@ -8058,6 +8068,12 @@ class jaf_compiler ctx debug_info =
       | Some (_, _, _, hops) as r when List.length hops >= 2 -> r
       | _ -> None
 
+    method v12_compile_branch ~fallthrough (b : statement) =
+      v12_pending_fallthrough <- Ain.version_gte ctx.ain (12, 0) && fallthrough;
+      Exn.protect
+        ~f:(fun () -> self#compile_statement b)
+        ~finally:(fun () -> v12_pending_fallthrough <- false)
+
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
       match expr.node with
@@ -9213,7 +9229,19 @@ class jaf_compiler ctx debug_info =
           in
           if cleanup_after_pop then (
             self#compile_expr_and_pop e;
-            release ())
+            release ();
+            match e.node with
+            | Assign (EqAssign, { ty = Struct (sname, _); _ }, _)
+              when Ain.version_gte ctx.ain (12, 0)
+                   && not (Hashtbl.mem ctx.interface_names sname) ->
+                (* value-struct copy (SR_ASSIGN; DELETE) only: interface
+                   / ref assignments (R_ASSIGN; SP_INC) ARE replayed
+                   (orig CMenuViewItem@CreateTextParts) *)
+                v12_struct_assign_released <-
+                  List.filter last_condition_deleted_dummies ~f:(fun i ->
+                      String.is_prefix (self#get_local i).name ~prefix:"<dummy")
+                  @ v12_struct_assign_released
+            | _ -> ())
           else if Ain.version ctx.ain > 8 then
             self#compile_expr_and_pop ~before_pop:release e
           else self#compile_expr_and_pop e
@@ -9343,7 +9371,7 @@ class jaf_compiler ctx debug_info =
               let alt_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at if_addr current_address;
-              self#compile_statement con;
+              self#v12_compile_branch ~fallthrough:(empty_statement alt) con;
               match alt.node with
               | EmptyStatement ->
                   self#write_address_at alt_jump_addr current_address
@@ -9351,7 +9379,7 @@ class jaf_compiler ctx debug_info =
                   let end_jump_addr = current_address + 2 in
                   self#write_instruction1 JUMP 0;
                   self#write_address_at alt_jump_addr current_address;
-                  self#compile_statement alt;
+                  self#v12_compile_branch ~fallthrough:true alt;
                   self#write_address_at end_jump_addr current_address)
             else (
               (* Original v12 if-with-cleanup layout (per dasm of original
@@ -9386,7 +9414,7 @@ class jaf_compiler ctx debug_info =
               let alt_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at if_addr current_address;
-              self#compile_statement con;
+              self#v12_compile_branch ~fallthrough:(empty_statement alt) con;
               (* Post-con replay covers Ref/Struct call-result dummies
                  only (orig exemplars SceneQuestMap@ProcessNext /
                  GetMoveType / CheckNoLeader / RunCurrentObjectEvent).
@@ -9407,7 +9435,7 @@ class jaf_compiler ctx debug_info =
                   let end_jump_addr = current_address + 2 in
                   self#write_instruction1 JUMP 0;
                   self#write_address_at alt_jump_addr current_address;
-                  self#compile_statement alt;
+                  self#v12_compile_branch ~fallthrough:true alt;
                   self#write_address_at end_jump_addr current_address);
               (* The both-branch replay IS the condition temps' block-end
                  replay: drop them from the enclosing scope so a loop
@@ -10599,6 +10627,9 @@ class jaf_compiler ctx debug_info =
     (** Emit the code for a block of statements. *)
     method compile_block (stmts : statement list) =
       let top_level = Int.equal block_depth 0 in
+      let is_fallthrough = v12_pending_fallthrough in
+      v12_pending_fallthrough <- false;
+      let last_struct_released = ref [] in
       block_depth <- block_depth + 1;
       self#start_scope;
       (* v12 iface-init suppression: for [Type var; <next stmt that
@@ -10649,15 +10680,29 @@ class jaf_compiler ctx debug_info =
             in
             let prev_last = v12_lambda_last_stmt in
             if lambda_last then v12_lambda_last_stmt <- true;
+            v12_struct_assign_released <- [];
             Exn.protect
               ~f:(fun () -> self#compile_statement stmt)
               ~finally:(fun () -> v12_lambda_last_stmt <- prev_last);
+            (* only the LAST statement's struct-assign temps take part
+               in the fall-through rule; a mid-block struct assign is
+               replayed at block end like everything else (orig
+               CMenuView@_CreateFrame) *)
+            if List.is_empty rest then
+              last_struct_released := v12_struct_assign_released;
             if Ain.version_gte ctx.ain (12, 0) then
               self#emit_v12_last_use_cleanup stmt rest;
             ignore top_level;
             loop rest
       in
       loop stmts;
+      (if is_fallthrough then
+         match Stack.top scopes with
+         | Some scope ->
+             scope.vars <-
+               List.filter scope.vars ~f:(fun v ->
+                   not (List.mem !last_struct_released v.index ~equal:Int.equal))
+         | None -> ());
       self#end_scope;
       block_depth <- block_depth - 1
 
@@ -10708,6 +10753,8 @@ class jaf_compiler ctx debug_info =
       current_function <- Some func;
       let prev_cond_scoped_slots = v12_cond_scoped_slots in
       v12_cond_scoped_slots <- Hashtbl.create (module Int);
+      let prev_struct_assign_released = v12_struct_assign_released in
+      v12_struct_assign_released <- [];
       let prev_readonly_slots = v12_readonly_slots in
       let prev_this_readonly = v12_this_readonly in
       v12_readonly_slots <- Hashtbl.create (module Int);
@@ -10858,6 +10905,7 @@ class jaf_compiler ctx debug_info =
       current_function <- prev_function;
       v12_readonly_slots <- prev_readonly_slots;
       v12_cond_scoped_slots <- prev_cond_scoped_slots;
+      v12_struct_assign_released <- prev_struct_assign_released;
       v12_this_readonly <- prev_this_readonly;
       enclosing_functions <- prev_enclosing_functions;
       inline_deleted_dummies <- prev_inline_deleted_dummies;
