@@ -4315,7 +4315,9 @@ class jaf_compiler ctx debug_info =
           let bare_array_var_rhs =
             Ain.version_gte ctx.ain (12, 0)
             && (match op with EqAssign -> true | _ -> false)
-            && (match lhs.ty with Array _ | Ref (Array _) -> true | _ -> false)
+            && (match lhs.ty with
+               | Array _ | Ref (Array _) | Delegate _ -> true
+               | _ -> false)
             && self#v12_is_auto_setter_backing_store lhs rhs
           in
           if bare_array_var_rhs then (
@@ -7655,7 +7657,7 @@ class jaf_compiler ctx debug_info =
       match expr.node with
       (* v12 [arr = other_arr;]: X_SET leaves the (borrowed) source ref;
          the original POPs it rather than DELETE-ing. *)
-      | Assign (EqAssign, ({ ty = Array _ | Ref (Array _); _ } as lhs), rhs)
+      | Assign (EqAssign, ({ ty = Array _ | Ref (Array _) | Delegate _; _ } as lhs), rhs)
         when Ain.version_gte ctx.ain (12, 0)
              && self#v12_is_auto_setter_backing_store lhs rhs ->
           self#compile_expression expr;
