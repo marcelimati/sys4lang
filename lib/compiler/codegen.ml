@@ -9006,7 +9006,22 @@ class jaf_compiler ctx debug_info =
                   self#write_instruction1 JUMP 0;
                   self#write_address_at alt_jump_addr current_address;
                   self#compile_statement alt;
-                  self#write_address_at end_jump_addr current_address)))
+                  self#write_address_at end_jump_addr current_address);
+              (* The both-branch replay IS the condition temps' block-end
+                 replay: drop them from the enclosing scope so a loop
+                 body's end_scope doesn't release them a third time
+                 (orig Party@EraseNgCard: no release after the if's end
+                 label before the back-jump). *)
+              (match Stack.top scopes with
+              | Some scope ->
+                  scope.vars <-
+                    List.filter scope.vars ~f:(fun v ->
+                        not
+                          (List.mem saved_last v.index ~equal:Int.equal
+                          && (match v.value_type with
+                             | Ain.Type.IFace _ -> false
+                             | _ -> true)))
+              | None -> ())))
           else (
             let ifz_addr = current_address + 2 in
             self#write_instruction1 IFZ 0;
