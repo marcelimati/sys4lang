@@ -3897,6 +3897,19 @@ class jaf_compiler ctx debug_info =
               | _ when (match b.node with This -> true | _ -> false) ->
                   self#compile_lvalue b
               | Ref _ -> self#compile_lvalue b
+              (* v12 identity compare against a non-interface struct
+                 variable (predicate lambdas: [item === captured]):
+                 the original reads the page ref bare, no A_REF. *)
+              | Struct (n, _)
+                when Ain.version_gte ctx.ain (12, 0)
+                     && (not (Hashtbl.mem ctx.interface_names n))
+                     && (match b.node with
+                        | Ident (_, (LocalVariable _ | GlobalVariable _))
+                        | Member (_, _, ClassVariable _) ->
+                            true
+                        | _ -> false) ->
+                  self#compile_variable_ref b;
+                  self#write_instruction0 REF
               | _ -> self#compile_expression b);
               if both_iface then (
                 (* Narrow the rhs pair to its page too. Wrap-stored
@@ -3951,9 +3964,32 @@ class jaf_compiler ctx debug_info =
                   | _ -> None
                 else None
               in
+              (* v12 struct identity compare ([a == b] on struct refs):
+                 variable operands are read as bare refs — no A_REF
+                 bump (orig: [.LOCALREF item; ...X_GETENV; PUSH 7; REF;
+                 EQUALE] in Find/Erase predicate lambdas). *)
+              let bare_struct_operand (x : expression) =
+                Ain.version_gte ctx.ain (12, 0)
+                && (match op with Equal | NEqual -> true | _ -> false)
+                && (match x.ty with
+                   | Struct (n, _) | Ref (Struct (n, _)) ->
+                       not (Hashtbl.mem ctx.interface_names n)
+                   | _ -> false)
+                && (match x.node with
+                   | Ident (_, (LocalVariable _ | GlobalVariable _))
+                   | Member (_, _, ClassVariable _) ->
+                       true
+                   | _ -> false)
+              in
+              let compile_operand (x : expression) =
+                if bare_struct_operand x then (
+                  self#compile_variable_ref x;
+                  self#write_instruction0 REF)
+                else self#compile_expression x
+              in
               (match deferred_left with
               | Some inner -> self#compile_expression inner
-              | None -> self#compile_expression a);
+              | None -> compile_operand a);
               (match (op, b.node) with
               | (Equal | NEqual), Null
                 when Ain.version_gte ctx.ain (12, 0)
@@ -3976,7 +4012,7 @@ class jaf_compiler ctx debug_info =
                       self#write_instruction0 POP
                   | _ -> ())
               | _ -> ());
-              self#compile_expression b;
+              compile_operand b;
               if Option.is_some deferred_left then (
                 self#write_instruction0 SWAP;
                 self#write_instruction0 ITOF;
