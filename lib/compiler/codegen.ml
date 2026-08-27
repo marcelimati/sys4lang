@@ -6199,7 +6199,9 @@ class jaf_compiler ctx debug_info =
                 MethodCall _ )
             when Ain.version_gte ctx.ain (12, 0)
                  && (is_variable_ref recv.node
-                    || match recv.node with This -> true | _ -> false)
+                    || (match recv.node with
+                       | This | DummyRef _ | Call _ -> true
+                       | _ -> false))
                  && (match (Ain.get_function_by_index ctx.ain getter_no).name with
                     | n -> String.is_suffix n ~suffix:"::get") ->
               (* v12 [recv?.field.Getter ?? fallback] — a struct FIELD hop
@@ -6214,8 +6216,19 @@ class jaf_compiler ctx debug_info =
                    merge: PUSH -1; EQUALE; IFZ live; POP; POP; fallback; JUMP end
                    live: POP; PUSH getter; CALLMETHOD 0
                    end: *)
+              (* root shape: [this] (1 slot), a variable (address pair,
+                 re-REF'd live, 2 POPs null) or a call result held in a
+                 dummy (value, 1 POP null). *)
+              let root_is_value =
+                match recv.node with
+                | This | DummyRef _ | Call _ -> true
+                | _ -> false
+              in
               (match recv.node with
               | This -> self#write_instruction0 PUSHSTRUCTPAGE
+              | DummyRef _ | Call _ ->
+                  self#compile_lvalue recv;
+                  self#write_instruction0 DUP
               | _ ->
                   self#compile_variable_ref recv;
                   self#write_instruction0 DUP2;
@@ -6224,7 +6237,7 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 EQUALE;
               let null_addr = current_address + 2 in
               self#write_instruction1 IFNZ 0;
-              (match recv.node with This -> () | _ -> self#write_instruction0 REF);
+              if not root_is_value then self#write_instruction0 REF;
               self#write_instruction1 PUSH fidx;
               self#write_instruction0 REF;
               self#write_instruction1 PUSH 0;
@@ -6232,7 +6245,7 @@ class jaf_compiler ctx debug_info =
               let merge_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at null_addr current_address;
-              (match recv.node with This -> () | _ -> self#write_instruction0 POP);
+              if not root_is_value then self#write_instruction0 POP;
               self#write_instruction0 POP;
               self#write_instruction1 PUSH (-1);
               self#write_instruction1 PUSH (-1);
