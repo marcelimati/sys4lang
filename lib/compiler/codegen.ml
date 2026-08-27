@@ -8392,6 +8392,23 @@ class jaf_compiler ctx debug_info =
                    delete-first): the previous default inverted this
                    for every Struct/Ref-Struct/Int-typed statement
                    (full-coverage families [-POP +POP] 516+479 hunks). *)
+                (* v12 struct assignment statements ([s = new T(..)],
+                   [s = call()] — SR_ASSIGN; DELETE) release their temps
+                   AFTER the DELETE; every other plain assignment
+                   (popped scalar/ref result) releases before the POP. *)
+                | Assign (EqAssign, _, _)
+                  when Ain.version_gte ctx.ain (12, 0)
+                       && (match e.ty with
+                          | Struct _ | Ref (Struct _) -> true
+                          | _ -> false)
+                       && not
+                            (Option.value_map current_function ~default:false
+                               ~f:(fun f ->
+                                 String.equal f.name "0"
+                                 || String.is_suffix f.name ~suffix:"@2")) ->
+                    (* ...but the generated initializers ([0] globals,
+                       [Class@2] members) release before. *)
+                    true
                 | Assign (EqAssign, _, _) when Ain.version_gte ctx.ain (12, 0) ->
                     false
                 | _ when Ain.version_gte ctx.ain (12, 0) -> true
