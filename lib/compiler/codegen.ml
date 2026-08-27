@@ -4067,12 +4067,20 @@ class jaf_compiler ctx debug_info =
                 true
             | _ -> false
           in
+          (* A delegate VALUE rhs ([?.Event += value]) takes the same
+             deferred protocol; it is pushed as a plain expression
+             (deref + A_REF) in both branches instead of being built
+             with DG_NEW_FROM_METHOD. *)
+          let rhs_is_delegate_value =
+            (not rhs_is_method_ref)
+            && (match rhs.ty with Delegate _ | Ref (Delegate _) -> true | _ -> false)
+          in
           let optional_delegate_add =
             if
               Ain.version_gte ctx.ain (12, 0)
               && (match op with PlusAssign | MinusAssign -> true | _ -> false)
               && (match lhs.ty with Delegate _ -> true | _ -> false)
-              && rhs_is_method_ref
+              && (rhs_is_method_ref || rhs_is_delegate_value)
             then
               match lhs.node with
               | OptionalMember
@@ -4087,7 +4095,8 @@ class jaf_compiler ctx debug_info =
               let dgop = match op with PlusAssign -> DG_PLUSA | _ -> DG_MINUSA in
               let emit_rhs_dg () =
                 self#compile_expression rhs;
-                self#write_instruction0 DG_NEW_FROM_METHOD
+                if not rhs_is_delegate_value then
+                  self#write_instruction0 DG_NEW_FROM_METHOD
               in
               (* Evaluate the receiver call: CALLFUNC; store to its
                  dummy slot; leave the page-ref on the stack. The
@@ -7545,6 +7554,26 @@ class jaf_compiler ctx debug_info =
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
       match expr.node with
+      (* v12 [recv?.DelegateMember += rhs]: the deferred arm consumes
+         everything itself (DG_PLUSA; DELETE on the live path, DELETE of
+         the built/pushed rhs on the null path) — no statement pop. *)
+      | Assign
+          ( (PlusAssign | MinusAssign),
+            { node =
+                OptionalMember
+                  ( { node = DummyRef (_, { node = Call _; _ }); _ },
+                    _,
+                    ClassVariable _ );
+              ty = Delegate _;
+              _;
+            },
+            rhs )
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match rhs.ty with
+                | Delegate _ | Ref (Delegate _) | TyMethod _ | TyFunction _ -> true
+                | _ -> (match rhs.node with Lambda _ | FuncAddr _ -> true | _ -> false)) ->
+          self#compile_expression expr;
+          before_pop ()
       | Assign
           ( EqAssign,
             ( {
