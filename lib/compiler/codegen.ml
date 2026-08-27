@@ -163,6 +163,11 @@ class jaf_compiler ctx debug_info =
        form (IFZ end; RETURN; end:). *)
     val mutable v12_if_ret_short : bool = false
 
+    (* v12: the LAST top-level statement of a lambda body does not
+       release its expression temps — the frame teardown at the
+       implicit RETURN does (orig: 212 of 227 straight-line lambdas). *)
+    val mutable v12_lambda_last_stmt : bool = false
+
     (* v12 foreach header: the original lowers [container = call(), i = -1]
        as one comma expression, so the container call's temps are
        released just before the counter assignment's POP. The container
@@ -8752,14 +8757,15 @@ class jaf_compiler ctx debug_info =
                     true
                 | _ -> false)
           in
+          let release () =
+            if not v12_lambda_last_stmt then
+              self#cleanup_condition_dummyrefs vars_before_expr
+          in
           if cleanup_after_pop then (
             self#compile_expr_and_pop e;
-            self#cleanup_condition_dummyrefs vars_before_expr)
+            release ())
           else if Ain.version ctx.ain > 8 then
-            self#compile_expr_and_pop
-              ~before_pop:(fun () ->
-                self#cleanup_condition_dummyrefs vars_before_expr)
-              e
+            self#compile_expr_and_pop ~before_pop:release e
           else self#compile_expr_and_pop e
       | Compound stmts -> self#compile_block stmts
       | Label name ->
@@ -10124,7 +10130,17 @@ class jaf_compiler ctx debug_info =
                            Hashtbl.set v12_skip_iface_init ~key:i ~data:()
                        | _ -> ())
                | _ -> ());
-            self#compile_statement stmt;
+            let lambda_last =
+              top_level && List.is_empty rest
+              && Ain.version_gte ctx.ain (12, 0)
+              && Option.value_map current_function ~default:false
+                   ~f:(fun f -> f.is_lambda)
+            in
+            let prev_last = v12_lambda_last_stmt in
+            if lambda_last then v12_lambda_last_stmt <- true;
+            Exn.protect
+              ~f:(fun () -> self#compile_statement stmt)
+              ~finally:(fun () -> v12_lambda_last_stmt <- prev_last);
             if Ain.version_gte ctx.ain (12, 0) then
               self#emit_v12_last_use_cleanup stmt rest;
             ignore top_level;
