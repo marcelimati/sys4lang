@@ -3254,3 +3254,142 @@ let%expect_test "v11 keeps readonly as an ordinary identifier" =
     056: FUNC NULL
     062: EOF
     |}]
+
+let%expect_test "v12 condition-scoped declaration is allocated after the temps and released on both arms" =
+  compile_test ~ain_version:12
+    {|
+      interface I { int Get(); };
+      class C implements I {
+      public:
+        int Get() { return 1; }
+        ref C Self() { return this; }
+      };
+      int f(ref C c)
+      {
+        if ((I p = I(c.Self())) != NULL) {
+          return p.Get();
+        }
+        return 0;
+      }
+    |};
+  [%expect {|
+    000: EOF 0
+    006: EOF 1
+    012: EOF 2
+    018: EOF 3
+    024: EOF 4
+    030: FUNC C@Get
+    036: PUSH 1
+    042: RETURN
+    044: PUSH 0
+    050: RETURN
+    052: FUNC C@Self
+    058: PUSHSTRUCTPAGE
+    060: DUP
+    062: SP_INC
+    064: RETURN
+    066: PUSH -1
+    072: RETURN
+    074: FUNC f
+    080: PUSHLOCALPAGE
+    082: PUSH 0
+    088: REF
+    090: PUSH 3
+    096: CALLMETHOD NULL
+    102: PUSHLOCALPAGE
+    104: PUSH 1
+    110: REF
+    112: DELETE
+    114: PUSHLOCALPAGE
+    116: SWAP
+    118: PUSH 1
+    124: SWAP
+    126: ASSIGN
+    128: X_ICAST struct(0)
+    134: POP
+    136: PUSHLOCALPAGE
+    138: DUP_X2
+    140: POP
+    142: PUSH 2
+    148: DUP_X2
+    150: POP
+    152: R_ASSIGN
+    154: POP
+    156: DUP
+    158: SP_INC
+    160: PUSH -1
+    166: NOTE
+    168: PUSHLOCALPAGE
+    170: PUSH 1
+    176: DUP2
+    178: REF
+    180: DELETE
+    182: PUSH -1
+    188: ASSIGN
+    190: POP
+    192: IFNZ 252
+    198: PUSHLOCALPAGE
+    200: PUSH 2
+    206: DUP2
+    208: REF
+    210: DELETE
+    212: PUSH -1
+    218: ASSIGN
+    220: POP
+    222: PUSHLOCALPAGE
+    224: PUSH 1
+    230: DUP2
+    232: REF
+    234: DELETE
+    236: PUSH -1
+    242: ASSIGN
+    244: POP
+    246: JUMP 340
+    252: PUSHLOCALPAGE
+    254: PUSH 2
+    260: REFREF
+    262: DUP_U2
+    264: PUSH 0
+    270: REF
+    272: SWAP
+    274: PUSH 0
+    280: ADD
+    282: REF
+    284: CALLMETHOD NULL
+    290: RETURN
+    292: PUSHLOCALPAGE
+    294: PUSH 2
+    300: DUP2
+    302: REF
+    304: DELETE
+    306: PUSH -1
+    312: ASSIGN
+    314: POP
+    316: PUSHLOCALPAGE
+    318: PUSH 1
+    324: DUP2
+    326: REF
+    328: DELETE
+    330: PUSH -1
+    336: ASSIGN
+    338: POP
+    340: PUSHLOCALPAGE
+    342: PUSH 2
+    348: DUP2
+    350: REF
+    352: DELETE
+    354: PUSH -1
+    360: ASSIGN
+    362: POP
+    364: PUSH 0
+    370: RETURN
+    372: PUSH 0
+    378: RETURN
+    380: ENDFUNC f
+    386: EOF test.jaf
+    392: FUNC C@0
+    398: RETURN
+    400: ENDFUNC C@0
+    406: FUNC NULL
+    412: EOF
+    |}]
