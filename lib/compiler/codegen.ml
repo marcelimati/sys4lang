@@ -159,6 +159,15 @@ class jaf_compiler ctx debug_info =
        marker: fall back to the operand-kind heuristic). *)
     val mutable v12_not_peel : bool option = None
 
+    (* v12 foreach header: the original lowers [container = call(), i = -1]
+       as one comma expression, so the container call's temps are
+       released just before the counter assignment's POP. The container
+       init stashes its scope mark here; the counter init consumes it
+       (long-form ASSIGN; release; POP instead of the LOCALASSIGN
+       shorthand). *)
+    val mutable v12_pending_foreach_release : int option = None
+    val mutable v12_suppress_localassign : bool = false
+
     val v12_readonly_variant_cache : (int, int) Hashtbl.t =
       Hashtbl.create (module Int)
 
@@ -7797,6 +7806,7 @@ class jaf_compiler ctx debug_info =
             { node = Ident (_, LocalVariable (i, _)); _ },
             { node = ConstInt n; _ } )
         when ctx.version > 100 && ctx.version < 630
+             && (not v12_suppress_localassign)
              && not (Ain.Type.is_ref (self#get_local i).value_type) ->
           self#write_instruction2 SH_LOCALASSIGN i n
       | Unary
@@ -9307,14 +9317,38 @@ class jaf_compiler ctx debug_info =
                    [DeletePage Page=N] crash (confirmed via Ghidra:
                    the page-table flag at offset +4 must equal 1). *)
                 let vb = vars_before () in
-                self#write_instruction0 PUSHLOCALPAGE;
-                self#write_instruction1 PUSH v.index;
-                if not decl.is_private then
-                  self#compile_delete_ref decl.type_spec.ty;
-                self#compile_lvalue e;
-                self#write_instruction0 ASSIGN;
-                self#write_instruction0 SP_INC;
-                self#cleanup_condition_dummyrefs vb
+                let foreach_call_container =
+                  Ain.version_gte ctx.ain (12, 0) && decl.is_private
+                  && String.is_prefix decl.name ~prefix:"<foreach_container_"
+                  && (match e.node with
+                     | DummyRef (_, { node = Call _; _ }) -> true
+                     | _ -> false)
+                in
+                if foreach_call_container then (
+                  (* rhs first, then the STACK_LOCALASSIGN store
+                     (release the slot's old value, swap-store);
+                     temps stay pending *)
+                  self#compile_lvalue e;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH v.index;
+                  self#write_instruction0 REF;
+                  self#write_instruction0 DELETE;
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction1 PUSH v.index;
+                  self#write_instruction0 SWAP;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 SP_INC;
+                  v12_pending_foreach_release <- Some vb)
+                else (
+                  self#write_instruction0 PUSHLOCALPAGE;
+                  self#write_instruction1 PUSH v.index;
+                  if not decl.is_private then
+                    self#compile_delete_ref decl.type_spec.ty;
+                  self#compile_lvalue e;
+                  self#write_instruction0 ASSIGN;
+                  self#write_instruction0 SP_INC;
+                  self#cleanup_condition_dummyrefs vb)
             | Some e
               when is_ref_scalar (ain_to_jaf_type ctx.ain v.value_type)
                    && (match e.node with DummyRef _ -> false | _ -> true) ->
@@ -9446,15 +9480,33 @@ class jaf_compiler ctx debug_info =
               | Some scope -> List.length scope.vars
               | None -> 0
             in
-            self#compile_expr_and_pop
-              ~before_pop:(fun () ->
-                if Ain.version ctx.ain > 8 then
-                    self#cleanup_condition_dummyrefs vars_before)
-                {
-                  node = Assign (EqAssign, lhs, rhs);
-                  ty = rhs.ty;
-                  loc = decl.location;
-                }
+            let pending_foreach =
+              match v12_pending_foreach_release with
+              | Some vb ->
+                  (* the counter init right after a foreach container init
+                     (named or synthetic index variable) *)
+                  v12_pending_foreach_release <- None;
+                  Some vb
+              | _ -> None
+            in
+            let release_from =
+              Option.value pending_foreach ~default:vars_before
+            in
+            let prev_suppress = v12_suppress_localassign in
+            if Option.is_some pending_foreach then
+              v12_suppress_localassign <- true;
+            Exn.protect
+              ~f:(fun () ->
+                self#compile_expr_and_pop
+                  ~before_pop:(fun () ->
+                    if Ain.version ctx.ain > 8 then
+                      self#cleanup_condition_dummyrefs release_from)
+                  {
+                    node = Assign (EqAssign, lhs, rhs);
+                    ty = rhs.ty;
+                    loc = decl.location;
+                  })
+              ~finally:(fun () -> v12_suppress_localassign <- prev_suppress)
         | Struct sno -> (
             (* FIXME: use verbose versions *)
             let v12 = Ain.version_gte ctx.ain (12, 0) in
