@@ -159,6 +159,10 @@ class jaf_compiler ctx debug_info =
        marker: fall back to the operand-kind heuristic). *)
     val mutable v12_not_peel : bool option = None
 
+    (* Per-file marker: [if (c) return;] compiled as the short skip
+       form (IFZ end; RETURN; end:). *)
+    val mutable v12_if_ret_short : bool = false
+
     (* v12 foreach header: the original lowers [container = call(), i = -1]
        as one comma expression, so the container call's temps are
        released just before the counter assignment's POP. The container
@@ -8764,6 +8768,24 @@ class jaf_compiler ctx debug_info =
              both the taken and not-taken branch see them cleaned up. *)
           self#cleanup_condition_dummyrefs vars_before;
           self#maybe_emit_condition_itob test;
+          let bare_return_body =
+            match con.node with
+            | Return None | Compound [ { node = Return None; _ } ] -> true
+            | _ -> false
+          in
+          if
+            Ain.version_gte ctx.ain (12, 0)
+            && v12_if_ret_short && bare_return_body && empty_statement alt
+            && List.is_empty last_condition_deleted_dummies
+          then (
+            (* Short form ([cond; IFZ end; RETURN; end:]) - a per-file
+               compiler-build style, see FileStyle. *)
+            let skip_op = if peeled_lognot then IFNZ else IFZ in
+            let skip_addr = current_address + 2 in
+            self#write_instruction1 skip_op 0;
+            self#compile_statement con;
+            self#write_address_at skip_addr current_address)
+          else
           if Ain.version_gte ctx.ain (12, 0) then (
             (* Capture the per-if cleanup slot list now; nested ifs in con
                will clobber [last_condition_deleted_dummies]. *)
@@ -10749,6 +10771,9 @@ class jaf_compiler ctx debug_info =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
       v12_not_peel <- Hashtbl.find LexerState.file_not_peel jaf_name;
+      v12_if_ret_short <-
+        Option.value (Hashtbl.find LexerState.file_if_ret_short jaf_name)
+          ~default:false;
       let compile_decl = function
         | Jaf.Function f
           when Ain.version_gte ctx.ain (12, 0)

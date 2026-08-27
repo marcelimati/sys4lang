@@ -23,6 +23,17 @@ let readonly_keyword = ref true
    FileStyle in the decompiler. Keyed by the source path used in the
    project file. *)
 let file_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+let file_if_ret_short : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
+let detect_if_ret_short (source : string) =
+  let head = String.prefix source 200 in
+  match String.substr_index head ~pattern:"if-ret-short=" with
+  | None -> None
+  | Some i ->
+      let rest = String.drop_prefix head (i + String.length "if-ret-short=") in
+      if String.is_prefix rest ~prefix:"1" then Some true
+      else if String.is_prefix rest ~prefix:"0" then Some false
+      else None
 
 let detect_not_peel (source : string) =
   let head = String.prefix source 200 in
@@ -34,7 +45,10 @@ let detect_not_peel (source : string) =
       else if String.is_prefix rest ~prefix:"keep" then Some false
       else None
 
-let clear () = Hashtbl.clear templated; Hashtbl.clear file_not_peel
+let clear () =
+  Hashtbl.clear templated;
+  Hashtbl.clear file_not_peel;
+  Hashtbl.clear file_if_ret_short
 
 (* Pre-scan a source string to register any identifier immediately followed
    by `<` (no whitespace between) as templated. The decompiler emits
