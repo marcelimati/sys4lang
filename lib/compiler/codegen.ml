@@ -1911,6 +1911,55 @@ class jaf_compiler ctx debug_info =
                      [(-1, -1)] fat-null pair. Trailing fat-null
                      normalization collapses [(page, -1)] to a single
                      [-1] for callers expecting a single page-ref. *)
+                  let rec call_result_receiver (x : expression) =
+                    match x.node with
+                    | DummyRef _ | Call _ -> true
+                    | Cast (_, i) | RvalueRef i -> call_result_receiver i
+                    | _ -> false
+                  in
+                  if
+                    Ain.version_gte ctx.ain (12, 0)
+                    && List.is_empty args
+                    && call_result_receiver obj
+                  then (
+                    (* v12 [call()?.Getter] stored into a dummy: the
+                       original defers the call behind a (page, 0, 0) /
+                       (-1, -1, -1) marker triple — the getter runs (and
+                       the dummy store happens) only on the live path;
+                       the null path yields a single -1. *)
+                    self#compile_lvalue obj;
+                    self#write_instruction0 DUP;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 EQUALE;
+                    let null_addr = current_address + 2 in
+                    self#write_instruction1 IFNZ 0;
+                    self#write_instruction1 PUSH 0;
+                    self#write_instruction1 PUSH 0;
+                    let merge_addr = current_address + 2 in
+                    self#write_instruction1 JUMP 0;
+                    self#write_address_at null_addr current_address;
+                    self#write_instruction0 POP;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction1 PUSH (-1);
+                    self#write_address_at merge_addr current_address;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_instruction0 EQUALE;
+                    let null2_addr = current_address + 2 in
+                    self#write_instruction1 IFNZ 0;
+                    self#write_instruction0 POP;
+                    self#compile_method_call_for_receiver
+                      ~prefer_first_duplicate:true ~receiver:obj obj.ty args
+                      method_no;
+                    emit_checkudo_assign ();
+                    let end_addr = current_address + 2 in
+                    self#write_instruction1 JUMP 0;
+                    self#write_address_at null2_addr current_address;
+                    self#write_instruction0 POP;
+                    self#write_instruction0 POP;
+                    self#write_instruction1 PUSH (-1);
+                    self#write_address_at end_addr current_address)
+                  else (
                   self#compile_lvalue obj;
                   self#write_instruction0 DUP;
                   self#write_instruction1 PUSH (-1);
@@ -1949,7 +1998,7 @@ class jaf_compiler ctx debug_info =
                   self#write_address_at ifnz3_addr current_address;
                   self#write_instruction0 POP;
                   self#write_instruction1 PUSH (-1);
-                  self#write_address_at jump_norm_end current_address
+                  self#write_address_at jump_norm_end current_address)
               | _ ->
                   self#compile_expression ref_expr;
                   emit_checkudo_assign ())
