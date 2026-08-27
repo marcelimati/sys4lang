@@ -1753,7 +1753,14 @@ class jaf_compiler ctx debug_info =
                   self#emit_array_literal_element elem;
                   self#compile_CALLHLL "Array" "PushBack" elem_ty
                     (ASTExpression ref_expr));
-              self#write_instruction0 A_REF
+              (* v12: the populated literal is pushed bare; only a
+                 by-value array parameter consumer bumps it (orig:
+                 CASTask@JoinImp(array<ref CASTask>) gets [A_REF],
+                 while [ref array] params (EraseSuffix), foreach
+                 containers and [return {...}] tails are bare).
+                 [compile_argument] adds the bump for that consumer. *)
+              if Ain.version_lt ctx.ain (12, 0) then
+                self#write_instruction0 A_REF
           | { node =
                 NullCoalesce
                   (({ node = Call _; _ } as option_call), { node = Null; _ });
@@ -2321,10 +2328,17 @@ class jaf_compiler ctx debug_info =
                 in
                 walk expr
               in
+              let by_value_array_literal =
+                Ain.version_gte ctx.ain (12, 0)
+                &&
+                match (t, expr.node) with
+                | Array _, DummyRef (_, { node = ArrayLiteral _; _ }) -> true
+                | _ -> false
+              in
               if
                 (self#needs_a_ref_for_consume expr
                 && not in_ref_elem_hll_store_arg)
-                || v11_dummy_call_returns_ref
+                || v11_dummy_call_returns_ref || by_value_array_literal
               then self#write_instruction0 A_REF
           | IFace _ when Ain.version_gte ctx.ain (12, 0) ->
               (* v12 interface arg: callee declares 2 slots (IFace +
@@ -9287,7 +9301,12 @@ class jaf_compiler ctx debug_info =
                   match e.node with
                   | DummyRef (_, inner) -> (
                       match inner.node with
-                      | New _ | NewCall _ ->
+                      | New _ | NewCall _ | ArrayLiteral _ ->
+                          (* v12 [return {...}] by value: the literal
+                             is populated bare, so the owning bump
+                             lands here (orig BadCondition::
+                             GetSkillEffects: [PushBack; A_REF;
+                             RETURN]). *)
                           Ain.version_gte ctx.ain (12, 0)
                       | Call _ -> (
                           match self#ain_call_return_type inner with
