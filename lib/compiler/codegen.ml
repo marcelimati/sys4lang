@@ -8807,6 +8807,22 @@ class jaf_compiler ctx debug_info =
              self#write_instruction0 POP;
              self#write_instruction0 SP_INC);
           before_pop ()
+      | NullCoalesce
+          ( { node = Call ({ node = Member _; _ }, [ _ ], MethodCall (_, m)); _ },
+            _ )
+        when Ain.version_gte ctx.ain (12, 0)
+             && String.is_suffix (Ain.get_function_by_index ctx.ain m).name
+                  ~suffix:"::set" ->
+          (* v12 [recv?.chain.Prop = v] at statement level: the deferred
+             optional-setter layouts keep the assigned value on both
+             arms (DUP_X2 under the setter call / the fallback on the
+             null arm), so the statement always drops exactly one slot
+             even though the setter itself is void (orig
+             CElementData@SetEvent lambdas end [.LOCALREF flag; end:
+             POP; RETURN]). *)
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP
       | _ ->
           self#compile_expression expr;
           before_pop ();
