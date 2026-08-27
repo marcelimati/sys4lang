@@ -514,14 +514,26 @@ class variable_alloc_visitor ctx =
           if expr_ty_ref || ain_returns_ref then (
             let call_key = expr_to_string expr in
             let varname =
+              (* v12 names a call-result dummy [<dummy : Calleeの戻り値>]
+                 (return value of); HLL calls stay bare ([<dummy : At>]),
+                 delegate / functype calls use the type's name
+                 ([<dummy : DG_Func<ref ITextParts, ...>の戻り値>]). *)
+              let ret_suffix = if v12 then "の戻り値" else "" in
+              let callee_ty_name default =
+                match expr.node with
+                | Call ({ ty = Delegate (Some (n, _)) | FuncType (Some (n, _)); _ }, _, _)
+                  when v12 ->
+                    n ^ ret_suffix
+                | _ -> default
+              in
               match calltype with
               | FunctionCall fno | MethodCall (_, fno) ->
-                  (Ain.get_function_by_index ctx.ain fno).name
+                  (Ain.get_function_by_index ctx.ain fno).name ^ ret_suffix
               | HLLCall (lib_no, fun_no) ->
                   let lib = Ain.get_library_by_index ctx.ain lib_no in
                   lib.functions.(fun_no).name
-              | DelegateCall _ -> "<delegate>"
-              | FuncTypeCall _ -> "<functype>"
+              | DelegateCall _ -> callee_ty_name "<delegate>"
+              | FuncTypeCall _ -> callee_ty_name "<functype>"
               | _ ->
                   compiler_bug "variable_alloc_visitor: unexpected call type"
                     (Some (ASTExpression expr))
