@@ -10133,6 +10133,7 @@ class jaf_compiler ctx debug_info =
             let lambda_last =
               top_level && List.is_empty rest
               && Ain.version_gte ctx.ain (12, 0)
+              && (match stmt.node with Expression _ -> true | _ -> false)
               && Option.value_map current_function ~default:false
                    ~f:(fun f -> f.is_lambda)
             in
