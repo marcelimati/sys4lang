@@ -835,6 +835,50 @@ let generate_var_decls (func : Ain.Function.t) bbs =
         true)
       else false
     in
+    (* v12: a local whose FIRST reference is an assignment nested inside a
+       branch condition ([if ((p = IVScrollbarParts(..)) != NULL)]) was
+       declared in that condition by the original source: its slot sits
+       above the condition's call temps and its release rides the branch
+       cleanup on both arms. The first such [.LOCALDELETE] (blockEval
+       lifts every one to a [VarDecl]) is a release, not the declaration
+       - it used to land INSIDE the false arm, flipping the if's
+       polarity and leaving the condition's assignment undeclared
+       (105 Rance10 sites, CAEPropertyVScrollBar@UpdateScrollPos).
+       Declare the local right before the condition instead. *)
+    let cond_decls : (int * Ain.Variable.t) list ref = ref [] in
+    (if Ain.ain.vers >= 12 then
+       let seen = ref [] in
+       let mark v =
+         if not (Stdlib.List.memq v !seen) then seen := v :: !seen
+       in
+       let sorted =
+         List.sort bbs ~compare:(fun a b -> Int.compare a.addr b.addr)
+       in
+       List.iter sorted ~f:(fun bb ->
+           let terminator, stmts = bb.code in
+           List.iter stmts ~f:(fun st ->
+               Ast.walk st
+                 ~stmt_cb:(function VarDecl (v, _) -> mark v | _ -> ())
+                 ~lvalue_cb:(function Var (LocalPage, v) -> mark v | _ -> ()));
+           match terminator.txt with
+           | Branch (_, e) | Switch0 (_, e) ->
+               let fresh = ref [] in
+               Ast.walk_expr e
+                 ~expr_cb:(function
+                   | AssignOp (_, Var (LocalPage, v), _)
+                     when (not (Stdlib.List.memq v !seen))
+                          && (not (Ain.Variable.is_dummy v))
+                          && Stdlib.List.memq v !uninitialized_vars ->
+                       if not (Stdlib.List.memq v !fresh) then
+                         fresh := v :: !fresh
+                   | _ -> ())
+                 ~lvalue_cb:(fun _ -> ());
+               List.iter (List.rev !fresh) ~f:(fun v ->
+                   cond_decls := (bb.addr, v) :: !cond_decls);
+               Ast.walk_expr e
+                 ~lvalue_cb:(function Var (LocalPage, v) -> mark v | _ -> ())
+           | _ -> ()));
+    List.iter !cond_decls ~f:(fun (_, v) -> mark_use v);
     let replace_stmt = function
       | VarDecl (var, None) as stmt ->
           (* v12: a .LOCALDELETE of an already-declared local (lifted to
@@ -882,7 +926,15 @@ let generate_var_decls (func : Ain.Function.t) bbs =
               Option.map (replace_stmt stmt.txt) ~f:(fun txt ->
                   { stmt with txt }))
         in
-        { bb with code = (terminator, stmts') })
+        let decls =
+          List.filter_map (List.rev !cond_decls) ~f:(fun (a, v) ->
+              if a = bb.addr then
+                Some { txt = VarDecl (v, None); addr = bb.addr; end_addr = bb.addr }
+              else None)
+        in
+        (* [stmts] is stored newest-first: prepending puts the
+           declaration last in source order, right before the branch. *)
+        { bb with code = (terminator, decls @ stmts') })
     |> fun bbs ->
     (* Locals still in [uninitialized_vars] after the pass above are
        referenced in the body without any of the patterns that promote
