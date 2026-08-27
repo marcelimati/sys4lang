@@ -6089,6 +6089,77 @@ class jaf_compiler ctx debug_info =
             | _ -> false
           in
           match a_inner.node with
+          | Call
+              ( { node =
+                    Member
+                      ( ({ node = OptionalMember (recv, _, ClassVariable fidx); _ }
+                         as field_expr),
+                        _,
+                        ClassMethod (_, getter_no) );
+                  _;
+                },
+                [],
+                MethodCall _ )
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (is_variable_ref recv.node
+                    || match recv.node with This -> true | _ -> false)
+                 && (match (Ain.get_function_by_index ctx.ain getter_no).name with
+                    | n -> String.is_suffix n ~suffix:"::get") ->
+              (* v12 [recv?.field.Getter ?? fallback] — a struct FIELD hop
+                 inside the optional, a zero-arg getter after it. The
+                 original keeps the receiver as a (page, index) pair
+                 across the null test, defers the field VALUE as
+                 (field page, 0, 0) / (-1, -1, -1), and only calls the
+                 getter on the live path:
+                   PUSHxPAGE; PUSH i; DUP2; REF; PUSH -1; EQUALE; IFNZ null
+                   REF; PUSH fidx; REF; PUSH 0; PUSH 0; JUMP merge
+                   null: POP; POP; PUSH -1; PUSH -1; PUSH -1
+                   merge: PUSH -1; EQUALE; IFZ live; POP; POP; fallback; JUMP end
+                   live: POP; PUSH getter; CALLMETHOD 0
+                   end: *)
+              (match recv.node with
+              | This -> self#write_instruction0 PUSHSTRUCTPAGE
+              | _ ->
+                  self#compile_variable_ref recv;
+                  self#write_instruction0 DUP2;
+                  self#write_instruction0 REF);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              (match recv.node with This -> () | _ -> self#write_instruction0 REF);
+              self#write_instruction1 PUSH fidx;
+              self#write_instruction0 REF;
+              self#write_instruction1 PUSH 0;
+              self#write_instruction1 PUSH 0;
+              let merge_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at null_addr current_address;
+              (match recv.node with This -> () | _ -> self#write_instruction0 POP);
+              self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_addr current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let live_addr = current_address + 2 in
+              self#write_instruction1 IFZ 0;
+              self#write_instruction0 POP;
+              self#write_instruction0 POP;
+              self#compile_expression b;
+              let end_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at live_addr current_address;
+              self#write_instruction0 POP;
+              let getter_no =
+                if self#v12_expr_is_readonly field_expr then
+                  self#v12_readonly_variant getter_no
+                else getter_no
+              in
+              self#write_instruction1 PUSH getter_no;
+              self#write_instruction1 CALLMETHOD 0;
+              self#write_address_at end_addr current_address
           | Binary (((Equal | NEqual) as cmp_op), cmp_lhs, cmp_rhs)
             when Ain.version_gte ctx.ain (12, 0)
                  && (let rec strip (e : expression) =
