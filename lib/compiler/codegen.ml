@@ -7270,12 +7270,25 @@ class jaf_compiler ctx debug_info =
                   self#compile_expression b;
                   self#write_address_at end_addr current_address
               | None ->
-              self#compile_lvalue obj;
-              self#write_instruction0 DUP;
+              (* A variable receiver stays a (page, index) pair across
+                 the null test and is re-REF'd on the live path (orig:
+                 [PUSHxPAGE; PUSH i; DUP2; REF; PUSH -1; EQUALE; IFNZ;
+                 REF]); the null path then pops both slots. *)
+              let obj_is_variable =
+                Ain.version_gte ctx.ain (12, 0) && is_variable_ref obj.node
+              in
+              if obj_is_variable then (
+                self#compile_variable_ref obj;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF)
+              else (
+                self#compile_lvalue obj;
+                self#write_instruction0 DUP);
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 EQUALE;
               let ifnz_addr = current_address + 2 in
               self#write_instruction1 IFNZ 0;
+              if obj_is_variable then self#write_instruction0 REF;
               (* non-null: call the inner getter (e.g. Status::get) on
                  [obj], store the result in [dummy_idx] via the
                  standard [SWAP; ASSIGN] dance, then push the (0, 0)
@@ -7297,6 +7310,7 @@ class jaf_compiler ctx debug_info =
               self#write_address_at ifnz_addr current_address;
               (* null branch: drop the dup'd [obj], push the
                  (-1, -1, -1) null-marker triple. *)
+              if obj_is_variable then self#write_instruction0 POP;
               self#write_instruction0 POP;
               self#write_instruction1 PUSH (-1);
               self#write_instruction1 PUSH (-1);
