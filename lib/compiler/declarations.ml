@@ -1039,10 +1039,22 @@ class type_declare_visitor ctx =
              pre-v12 keeps sequential [<lambda : N>] for byte-stability. *)
           let rec name_of_ty (t : jaf_type) =
             match t with
+            | Unresolved s when Hashtbl.mem ctx.interface_names s -> "ref " ^ s
             | Unresolved s -> s
+            | Ref (Struct (s, _) | Unresolved s)
+              when Hashtbl.mem ctx.interface_names s ->
+                "ref " ^ s
             | Ref t -> "ref " ^ name_of_ty t
             | Array t -> "array<" ^ name_of_ty t ^ ">"
             | Wrap t -> "wrap<" ^ name_of_ty t ^ ">"
+            | Struct (s, _) when Hashtbl.mem ctx.interface_names s ->
+                (* Interface-typed parameters are stored plain in the
+                   ain (no ref bit) but the original spells them
+                   [ref IFace] in lambda names: 348 [ref IActivity]-style
+                   vs 0 plain true-interface params in Rance10; the
+                   plain [IFilter]/[IElement] cases are I-prefixed
+                   classes with members. *)
+                "ref " ^ s
             | Struct (s, _) -> s
             | t -> jaf_type_to_string t
           in
