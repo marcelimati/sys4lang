@@ -334,6 +334,27 @@ let remove_generated_lockpeek stmt =
   in
   map_block stmt ~f:(fun stmts -> reduce [] (List.rev stmts))
 
+(* v12 [T x = call();] for a struct-valued local: the compiler fuses the
+   fresh-struct creation with the store target (the DUP2'd slot pair is
+   REF'd as the SR_ASSIGN destination). It decodes as
+   [T x = new T; x = call();] — fold the pair back into one declaration
+   so the round-trip re-emits the fused form. *)
+let fuse_struct_init stmt =
+  let rec reduce left = function
+    | [] -> left
+    | ({ txt = VarDecl (v, Some (_, New _)); _ } as decl)
+      :: ({ txt = Expression (AssignOp (SR_ASSIGN, Var (LocalPage, v'), e)); _ }
+         as assign)
+      :: right
+      when phys_equal v v' ->
+        reduce
+          ({ decl with txt = VarDecl (v, Some (SR_ASSIGN, e)); end_addr = assign.end_addr }
+          :: left)
+          right
+    | stmt :: right -> reduce (stmt :: left) right
+  in
+  map_block stmt ~f:(fun stmts -> reduce [] (List.rev stmts))
+
 let remove_vardecl_default_rhs stmt =
   map_stmt stmt ~f:(function
     | VarDecl
@@ -648,5 +669,6 @@ let apply_all_transforms stmt =
   |> remove_array_free_for_dead_arrays |> remove_array_free_for_temporary_arrays
   |> remove_generated_lockpeek |> remove_redundant_return
   |> remove_dummy_variable_assignment |> remove_vardecl_default_rhs
+  |> fuse_struct_init
   |> fold_newline_func_to_msg |> remove_optional_arguments
   |> simplify_boolean_expr

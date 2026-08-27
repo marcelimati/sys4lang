@@ -9431,28 +9431,75 @@ class jaf_compiler ctx debug_info =
                 }
         | Struct sno -> (
             (* FIXME: use verbose versions *)
-            if not (Ain.version_gte ctx.ain (12, 0)) then
-              self#write_instruction1 SH_LOCALDELETE v.index;
-            self#write_instruction2 SH_LOCALCREATE v.index sno;
+            let v12 = Ain.version_gte ctx.ain (12, 0) in
+            let value_init =
+              match decl.initval with
+              | Some { node = New { ty = Struct (_, init_sno); _ }; _ }
+              | Some { node = NewCall ({ ty = Struct (_, init_sno); _ }, []); _ }
+                when v12 && Int.equal init_sno sno ->
+                  false
+              | Some _ -> v12
+              | None -> false
+            in
+            if not v12 then self#write_instruction1 SH_LOCALDELETE v.index;
+            if value_init then (
+              (* v12 [T x = expr;]: the original fuses the create and the
+                 store target — the DUP2'd slot pair is left on the stack
+                 and REF'd as the SR_ASSIGN destination instead of a
+                 separate local ref. *)
+              self#write_instruction0 PUSHLOCALPAGE;
+              self#write_instruction1 PUSH v.index;
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF;
+              self#write_instruction0 DELETE;
+              self#write_instruction0 DUP2;
+              self#write_instruction2 NEW sno (-1);
+              self#write_instruction0 ASSIGN;
+              self#write_instruction0 POP;
+              self#write_instruction0 REF)
+            else self#write_instruction2 SH_LOCALCREATE v.index sno;
             match decl.initval with
             | Some { node = New { ty = Struct (_, init_sno); _ }; _ }
-              when Ain.version_gte ctx.ain (12, 0) && Int.equal init_sno sno ->
+              when v12 && Int.equal init_sno sno ->
                 ()
             | Some { node = NewCall ({ ty = Struct (_, init_sno); _ }, []); _ }
-              when Ain.version_gte ctx.ain (12, 0) && Int.equal init_sno sno ->
+              when v12 && Int.equal init_sno sno ->
                 ()
             | Some e ->
-                self#compile_lvalue
-                  {
-                    node =
-                      Ident (decl.name, LocalVariable (v.index, decl.location));
-                    ty = decl.type_spec.ty;
-                    loc = decl.location;
-                  };
+                if not value_init then
+                  self#compile_lvalue
+                    {
+                      node =
+                        Ident (decl.name, LocalVariable (v.index, decl.location));
+                      ty = decl.type_spec.ty;
+                      loc = decl.location;
+                    };
+                let vars_before =
+                  match Stack.top scopes with
+                  | Some scope -> List.length scope.vars
+                  | None -> 0
+                in
                 self#compile_expression e;
                 if Ain.version ctx.ain > 1 && Ain.version ctx.ain <= 8 then
                   self#write_instruction1 PUSH sno;
+                (* Same rhs rules as [x = e;]: a call/new result held in
+                   a dummy is A_REF'd before the struct copy. *)
+                (if value_init then
+                   match e.node with
+                   | DummyRef
+                       ( _,
+                         { node =
+                             ( Call _ | New { ty = Struct _; _ }
+                             | NewCall ({ ty = Struct _; _ }, _) );
+                           _ } )
+                   | New { ty = Struct _; _ } ->
+                       self#write_instruction0 A_REF
+                   | _ -> ());
                 self#write_instruction0 SR_ASSIGN;
+                (* v12 plain assignment order: release the rhs dummies,
+                   then drop the assigned value. *)
+                if value_init then
+                  self#cleanup_condition_dummyrefs vars_before;
                 self#compile_pop decl.type_spec.ty (ASTVariable decl)
             | None -> ())
         | Array _ ->
