@@ -9195,13 +9195,16 @@ class jaf_compiler ctx debug_info =
             | _ -> false
           in
           let inverted_null_test =
+            (* Only the [== null] source sense: the original compiles
+               [if (x != null) return ..] in the long NOTE form
+               (CompletedTrophy@GetNewCompleted lambda: [X_ICAST; POP;
+               POP; PUSH -1; NOTE; IFNZ then; JUMP end; then: PUSH 0;
+               RETURN; end:]). *)
             match test.node with
-            | Binary ((Equal | NEqual as op), a, ({ node = Null; _ } as b)) ->
-                let op = match op with Equal -> NEqual | NEqual -> Equal | _ -> op in
-                Some { test with node = Binary (op, a, b) }
-            | Binary ((Equal | NEqual as op), ({ node = Null; _ } as a), b) ->
-                let op = match op with Equal -> NEqual | NEqual -> Equal | _ -> op in
-                Some { test with node = Binary (op, a, b) }
+            | Binary (Equal, a, ({ node = Null; _ } as b)) ->
+                Some { test with node = Binary (NEqual, a, b) }
+            | Binary (Equal, ({ node = Null; _ } as a), b) ->
+                Some { test with node = Binary (NEqual, a, b) }
             | _ -> None
           in
           if
