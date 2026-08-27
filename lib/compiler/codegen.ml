@@ -4309,7 +4309,19 @@ class jaf_compiler ctx debug_info =
           if not emitted_v12_ref_struct_direct_assign then (
           if lhs_is_v12_iface then self#compile_variable_ref lhs
           else self#compile_lvalue lhs;
-          self#compile_expression rhs;
+          (* v12 [arr = other_arr;] (X_SET) with a bare variable rhs:
+             the original reads the source array without the rvalue
+             A_REF bump — X_SET copies. Call/new rhs keep the bump. *)
+          let bare_array_var_rhs =
+            Ain.version_gte ctx.ain (12, 0)
+            && (match op with EqAssign -> true | _ -> false)
+            && (match lhs.ty with Array _ | Ref (Array _) -> true | _ -> false)
+            && self#v12_is_auto_setter_backing_store lhs rhs
+          in
+          if bare_array_var_rhs then (
+            self#compile_variable_ref rhs;
+            self#write_instruction0 REF)
+          else self#compile_expression rhs;
           match (op, rhs.ty) with
           | EqAssign, NullType when lhs_is_v12_iface ->
               self#write_instruction1 PUSH 0;
@@ -7551,9 +7563,33 @@ class jaf_compiler ctx debug_info =
           else false)
       | _ -> false
 
+    (* The generated array-property setter body [this.<Prop> = value]
+       (inside [Class@Prop::set]): the original's stub copies with a
+       bare X_SET; POP — no A_REF on the source, no DELETE. User code
+       assigning an array ([this.m_items = items]) keeps A_REF/DELETE. *)
+    method v12_is_auto_setter_backing_store (lhs : expression) (rhs : expression) =
+      (match current_function with
+       | Some f -> String.is_suffix f.name ~suffix:"::set"
+       | None -> false)
+      && (match lhs.node with
+         | Member ({ node = This; _ }, name, ClassVariable _) ->
+             String.is_prefix name ~prefix:"<" && String.is_suffix name ~suffix:">"
+         | _ -> false)
+      && (match rhs.node with
+         | Ident (_, LocalVariable _) -> true
+         | _ -> false)
+
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
       match expr.node with
+      (* v12 [arr = other_arr;]: X_SET leaves the (borrowed) source ref;
+         the original POPs it rather than DELETE-ing. *)
+      | Assign (EqAssign, ({ ty = Array _ | Ref (Array _); _ } as lhs), rhs)
+        when Ain.version_gte ctx.ain (12, 0)
+             && self#v12_is_auto_setter_backing_store lhs rhs ->
+          self#compile_expression expr;
+          before_pop ();
+          self#write_instruction0 POP
       (* v12 [recv?.DelegateMember += rhs]: the deferred arm consumes
          everything itself (DG_PLUSA; DELETE on the live path, DELETE of
          the built/pushed rhs on the null path) — no statement pop. *)
