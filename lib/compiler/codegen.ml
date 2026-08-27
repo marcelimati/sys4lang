@@ -5131,22 +5131,44 @@ class jaf_compiler ctx debug_info =
                 && Hashtbl.mem ctx.interface_names name
             | _ -> false
           in
+          (* v12 checked DOWNCAST receiver ([(Iface-typed call() as
+             Class)?.Method(..)]): compile_lvalue's Cast arm emits
+             [X_ICAST] which leaves the page under a validator pair, so
+             no DUP; the live path drops the middle slot, the null path
+             both (orig CBrushAction@OnInsertingBrush lambda: [X_ICAST;
+             PUSH -1; EQUALE; IFNZ null; POP; call; PUSH 0; JUMP end;
+             null: POP; POP; PUSH -1]). *)
+          let receiver_is_downcast_from_iface =
+            Ain.version_gte ctx.ain (12, 0)
+            &&
+            match e.node with
+            | Cast ((Struct (dst, _) | Ref (Struct (dst, _))), inner) -> (
+                (not (Hashtbl.mem ctx.interface_names dst))
+                &&
+                match inner.ty with
+                | Struct (src, _) | Ref (Struct (src, _)) ->
+                    Hashtbl.mem ctx.interface_names src
+                | _ -> false)
+            | _ -> false
+          in
           if is_dummyref then (
             self#compile_lvalue e;
-            if not receiver_is_casted_iface then
+            if not (receiver_is_casted_iface || receiver_is_downcast_from_iface)
+            then
               self#write_instruction0
                 (if receiver_is_iface then DUP_U2 else DUP);
             self#write_instruction1 PUSH (-1);
             self#write_instruction0 EQUALE;
             let ifnz_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
+            if receiver_is_downcast_from_iface then self#write_instruction0 POP;
             self#compile_method_call_for_receiver ~prefer_first_duplicate:true
               ~receiver:e e.ty args method_no;
             self#write_instruction1 PUSH 0;
             let jump_addr = current_address + 2 in
             self#write_instruction1 JUMP 0;
             self#write_address_at ifnz_addr current_address;
-            if receiver_is_iface then (
+            if receiver_is_iface || receiver_is_downcast_from_iface then (
               self#write_instruction0 POP;
               self#write_instruction0 POP)
             else self#write_instruction0 POP;
