@@ -543,3 +543,11 @@ let insert_option_spine expr obj =
   in
   let spined = walk expr in
   if !found then spined else insert_option expr obj
+
+(* v12 condition-scoped declarations (basicBlock.generate_var_decls):
+   (function index, variable index) of locals printed as [(T p = expr)]
+   at their first assignment instead of a separate declaration. *)
+let cond_decl_marks : (string, unit) Base.Hashtbl.t =
+  Base.Hashtbl.create (module Base.String)
+
+let cond_decl_key fno vidx = Printf.sprintf "%d:%d" fno vidx

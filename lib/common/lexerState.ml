@@ -45,6 +45,18 @@ let detect_not_peel (source : string) =
       else if String.is_prefix rest ~prefix:"keep" then Some false
       else None
 
+(* v12 condition-scoped declarations: [if ((T p = expr) != NULL)] declares
+   [p] for the if statement only - its slot is allocated after the
+   initializer's call temps and it is released with them on both arms.
+   The parser wraps the statement in a block with a marked declaration;
+   variableAlloc / codegen look the mark up by (file, offset, name). *)
+let cond_scoped : (string, unit) Hashtbl.t = Hashtbl.create (module String)
+
+let cond_key fname pos name = fname ^ "@" ^ Int.to_string pos ^ "@" ^ name
+let mark_cond_scoped fname pos name =
+  Hashtbl.set cond_scoped ~key:(cond_key fname pos name) ~data:()
+let is_cond_scoped fname pos name = Hashtbl.mem cond_scoped (cond_key fname pos name)
+
 let clear () =
   Hashtbl.clear templated;
   Hashtbl.clear file_not_peel;

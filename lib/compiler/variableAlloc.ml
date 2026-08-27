@@ -79,6 +79,12 @@ class variable_alloc_visitor ctx =
       && Option.is_none v.index
       && Option.is_none v.initval
 
+    method private v12_cond_scoped (v : variable) =
+      Ain.version_gte ctx.ain (12, 0)
+      &&
+      let pos = fst v.location in
+      LexerState.is_cond_scoped pos.Lexing.pos_fname pos.Lexing.pos_cnum v.name
+
     method private assignment_to_deferred_iface_local (lhs : expression) =
       match lhs.node with
       | Ident (name, LocalVariable _) -> (
@@ -442,6 +448,17 @@ class variable_alloc_visitor ctx =
       in
       (match expr.node with
       | DummyRef _ -> ()
+      | Assign (EqAssign, ({ node = Ident (name, _); _ } as lhs), rhs)
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match self#env#get_local name with
+                | Some v -> self#v12_cond_scoped v
+                | None -> false) ->
+          (* condition-scoped [(T p = expr)]: p's slot comes AFTER the
+             initializer's temps (orig CAEPropertyVScrollBar@
+             UpdateScrollPos: Parts::get temp at 0, p at 2). The lhs
+             visit allocates it lazily through get_var_no. *)
+          self#visit_expression rhs;
+          self#visit_expression lhs
       | Assign (EqAssign, lhs, rhs)
         when self#assignment_to_deferred_iface_local lhs ->
           (* v12 deferred iface local: allocate LHS slot FIRST so the
@@ -845,7 +862,8 @@ class variable_alloc_visitor ctx =
              before [break]). Matches original Rance10 layout where
              outer-scope iface locals appear in [initial_vars] at
              every nested scope. *)
-          if (not v12) || Option.is_none v.index then (
+          if ((not v12) || Option.is_none v.index) && not (self#v12_cond_scoped v)
+          then (
             (* v11 private locals can re-declare a same-named slot;
                reuse the existing slot rather than allocating a new
                one. *)

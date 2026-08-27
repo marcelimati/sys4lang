@@ -30,6 +30,22 @@ let implicit_void pos = { ty = Void; location = (pos, pos) }
 let stmt loc ast =
   { node=ast; delete_vars=[]; loc }
 
+(* v12 [(T p = expr)] inside a condition: the declaration is hoisted into
+   a block wrapping the statement (see wrap_cond_decls) and marked
+   condition-scoped in LexerState. *)
+let pending_cond_decls : variable list ref = ref []
+
+let wrap_cond_decls loc node =
+  match !pending_cond_decls with
+  | [] -> node
+  | vars ->
+      pending_cond_decls := [];
+      let vars = List.rev vars in
+      let typespec = match vars with v :: _ -> v.type_spec | [] -> assert false in
+      Compound
+        [ stmt loc (Declarations { decl_loc = loc; typespec; is_const_decls = false; vars });
+          stmt loc node ]
+
 type varinit = {
   name: string;
   loc: location;
@@ -182,6 +198,13 @@ primary_expression
   | constant { make_expr ~loc:$sloc $1 }
   | string { make_expr ~loc:$sloc $1 }
   | LPAREN expression RPAREN { {$2 with loc=$sloc} }
+  | LPAREN declaration_specifiers IDENTIFIER ASSIGN assign_expression RPAREN
+    { let v = vardecl LocalVar false $2 { name=$3; dims=[]; initval=None; loc=$loc($3) } in
+      let p = fst $loc($3) in
+      LexerState.mark_cond_scoped p.Lexing.pos_fname p.Lexing.pos_cnum $3;
+      pending_cond_decls := v :: !pending_cond_decls;
+      make_expr ~loc:$sloc
+        (Assign (EqAssign, make_expr ~loc:$loc($3) (Ident ($3, UnresolvedIdent)), $5)) }
   | parameter_list(init_declarator(IDENTIFIER)) FATARROW declaration_specifiers block
     { make_expr ~loc:$sloc (Lambda (func ~is_lambda:true $sloc $3 "<lambda>" $1 (Some $4))) }
   (* v12 array literal: `[e1, e2, ...]`. The empty form `[]` does
@@ -468,15 +491,15 @@ expression_statement
 
 selection_statement
   : IF LPAREN expression RPAREN statement %prec IFX
-    { If ($3, $5, stmt ($endpos, $endpos) EmptyStatement) }
+    { wrap_cond_decls $sloc (If ($3, $5, stmt ($endpos, $endpos) EmptyStatement)) }
   | IF LPAREN expression RPAREN statement ELSE statement
-    { If ($3, $5, $7) }
+    { wrap_cond_decls $sloc (If ($3, $5, $7)) }
   | SWITCH LPAREN expression RPAREN LBRACE statement+ RBRACE
-    { Switch ($3, $6) }
+    { wrap_cond_decls $sloc (Switch ($3, $6)) }
   ;
 
 iteration_statement
-  : WHILE LPAREN expression RPAREN statement { While ($3, $5) }
+  : WHILE LPAREN expression RPAREN statement { wrap_cond_decls $sloc (While ($3, $5)) }
   | DO statement WHILE LPAREN expression RPAREN { DoWhile ($5, $2) }
   | FOR LPAREN expression_statement expression? SEMICOLON expression? RPAREN statement
     { For (stmt $loc($3) $3,

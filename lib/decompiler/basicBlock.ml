@@ -817,6 +817,13 @@ let create (f : CodeSection.function_t) =
   | Some (Struct s), ("0" | "2") -> from_generated_constructor s f
   | _ -> from_instructions f f.code
 
+(* Slot of a local in its function: the position in [func.vars]
+   (the decompiler's Variable.t carries no index). *)
+let slot_of (func : Ain.Function.t) (v : Ain.Variable.t) =
+  match Array.findi func.vars ~f:(fun _ x -> phys_equal x v) with
+  | Some (i, _) -> i
+  | None -> -1
+
 let generate_var_decls (func : Ain.Function.t) bbs =
   if Ain.ain.vers <= 1 then
     (* For ain v0/v1, we declare all locals at the top instead. *)
@@ -863,6 +870,7 @@ let generate_var_decls (func : Ain.Function.t) bbs =
            match terminator.txt with
            | Branch (_, e) | Switch0 (_, e) ->
                let fresh = ref [] in
+               let max_dummy = ref (-1) in
                Ast.walk_expr e
                  ~expr_cb:(function
                    | AssignOp (_, Var (LocalPage, v), _)
@@ -872,9 +880,20 @@ let generate_var_decls (func : Ain.Function.t) bbs =
                        if not (Stdlib.List.memq v !fresh) then
                          fresh := v :: !fresh
                    | _ -> ())
-                 ~lvalue_cb:(fun _ -> ());
+                 ~lvalue_cb:(function
+                   | Var (LocalPage, d) when Ain.Variable.is_dummy d ->
+                       if slot_of func d > !max_dummy then max_dummy := slot_of func d
+                   | _ -> ());
                List.iter (List.rev !fresh) ~f:(fun v ->
-                   cond_decls := (bb.addr, v) :: !cond_decls);
+                   (* Slot above the condition's call temps = declared in
+                      the condition by the original source: print it as
+                      [(T p = expr)] at the assignment (codeGen) instead
+                      of a separate declaration. *)
+                   if !max_dummy >= 0 && slot_of func v > !max_dummy then (
+                     Base.Hashtbl.set Ast.cond_decl_marks
+                       ~key:(Ast.cond_decl_key func.id (slot_of func v)) ~data:();
+                     mark_use v)
+                   else cond_decls := (bb.addr, v) :: !cond_decls);
                Ast.walk_expr e
                  ~lvalue_cb:(function Var (LocalPage, v) -> mark v | _ -> ())
            | _ -> ()));

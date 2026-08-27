@@ -195,6 +195,15 @@ class jaf_compiler ctx debug_info =
        NULL-init prefix for these since the assignment overwrites
        the slot before any read. Populated by [compile_block] before
        processing the Declarations statement. *)
+    (* v12 condition-scoped locals ([(T p = expr)] in a condition, see
+       LexerState.cond_scoped): registered in the scope at their
+       assignment (so the branch cleanup treats them like condition
+       temps), never released before the branch, always replayed on
+       both arms. Per function (saved/restored around nested lambdas
+       like v12_readonly_slots). *)
+    val mutable v12_cond_scoped_slots : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
     val v12_skip_iface_init : (int, unit) Hashtbl.t =
       Hashtbl.create (module Int)
 
@@ -550,7 +559,9 @@ class jaf_compiler ctx debug_info =
                       Int.descending a.index b.index)
                 else filtered
               in
-              List.iter new_vars ~f:self#compile_delete_var;
+              List.iter new_vars ~f:(fun v ->
+                  if not (Hashtbl.mem v12_cond_scoped_slots v.index) then
+                    self#compile_delete_var v);
               let new_idxs = List.map new_vars ~f:(fun v -> v.index) in
               last_condition_deleted_dummies <- new_idxs;
               inline_deleted_dummies <- new_idxs @ inline_deleted_dummies;
@@ -4181,6 +4192,16 @@ class jaf_compiler ctx debug_info =
               compiler_bug "invalid binary expression"
                 (Some (ASTExpression expr)))
       | Assign (op, lhs, rhs) -> (
+          (match lhs.node with
+          | Ident (_, LocalVariable (i, _))
+            when Hashtbl.mem v12_cond_scoped_slots i
+                 && not
+                      (match Stack.top scopes with
+                      | Some scope ->
+                          List.exists scope.vars ~f:(fun v -> Int.equal v.index i)
+                      | None -> false) ->
+              self#scope_add_var (self#get_local i)
+          | _ -> ());
           (* v12 [receiver?.DelegateMember += method] / [-= method].
              The optional-member compound-assign to a delegate member
              is NOT the rvalue-member shape: the original keeps the
@@ -9355,7 +9376,7 @@ class jaf_compiler ctx debug_info =
                  存在しない関数番号 -1 at the intro scene transition. *)
               List.iter saved_last ~f:(fun idx ->
                   match (self#get_local idx).value_type with
-                  | Ain.Type.IFace _ -> ()
+                  | Ain.Type.IFace _ when not (Hashtbl.mem v12_cond_scoped_slots idx) -> ()
                   | _ -> self#write_instruction1 SH_LOCALDELETE idx);
               (match alt.node with
               | EmptyStatement ->
@@ -9911,6 +9932,15 @@ class jaf_compiler ctx debug_info =
         variable. Otherwise a default value is assigned. *)
     method compile_variable_declaration (decl : variable) =
       if decl.is_const then ()
+      else if
+        Ain.version_gte ctx.ain (12, 0)
+        && (let pos = fst decl.location in
+            LexerState.is_cond_scoped pos.Lexing.pos_fname pos.Lexing.pos_cnum
+              decl.name)
+      then
+        (* condition-scoped: no init, no scope registration here - the
+           assignment inside the condition registers it. *)
+        Hashtbl.set v12_cond_scoped_slots ~key:(Option.value_exn decl.index) ~data:()
       else if
         Ain.version ctx.ain <= 1
         && Option.is_none decl.initval
@@ -10654,6 +10684,8 @@ class jaf_compiler ctx debug_info =
       in
       let prev_function = current_function in
       current_function <- Some func;
+      let prev_cond_scoped_slots = v12_cond_scoped_slots in
+      v12_cond_scoped_slots <- Hashtbl.create (module Int);
       let prev_readonly_slots = v12_readonly_slots in
       let prev_this_readonly = v12_this_readonly in
       v12_readonly_slots <- Hashtbl.create (module Int);
@@ -10803,6 +10835,7 @@ class jaf_compiler ctx debug_info =
       Ain.write_function ctx.ain func;
       current_function <- prev_function;
       v12_readonly_slots <- prev_readonly_slots;
+      v12_cond_scoped_slots <- prev_cond_scoped_slots;
       v12_this_readonly <- prev_this_readonly;
       enclosing_functions <- prev_enclosing_functions;
       inline_deleted_dummies <- prev_inline_deleted_dummies;

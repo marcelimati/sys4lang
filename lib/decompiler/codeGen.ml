@@ -230,6 +230,13 @@ let pr_number out = function
   | Number n -> bprintf out "%ld" n
   | _ -> failwith "pr_number: non-number"
 
+(* Slot of a local in its function: the position in [func.vars]
+   (the decompiler's Variable.t carries no index). *)
+let slot_of (func : Ain.Function.t) (v : Ain.Variable.t) =
+  match Array.findi func.vars ~f:(fun _ x -> phys_equal x v) with
+  | Some (i, _) -> i
+  | None -> -1
+
 let pr_array_dims ?(pr_expr = pr_number) out dims =
   List.iter dims ~f:(fun e -> bprintf out "[%a]" pr_expr e)
 
@@ -480,6 +487,23 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
       | BinaryOp (insn, lhs, rhs) ->
           let op = operator insn in
           self#pr_binary_op parent_op prec op lhs rhs
+      | AssignOp (insn, Var (LocalPage, v), rhs)
+        when (match Stack.top current_function with
+             | Some f ->
+                 Base.Hashtbl.mem Ast.cond_decl_marks
+                   (Ast.cond_decl_key f.func.id (slot_of f.func v))
+             | None -> false) ->
+          (* v12 condition-scoped declaration, printed once at its
+             first assignment. *)
+          (match Stack.top current_function with
+          | Some f ->
+              Base.Hashtbl.remove Ast.cond_decl_marks
+                (Ast.cond_decl_key f.func.id (slot_of f.func v))
+          | None -> ());
+          let op = operator insn in
+          bprintf out "(%a = %a)" self#pr_vardecl v
+            (self#pr_expr ~parent_op:op op.rprec)
+            rhs
       | AssignOp (insn, lval, rhs) ->
           let op = operator insn in
           self#pr_binary_op parent_op prec op (Load lval) rhs
