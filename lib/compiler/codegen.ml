@@ -9534,6 +9534,11 @@ class jaf_compiler ctx debug_info =
                         (ASTVariable decl));
                   self#write_instruction0 POP
               | Some e ->
+                  let vars_before_init =
+                    match Stack.top scopes with
+                    | Some scope -> List.length scope.vars
+                    | None -> 0
+                  in
                   self#compile_expression e;
                   (* v12 [array@T x = obj.GetList();] — the rhs is a
                      ref-returning call held in a dummy slot. [X_SET]
@@ -9568,6 +9573,12 @@ class jaf_compiler ctx debug_info =
                             List.filter scope.vars ~f:(fun sv ->
                                 not (Int.equal sv.index var_no))
                       | None -> ());
+                  (* v12 declaration-init: every other temp of the
+                     initializer (receiver dummies of the call chain) is
+                     released before the trailing DELETE as well;
+                     assignment statements keep them for after. *)
+                  if Ain.version_gte ctx.ain (12, 0) then
+                    self#cleanup_condition_dummyrefs vars_before_init;
                   self#write_instruction0 DELETE
               | None ->
                   if has_dims then (
