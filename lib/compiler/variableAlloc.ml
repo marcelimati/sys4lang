@@ -985,7 +985,20 @@ class variable_alloc_visitor ctx =
                 else ain_type
             | _ -> ain_type
           in
-          Ain.Variable.make ~index v.name ain_type
+          (* v12 unnamed lambda parameters are named [<0>], [<1>], ... by
+             the original compiler; sys4dc prints them as [_0], [_1]
+             (the bracket form doesn't lex). Map them back. *)
+          let name =
+            if
+              Ain.version_gte ctx.ain (12, 0) && f.is_lambda
+              && (match v.kind with Parameter -> true | _ -> false)
+              && String.length v.name >= 2
+              && Char.equal v.name.[0] '_'
+              && String.for_all (String.drop_prefix v.name 1) ~f:Char.is_digit
+            then "<" ^ String.drop_prefix v.name 1 ^ ">"
+            else v.name
+          in
+          Ain.Variable.make ~index name ain_type
         in
         let add_vars vars (a_f : Ain.Function.t) =
           { a_f with vars = List.mapi vars ~f:(conv_var vars) }
