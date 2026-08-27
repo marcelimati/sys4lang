@@ -516,6 +516,7 @@ let decompile ~move_to_original_file ~continue_on_error =
   let enums =
     Array.map Ain.ain.enum ~f:(fun name -> CodeGen.{ name; values = [] })
   in
+  if Ain.ain.vers >= 12 then FileStyle.compute files else FileStyle.compute [];
   let globals = ref (to_variable_list Ain.ain.glob) in
   let srcs =
     List.map files ~f:(fun (fname, funcs) ->
@@ -736,6 +737,9 @@ let export ~print_addr decompiled ain_path write_to_file =
   List.iter decompiled.srcs ~f:(fun (fname, funcs) ->
       if not (List.is_empty funcs) then
         generate fname (fun pr ->
+            Option.iter (FileStyle.marker fname) ~f:(fun m ->
+                Buffer.add_string pr#get_buffer (m ^ "
+"));
             List.iter funcs ~f:(fun (func : CodeGen.function_t) ->
                 (match Hashtbl.find event_by_add_id func.func.id with
                 | Some pair -> pr#print_event_def pair

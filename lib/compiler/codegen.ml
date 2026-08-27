@@ -155,6 +155,10 @@ class jaf_compiler ctx debug_info =
        callback, so the lambda's ref parameters are readonly. *)
     val mutable v12_lambda_params_readonly : bool = false
 
+    (* Per-file NOT-peel style from the sys4dc marker (None = no
+       marker: fall back to the operand-kind heuristic). *)
+    val mutable v12_not_peel : bool option = None
+
     val v12_readonly_variant_cache : (int, int) Hashtbl.t =
       Hashtbl.create (module Int)
 
@@ -8532,8 +8536,13 @@ class jaf_compiler ctx debug_info =
              peeled for [!this.IsEnd()] (bool CALLMETHOD, CASTask@IsEndTask). *)
           let test, peeled_lognot =
             if Ain.version_gte ctx.ain (12, 0) then
-              match test.node with
-              | Unary (LogNot, inner) -> (
+              match (test.node, v12_not_peel) with
+              (* File compiled by the NOT-keeping compiler build. *)
+              | _, Some false -> (test, false)
+              (* NOT-peeling build: every negated call is peeled. *)
+              | Unary (LogNot, ({ node = Call _; _ } as inner)), Some true ->
+                  (inner, true)
+              | Unary (LogNot, inner), None -> (
                   match (inner.node, inner.ty) with
                   | Call (_, _, MethodCall _), Bool -> (inner, true)
                   | _ -> (test, false))
@@ -10476,6 +10485,7 @@ class jaf_compiler ctx debug_info =
     method compile jaf_name (decls : declaration list) =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
+      v12_not_peel <- Hashtbl.find LexerState.file_not_peel jaf_name;
       let compile_decl = function
         | Jaf.Function f
           when Ain.version_gte ctx.ain (12, 0)

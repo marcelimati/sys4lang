@@ -57,6 +57,8 @@ let parse_pass ctx sources read_file =
       | (Pje.Jaf f | Pje.Hll (f, _)) as src ->
           let source = read_file f in
           LexerState.scan_source source;
+          Option.iter (LexerState.detect_not_peel source) ~f:(fun peel ->
+              Hashtbl.set LexerState.file_not_peel ~key:f ~data:peel);
           (src, source)
       | _ -> failwith "unreachable")
   in
