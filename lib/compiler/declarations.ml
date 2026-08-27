@@ -2308,6 +2308,12 @@ let write_interface_method_signatures ctx =
 
 let dummy_loc = dummy_location
 
+(* v12: a member array literal initializer stays one [this.X = [..]]
+   assignment (codegen builds it in place: [REF; DUP; Free; (DUP; elem;
+   PushBack)*; POP], orig CActivityEditor@2) instead of the pre-v12
+   [Free(); PushBack(e)...] statement run. Set by the compile driver. *)
+let member_array_literal_as_assign = ref false
+
 let make_member_init_stmts (var : variable) (init : expression) :
     statement list =
   let loc = init.loc in
@@ -2316,7 +2322,7 @@ let make_member_init_stmts (var : variable) (init : expression) :
     { node = Member (this_e, var.name, UnresolvedMember); ty = Untyped; loc }
   in
   match init.node with
-  | ArrayLiteral elems ->
+  | ArrayLiteral elems when not !member_array_literal_as_assign ->
       let free =
         let free_member =
           { node = Member (target, "Free", UnresolvedMember);

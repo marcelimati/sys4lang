@@ -436,6 +436,16 @@ class variable_alloc_visitor ctx =
              at slots 3/5/7/9/11. *)
           self#visit_expression lhs;
           self#visit_expression rhs
+      | Assign (EqAssign, lhs, ({ node = ArrayLiteral _; _ } as rhs))
+        when Ain.version_gte ctx.ain (12, 0) ->
+          (* [x = [..]] built in place by codegen (member initializers):
+             no literal dummy, like the decl-init form. *)
+          self#visit_expression lhs;
+          suppress_array_literal_dummy <- suppress_array_literal_dummy + 1;
+          Exn.protect
+            ~f:(fun () -> self#visit_expression rhs)
+            ~finally:(fun () ->
+              suppress_array_literal_dummy <- suppress_array_literal_dummy - 1)
       | NullCoalesce (lhs, rhs) when Ain.version_gte ctx.ain (12, 0) ->
           let prev = null_coalesce_call_dummy_cache in
           null_coalesce_call_dummy_cache <- Some (Hashtbl.create (module String));

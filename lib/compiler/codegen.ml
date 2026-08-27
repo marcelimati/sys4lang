@@ -8807,6 +8807,27 @@ class jaf_compiler ctx debug_info =
              self#write_instruction0 POP;
              self#write_instruction0 SP_INC);
           before_pop ()
+      | Assign (EqAssign, lhs, { node = ArrayLiteral elems; _ })
+        when Ain.version_gte ctx.ain (12, 0)
+             && is_variable_ref lhs.node
+             && (match lhs.ty with Array _ | Ref (Array _) -> true | _ -> false) ->
+          (* v12 [this.X = [a, b, ..]] (member array literal
+             initializers in Class@2): build the array in place —
+             orig CActivityEditor@2: [.STRUCTREF X; DUP; Free; (DUP;
+             elem; PushBack)*; POP]. *)
+          let arr_ty = match lhs.ty with Ref t -> t | t -> t in
+          let elem_ty = self#array_element_type_code arr_ty in
+          self#compile_variable_ref lhs;
+          self#write_instruction0 REF;
+          self#write_instruction0 DUP;
+          self#compile_CALLHLL "Array" "Free" elem_ty (ASTExpression expr);
+          List.iter elems ~f:(fun elem ->
+              self#write_instruction0 DUP;
+              self#emit_array_literal_element elem;
+              self#compile_CALLHLL "Array" "PushBack" elem_ty
+                (ASTExpression expr));
+          before_pop ();
+          self#write_instruction0 POP
       | NullCoalesce
           ( { node = Call ({ node = Member _; _ }, [ _ ], MethodCall (_, m)); _ },
             _ )
