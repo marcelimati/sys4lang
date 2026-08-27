@@ -6218,15 +6218,21 @@ class jaf_compiler ctx debug_info =
                         ClassMethod (_, getter_no) );
                   _;
                 },
-                [],
+                prop_args,
                 MethodCall _ )
             when Ain.version_gte ctx.ain (12, 0)
                  && (is_variable_ref recv.node
                     || (match recv.node with
                        | This | DummyRef _ | Call _ -> true
+                       | Cast (_, _) -> (
+                           match recv.ty with
+                           | Struct _ | Ref (Struct _) -> true
+                           | _ -> false)
                        | _ -> false))
-                 && (match (Ain.get_function_by_index ctx.ain getter_no).name with
-                    | n -> String.is_suffix n ~suffix:"::get") ->
+                 && (let n = (Ain.get_function_by_index ctx.ain getter_no).name in
+                     (List.is_empty prop_args && String.is_suffix n ~suffix:"::get")
+                     || (List.length prop_args = 1
+                        && String.is_suffix n ~suffix:"::set")) ->
               (* v12 [recv?.field.Getter ?? fallback] — a struct FIELD hop
                  inside the optional, a zero-arg getter after it. The
                  original keeps the receiver as a (page, index) pair
@@ -6242,16 +6248,37 @@ class jaf_compiler ctx debug_info =
               (* root shape: [this] (1 slot), a variable (address pair,
                  re-REF'd live, 2 POPs null) or a call result held in a
                  dummy (value, 1 POP null). *)
-              let root_is_value =
+              (* Root kinds: a value (1 slot: nothing live, 1 POP
+                 null); a variable (address pair: REF live, 2 POPs
+                 null); a checked downcast, where [X_ICAST] leaves the
+                 page under a validator pair (POP live, 2 POPs null) -
+                 orig CElementData@SetEvent's
+                 [(m_element as CBrush)?.field.Value = flag]:
+                 [.STRUCTREF m_element; X_ICAST; PUSH -1; EQUALE; IFNZ
+                 null; POP; PUSH fidx; REF; PUSH 0; PUSH 0; ...; null:
+                 POP; POP; PUSH -1 x3]. *)
+              let root_kind =
                 match recv.node with
-                | This | DummyRef _ | Call _ -> true
-                | _ -> false
+                | This | DummyRef _ | Call _ -> 0
+                | Cast _ -> 1
+                | _ -> 2
               in
               (match recv.node with
               | This -> self#write_instruction0 PUSHSTRUCTPAGE
               | DummyRef _ | Call _ ->
                   self#compile_lvalue recv;
                   self#write_instruction0 DUP
+              | Cast (_, inner) ->
+                  let dst_sno =
+                    match recv.ty with
+                    | Struct (_, s) | Ref (Struct (_, s)) -> s
+                    | _ -> -1
+                  in
+                  if is_variable_ref inner.node then (
+                    self#compile_variable_ref inner;
+                    self#write_instruction0 REF)
+                  else self#compile_expression inner;
+                  self#write_instruction1 X_ICAST dst_sno
               | _ ->
                   self#compile_variable_ref recv;
                   self#write_instruction0 DUP2;
@@ -6260,7 +6287,8 @@ class jaf_compiler ctx debug_info =
               self#write_instruction0 EQUALE;
               let null_addr = current_address + 2 in
               self#write_instruction1 IFNZ 0;
-              if not root_is_value then self#write_instruction0 REF;
+              if root_kind = 2 then self#write_instruction0 REF
+              else if root_kind = 1 then self#write_instruction0 POP;
               self#write_instruction1 PUSH fidx;
               self#write_instruction0 REF;
               self#write_instruction1 PUSH 0;
@@ -6268,7 +6296,7 @@ class jaf_compiler ctx debug_info =
               let merge_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at null_addr current_address;
-              if not root_is_value then self#write_instruction0 POP;
+              if root_kind > 0 then self#write_instruction0 POP;
               self#write_instruction0 POP;
               self#write_instruction1 PUSH (-1);
               self#write_instruction1 PUSH (-1);
@@ -6276,23 +6304,48 @@ class jaf_compiler ctx debug_info =
               self#write_address_at merge_addr current_address;
               self#write_instruction1 PUSH (-1);
               self#write_instruction0 EQUALE;
-              let live_addr = current_address + 2 in
-              self#write_instruction1 IFZ 0;
-              self#write_instruction0 POP;
-              self#write_instruction0 POP;
-              self#compile_expression b;
-              let end_addr = current_address + 2 in
-              self#write_instruction1 JUMP 0;
-              self#write_address_at live_addr current_address;
-              self#write_instruction0 POP;
-              let getter_no =
-                if self#v12_expr_is_readonly field_expr then
-                  self#v12_readonly_variant getter_no
-                else getter_no
-              in
-              self#write_instruction1 PUSH getter_no;
-              self#write_instruction1 CALLMETHOD 0;
-              self#write_address_at end_addr current_address
+              (match prop_args with
+              | [ set_arg ] ->
+                  (* value setter: live arm FIRST (IFNZ to the null
+                     arm), the assigned value kept under the call via
+                     DUP_X2 as the expression's value; the null arm
+                     drops the two markers and yields the fallback. *)
+                  let null2_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction0 POP;
+                  self#write_instruction1 PUSH getter_no;
+                  let setter = Ain.get_function_by_index ctx.ain getter_no in
+                  (match Ain.Function.logical_parameters setter with
+                  | param :: _ ->
+                      self#compile_argument set_arg param.value_type
+                  | [] -> Option.iter set_arg ~f:self#compile_expression);
+                  self#write_instruction0 DUP_X2;
+                  self#write_instruction1 CALLMETHOD 1;
+                  let end_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at null2_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#compile_expression b;
+                  self#write_address_at end_addr current_address
+              | _ ->
+                  let live_addr = current_address + 2 in
+                  self#write_instruction1 IFZ 0;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#compile_expression b;
+                  let end_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at live_addr current_address;
+                  self#write_instruction0 POP;
+                  let getter_no =
+                    if self#v12_expr_is_readonly field_expr then
+                      self#v12_readonly_variant getter_no
+                    else getter_no
+                  in
+                  self#write_instruction1 PUSH getter_no;
+                  self#write_instruction1 CALLMETHOD 0;
+                  self#write_address_at end_addr current_address)
           | Binary (((Equal | NEqual) as cmp_op), cmp_lhs, cmp_rhs)
             when Ain.version_gte ctx.ain (12, 0)
                  && (let rec strip (e : expression) =
@@ -7359,6 +7412,130 @@ class jaf_compiler ctx debug_info =
                   method_no;
                 self#write_address_at jump_addr current_address)
           | Call
+              ( { node = Member (receiver, _, _); _ },
+                args,
+                MethodCall (_, method_no) )
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (not (v12_iface_type receiver.ty))
+                 && Option.is_some (self#v12_optional_getter_hops receiver) ->
+              (* v12 [obj?.G1.G2...Gn.Outer ?? fallback] with TWO or more
+                 ref-getter hops held in dummies (orig
+                 CEmitterProperty@0 lambdas:
+                 [m_emitterData?.XRotation.Begin.Value = box.Value]).
+                 Same protocol as the single-hop arm below: null-test
+                 the root, on the live path call each hop getter on
+                 the previous stacked value and park it in its dummy,
+                 push the (0, 0) marker pair; the null path pops the
+                 root and pushes the (-1, -1, -1) triple; the outer
+                 getter/setter runs only after the merge. *)
+              let ( (obj : expression),
+                    opt_args,
+                    opt_method_no,
+                    (hops : (int * int * expression) list) ) =
+                Option.value_exn (self#v12_optional_getter_hops receiver)
+              in
+              let outer_setter =
+                if
+                  (match receiver.ty with
+                  | Struct (name, _) | Ref (Struct (name, _)) ->
+                      not (Hashtbl.mem ctx.interface_names name)
+                  | _ -> false)
+                  && self#is_value_prop_setter_method method_no args
+                then Some (Ain.get_function_by_index ctx.ain method_no)
+                else None
+              in
+              self#pre_emit_lambda_args args;
+              List.iter hops ~f:(fun (d, _, _) ->
+                  self#scope_add_var (self#get_local d));
+              let obj_is_variable = is_variable_ref obj.node in
+              if obj_is_variable then (
+                self#compile_variable_ref obj;
+                self#write_instruction0 DUP2;
+                self#write_instruction0 REF)
+              else (
+                self#compile_lvalue obj;
+                self#write_instruction0 DUP);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              let recv_null_addr = current_address + 2 in
+              self#write_instruction1 IFNZ 0;
+              if obj_is_variable then self#write_instruction0 REF;
+              self#compile_method_call_for_receiver ~receiver:obj obj.ty opt_args
+                opt_method_no;
+              let store d =
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction1 PUSH d;
+                self#write_instruction0 REF;
+                self#emit_slot_release;
+                self#write_instruction0 PUSHLOCALPAGE;
+                self#write_instruction0 SWAP;
+                self#write_instruction1 PUSH d;
+                self#write_instruction0 SWAP;
+                self#write_instruction0 ASSIGN
+              in
+              List.iteri hops ~f:(fun i (d, m, prev) ->
+                  if i > 0 then (
+                    self#compile_method_selector
+                      ~readonly_receiver:(self#v12_expr_is_readonly prev)
+                      prev.ty m;
+                    self#write_instruction1 CALLMETHOD 0);
+                  store d);
+              self#write_instruction1 PUSH 0;
+              self#write_instruction1 PUSH 0;
+              let merge_jump_addr = current_address + 2 in
+              self#write_instruction1 JUMP 0;
+              self#write_address_at recv_null_addr current_address;
+              if obj_is_variable then (
+                self#write_instruction0 POP;
+                self#write_instruction0 POP)
+              else self#write_instruction0 POP;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction1 PUSH (-1);
+              self#write_address_at merge_jump_addr current_address;
+              self#write_instruction1 PUSH (-1);
+              self#write_instruction0 EQUALE;
+              (match outer_setter with
+              | Some f ->
+                  let fallback_addr = current_address + 2 in
+                  self#write_instruction1 IFNZ 0;
+                  self#write_instruction0 POP;
+                  self#compile_method_selector
+                    ~readonly_receiver:(self#v12_expr_is_readonly receiver)
+                    receiver.ty method_no;
+                  (let prev = in_prop_setter_arg in
+                   Exn.protect
+                     ~f:(fun () ->
+                       in_prop_setter_arg <- true;
+                       self#compile_function_arguments args f)
+                     ~finally:(fun () -> in_prop_setter_arg <- prev));
+                  self#write_instruction0 DUP_X2;
+                  (match List.hd (Ain.Function.logical_parameters f) with
+                  | Some { value_type = String; _ } ->
+                      self#write_instruction0 A_REF
+                  | _ -> ());
+                  self#write_instruction1 CALLMETHOD f.nr_args;
+                  let end_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at fallback_addr current_address;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#compile_expression b;
+                  self#write_address_at end_addr current_address
+              | None ->
+                  let ifz_addr = current_address + 2 in
+                  self#write_instruction1 IFZ 0;
+                  self#write_instruction0 POP;
+                  self#write_instruction0 POP;
+                  self#compile_expression b;
+                  let jump_addr = current_address + 2 in
+                  self#write_instruction1 JUMP 0;
+                  self#write_address_at ifz_addr current_address;
+                  self#write_instruction0 POP;
+                  self#compile_method_call_for_receiver ~receiver receiver.ty args
+                    method_no;
+                  self#write_address_at jump_addr current_address)
+          | Call
               ( {
                   node =
                     Member
@@ -7782,6 +7959,41 @@ class jaf_compiler ctx debug_info =
       && (match rhs.node with
          | Ident (_, LocalVariable _) -> true
          | _ -> false)
+
+    (** [obj?.G1.G2...Gn] receiver chain: each hop is a zero-arg getter
+        call held in a dummy ([DummyRef (d, Call (Member (prev, ..),
+        [], MethodCall m))]); the innermost is the optional call on
+        the root. Returns the root call and the hops innermost-first
+        as [(dummy, method, previous receiver expr)] — [None] unless
+        there are at least two hops (the single-hop layout has its
+        own arm). *)
+    method v12_optional_getter_hops (receiver : expression) :
+        (expression * expression option list * int * (int * int * expression) list)
+        option =
+      let rec peel (e : expression) (acc : (int * int * expression) list) =
+        match e.node with
+        | DummyRef
+            ( d,
+              {
+                node =
+                  Call ({ node = OptionalMember (obj, _, _); _ }, opt_args,
+                        MethodCall (_, opt_m));
+                _;
+              } ) ->
+            Some (obj, opt_args, opt_m, (d, opt_m, obj) :: acc)
+        | DummyRef
+            ( d,
+              {
+                node =
+                  Call ({ node = Member (prev, _, _); _ }, [], MethodCall (_, m));
+                _;
+              } ) ->
+            peel prev ((d, m, prev) :: acc)
+        | _ -> None
+      in
+      match peel receiver [] with
+      | Some (_, _, _, hops) as r when List.length hops >= 2 -> r
+      | _ -> None
 
     method compile_expr_and_pop ?(before_pop = fun () -> ()) (expr : expression)
         =
