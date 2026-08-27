@@ -684,6 +684,14 @@ let rec reduce_forward_branch cfg node0 branch_target =
          join_addr:
       *)
       if label1 = join_addr then
+        (* Empty-body [if (c) {}]. v12 compiles every if in the IFNZ
+           form ([c; IFNZ then; JUMP end; then: end:], both labels
+           coincide here), and blockEval stored the IFNZ branch
+           condition negated - undo that so the source keeps the
+           original polarity ([x != 0] compiles to NOTE, not to the
+           EQUALE / NOT the negated spelling would produce). The v12
+           original never emits [IFZ a; JUMP a]. *)
+        let expr = if Ain.ain.vers >= 12 then negate expr else expr in
         reduce_if_no_else cfg node0 branch_target ~expr ~expr_addr
       else if label1 > join_addr then
         if Ain.ain.ifthen_optimized then reduce_if_then cfg node0 branch_target
