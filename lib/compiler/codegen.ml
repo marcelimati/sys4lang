@@ -8607,7 +8607,37 @@ class jaf_compiler ctx debug_info =
                        [Class@2] members) release before. *)
                     true
                 | Assign (EqAssign, _, _) when Ain.version_gte ctx.ain (12, 0) ->
-                    false
+                    (* plain assignment: temps released AFTER the POP,
+                       unless one of them holds an array (released
+                       before). *)
+                    let rec has_array_dummy (x : expression) =
+                      match x.node with
+                      | DummyRef (i, inner) ->
+                          (match (self#get_local i).value_type with
+                           | Ain.Type.Array _ | Ain.Type.Ref (Ain.Type.Array _) -> true
+                           | _ -> false)
+                          || has_array_dummy inner
+                      | Member (o, _, _) | OptionalMember (o, _, _) -> has_array_dummy o
+                      | Subscript (a, b) | Binary (_, a, b) | Assign (_, a, b)
+                      | NullCoalesce (a, b) ->
+                          has_array_dummy a || has_array_dummy b
+                      | Call (c, args, _) ->
+                          has_array_dummy c
+                          || List.exists args ~f:(function
+                               | Some a -> has_array_dummy a
+                               | None -> false)
+                      | Cast (_, i) | RvalueRef i | Unary (_, i) -> has_array_dummy i
+                      | Ternary (a, b, c) ->
+                          has_array_dummy a || has_array_dummy b || has_array_dummy c
+                      | _ -> false
+                    in
+                    let in_initializer =
+                      Option.value_map current_function ~default:false
+                        ~f:(fun f ->
+                          String.equal f.name "0"
+                          || String.is_suffix f.name ~suffix:"@2")
+                    in
+                    (not in_initializer) && not (has_array_dummy e)
                 | _ when Ain.version_gte ctx.ain (12, 0) -> true
                 (* v12 [obj.OptMethod(...)] / [obj?.Method(...)] / chained
                    optional access producing a plain scalar result (Int /
