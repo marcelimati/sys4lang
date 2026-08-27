@@ -515,9 +515,9 @@ class variable_alloc_visitor ctx =
             let call_key = expr_to_string expr in
             let varname =
               (* v12 names a call-result dummy [<dummy : Calleeの戻り値>]
-                 (return value of); HLL calls stay bare ([<dummy : At>]),
-                 delegate / functype calls use the type's name
-                 ([<dummy : DG_Func<ref ITextParts, ...>の戻り値>]). *)
+                 (return value of) - HLL calls included ([<dummy : At
+                 の戻り値>]); delegate / functype calls use the type's
+                 name ([<dummy : DG_Func<ref ITextParts, ...>の戻り値>]). *)
               let ret_suffix = if v12 then "の戻り値" else "" in
               let callee_ty_name default =
                 match expr.node with
@@ -531,7 +531,7 @@ class variable_alloc_visitor ctx =
                   (Ain.get_function_by_index ctx.ain fno).name ^ ret_suffix
               | HLLCall (lib_no, fun_no) ->
                   let lib = Ain.get_library_by_index ctx.ain lib_no in
-                  lib.functions.(fun_no).name
+                  lib.functions.(fun_no).name ^ ret_suffix
               | DelegateCall _ -> callee_ty_name "<delegate>"
               | FuncTypeCall _ -> callee_ty_name "<functype>"
               | _ ->
