@@ -3896,20 +3896,21 @@ class jaf_compiler ctx debug_info =
               (match b.ty with
               | _ when (match b.node with This -> true | _ -> false) ->
                   self#compile_lvalue b
-              | Ref _ -> self#compile_lvalue b
               (* v12 identity compare against a non-interface struct
                  variable (predicate lambdas: [item === captured]):
                  the original reads the page ref bare, no A_REF. *)
-              | Struct (n, _)
+              | Struct (n, _) | Ref (Struct (n, _))
                 when Ain.version_gte ctx.ain (12, 0)
                      && (not (Hashtbl.mem ctx.interface_names n))
                      && (match b.node with
                         | Ident (_, (LocalVariable _ | GlobalVariable _))
+                        | Ident (_, _)
                         | Member (_, _, ClassVariable _) ->
                             true
                         | _ -> false) ->
                   self#compile_variable_ref b;
                   self#write_instruction0 REF
+              | Ref _ -> self#compile_lvalue b
               | _ -> self#compile_expression b);
               if both_iface then (
                 (* Narrow the rhs pair to its page too. Wrap-stored
