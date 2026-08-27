@@ -421,6 +421,25 @@ class variable_alloc_visitor ctx =
             Some (self#create_dummy_var varname (Ref ts.ty))
         | _ -> None
       in
+      (* v12 array literals: the literal's own dummy is allocated BEFORE
+         its elements' (orig CBrushController@GetDotCreatePosList:
+         [<dummy : new array<CASVector3D>>] at 2, the element's
+         [<dummy : new CASVector3D>] at 3) - pre-order like NewCall. *)
+      let preallocated_literal_dummy =
+        match expr.node with
+        | ArrayLiteral _
+          when Ain.version_gte ctx.ain (12, 0)
+               && suppress_array_literal_dummy = 0
+               && not (Stack.is_empty func_vars) ->
+            let rec angle_ty (t : jaf_type) =
+              match t with
+              | Array e -> "array<" ^ angle_ty e ^ ">"
+              | Ref e -> "ref " ^ angle_ty e
+              | t -> jaf_type_to_string t
+            in
+            Some (self#create_dummy_var ("new " ^ angle_ty expr.ty) expr.ty)
+        | _ -> None
+      in
       (match expr.node with
       | DummyRef _ -> ()
       | Assign (EqAssign, lhs, rhs)
@@ -645,7 +664,10 @@ class variable_alloc_visitor ctx =
             | t -> jaf_type_to_string t
           in
           let v =
-            self#create_dummy_var ("new " ^ angle_ty expr.ty) expr.ty
+            match preallocated_literal_dummy with
+            | Some v -> v
+            | None ->
+                self#create_dummy_var ("new " ^ angle_ty expr.ty) expr.ty
           in
           expr.node <- DummyRef (v, clone_expr expr)
       | Binary

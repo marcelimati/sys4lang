@@ -1753,6 +1753,26 @@ class jaf_compiler ctx debug_info =
                   self#emit_array_literal_element elem;
                   self#compile_CALLHLL "Array" "PushBack" elem_ty
                     (ASTExpression ref_expr));
+              (* v12 [return [new T(..), ..]]: the element dummies were
+                 dropped from the scope with the literal, but orig still
+                 releases them once the literal holds its own ref
+                 (CBrushController@GetDotCreatePosList: [PushBack;
+                 .LOCALDELETE <dummy : new CASVector3D>; A_REF; RETURN]). *)
+              if Ain.version_gte ctx.ain (12, 0) && is_in_return_expr then (
+                let elem_dummies =
+                  List.filter_map elems ~f:(fun elem ->
+                      match elem.node with
+                      | DummyRef (d, { node = New _ | NewCall _; _ }) -> Some d
+                      | _ -> None)
+                in
+                List.iter (List.rev elem_dummies) ~f:(fun d ->
+                    self#write_instruction1 SH_LOCALDELETE d);
+                match Stack.top scopes with
+                | Some scope ->
+                    scope.vars <-
+                      List.filter scope.vars ~f:(fun v ->
+                          not (List.mem elem_dummies v.index ~equal:Int.equal))
+                | None -> ());
               (* v12: the populated literal is pushed bare; only a
                  by-value array parameter consumer bumps it (orig:
                  CASTask@JoinImp(array<ref CASTask>) gets [A_REF],
