@@ -8407,6 +8407,22 @@ class jaf_compiler ctx debug_info =
             | _ -> (
                 match e.node with
                 | Assign (EqAssign, { node = DummyRef _; _ }, _) -> true
+                (* v12: a target reached through call-result temps
+                   ([a.Get().Prop.x = v]) pops first, releases after. *)
+                | Assign (EqAssign, lhs, _)
+                  when Ain.version_gte ctx.ain (12, 0)
+                       &&
+                       let rec through_dummy (x : expression) =
+                         match x.node with
+                         | DummyRef _ -> true
+                         | Member (o, _, _) | OptionalMember (o, _, _) ->
+                             through_dummy o
+                         | Subscript (o, _) -> through_dummy o
+                         | Cast (_, o) | RvalueRef o -> through_dummy o
+                         | _ -> false
+                       in
+                       through_dummy lhs ->
+                    true
                 (* v12: orig pops a plain assignment's result BEFORE the
                    statement's dummy releases only for DummyRef lhs
                    (above); a plain [x = rhs] releases the rhs dummies
