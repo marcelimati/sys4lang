@@ -9183,7 +9183,6 @@ class jaf_compiler ctx debug_info =
           if
             Ain.version_gte ctx.ain (12, 0)
             && v12_if_ret_short && bare_return_body && empty_statement alt
-            && List.is_empty last_condition_deleted_dummies
           then (
             (* Short form ([cond; IFZ end; RETURN; end:]) - a per-file
                compiler-build style, see FileStyle. *)
@@ -9410,8 +9409,23 @@ class jaf_compiler ctx debug_info =
           crc_state <- saved
       | Continue ->
           (* v11: replay [SH_LOCALDELETE] for dummies released inside
-             the loop before jumping back to the test. *)
-          self#emit_loop_exit_cleanup;
+             the loop before jumping back to the test. v12 replays them
+             too (orig: [.LOCALDELETE <EmplaceBackの戻り値>; .LOCALDELETE
+             newInstance; JUMP head]) EXCEPT the condition temps of the
+             [if (c) continue;] the jump belongs to - those were released
+             right before the branch and orig's continue path is a bare
+             [JUMP head] (CInstanceParamSetter@SetModeMark, 53 sites). *)
+          if Ain.version_gte ctx.ain (12, 0) then (
+            match Stack.top cflow_stmts with
+            | Some s ->
+                List.iter s.inline_deleted_dummies ~f:(fun idx ->
+                    if
+                      not
+                        (List.mem last_condition_deleted_dummies idx
+                           ~equal:Int.equal)
+                    then self#write_instruction1 SH_LOCALDELETE idx)
+            | None -> ())
+          else self#emit_loop_exit_cleanup;
           self#add_continue (ASTStatement stmt)
       | Break ->
           self#emit_loop_exit_cleanup;
