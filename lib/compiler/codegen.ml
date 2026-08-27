@@ -5379,7 +5379,22 @@ class jaf_compiler ctx debug_info =
               | Some (Ref (Struct _ | Delegate _)) -> true
               | _ -> false
             in
-            if is_ref_struct_new_setter then self#write_instruction0 A_REF;
+            (* A by-value struct call result is an owned temp: orig keeps
+               the idiom's DUP_X2/DELETE but skips the A_REF (e.g.
+               [p.SurfaceArea = p.SurfaceArea.Copy(..)]). *)
+            let rhs_is_owned_value_result =
+              Ain.version_gte ctx.ain (12, 0)
+              &&
+              match args with
+              | [ Some { node = DummyRef (_, ({ node = Call _; _ } as c)); _ } ]
+                -> (
+                  match self#ain_call_return_type c with
+                  | Some (Ain.Type.Struct _) -> true
+                  | _ -> false)
+              | _ -> false
+            in
+            if is_ref_struct_new_setter && not rhs_is_owned_value_result then
+              self#write_instruction0 A_REF;
             self#write_instruction0 DUP_X2;
             (* String setters need an extra [A_REF] before [CALLMETHOD]
                so the trailing [DELETE] correctly releases the
