@@ -8828,6 +8828,71 @@ class jaf_compiler ctx debug_info =
                 (ASTExpression expr));
           before_pop ();
           self#write_instruction0 POP
+      | Call
+          ( {
+              node =
+                Member
+                  ( ({ node = OptionalMember (recv, _, ClassVariable fidx); _ }
+                     as field_expr),
+                    _,
+                    ClassMethod (_, m) );
+              _;
+            },
+            args,
+            MethodCall _ )
+        when Ain.version_gte ctx.ain (12, 0)
+             && (is_variable_ref recv.node
+                || (match recv.node with
+                   | This | DummyRef _ | Call _ -> true
+                   | _ -> false))
+             && (let f = Ain.get_function_by_index ctx.ain m in
+                 Poly.equal f.return_type Ain.Type.Void
+                 && not (String.is_suffix f.name ~suffix:"::get")
+                 && not (String.is_suffix f.name ~suffix:"::set")) ->
+          (* v12 statement [recv?.field.VoidMethod(args)]: the original
+             keeps the receiver as (page, index) across the null test,
+             calls the method on the live path only and pushes a [0]
+             marker as the expression's value (null path: drop the
+             pair, push -1), then the statement POP (orig
+             CGroupProperty@0 lambdas: [PUSHSTRUCTPAGE; PUSH 4; DUP2; REF;
+             PUSH -1; EQUALE; IFNZ null; REF; PUSH 15; REF; PUSH m; args;
+             CALLMETHOD 1; PUSH 0; JUMP end; null: POP; POP; PUSH -1;
+             end: POP]). The generic protocol called the method on the
+             -1 page. *)
+          self#pre_emit_lambda_args args;
+          let root_is_value =
+            match recv.node with
+            | This | DummyRef _ | Call _ -> true
+            | _ -> false
+          in
+          (match recv.node with
+          | This -> self#write_instruction0 PUSHSTRUCTPAGE
+          | DummyRef _ | Call _ ->
+              self#compile_lvalue recv;
+              self#write_instruction0 DUP
+          | _ ->
+              self#compile_variable_ref recv;
+              self#write_instruction0 DUP2;
+              self#write_instruction0 REF);
+          self#write_instruction1 PUSH (-1);
+          self#write_instruction0 EQUALE;
+          let null_addr = current_address + 2 in
+          self#write_instruction1 IFNZ 0;
+          if not root_is_value then self#write_instruction0 REF;
+          self#write_instruction1 PUSH fidx;
+          self#write_instruction0 REF;
+          self#compile_method_call_for_receiver ~receiver:field_expr field_expr.ty
+            args m;
+          self#write_instruction1 PUSH 0;
+          let end_addr = current_address + 2 in
+          self#write_instruction1 JUMP 0;
+          self#write_address_at null_addr current_address;
+          if not root_is_value then self#write_instruction0 POP;
+          self#write_instruction0 POP;
+          self#write_instruction1 PUSH (-1);
+          self#write_address_at end_addr current_address;
+          before_pop ();
+          self#write_instruction0 POP
       | NullCoalesce
           ( { node = Call ({ node = Member _; _ }, [ _ ], MethodCall (_, m)); _ },
             _ )
