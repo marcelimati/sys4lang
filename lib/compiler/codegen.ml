@@ -3508,6 +3508,15 @@ class jaf_compiler ctx debug_info =
                       match arg with
                       | Some expr when is_variable_ref expr.node ->
                           self#compile_argument arg var.value_type
+                      | Some { node = This; _ }
+                        when Ain.version_gte ctx.ain (12, 0) ->
+                          (* [this] to a [ref T] ctor param: the callee
+                             borrows the page-ref; orig pushes it bare
+                             (CElkViewport@0's [new CMainMenu(activity,
+                             this, ...)]). The rvalue [This] arm's A_REF
+                             is for by-value consumers (SR_ASSIGN,
+                             by-value struct params). *)
+                          self#write_instruction0 PUSHSTRUCTPAGE
                       | _ -> Option.iter arg ~f:self#compile_expression)
                   | _ -> self#compile_argument arg var.value_type)
           | None ->
