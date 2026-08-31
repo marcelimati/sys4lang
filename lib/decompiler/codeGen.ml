@@ -873,7 +873,21 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
             self#println "}"
         | ForEach { rev; var; ivar; array; body } ->
             self#addr_and_indent stmt.addr;
-            bprintf out "foreach%s (%s" (if rev then "_r" else "") var.name;
+            bprintf out "foreach%s (" (if rev then "_r" else "");
+            (* container from an HLL call returning untyped [array]:
+               spell the loop var's element type so sys4c doesn't have
+               to guess it (the function table has the truth) *)
+            (match array with
+            | Call (HllFunc (_, f), _)
+              when Ain.ain.vers >= 12
+                   && (match f.return_type with
+                      | Array Any -> true
+                      | _ -> false) -> (
+                match var.type_ with
+                | Ref t | FatRef t -> bprintf out "%a " self#pr_type t
+                | t -> bprintf out "%a " self#pr_type t)
+            | _ -> ());
+            bprintf out "%s" var.name;
             Option.iter ivar ~f:(fun v -> bprintf out ", %s" v.name);
             self#println " : %a) {" (self#pr_expr 0) array;
             self#with_indent (fun () ->

@@ -1275,7 +1275,7 @@ class jaf_compiler ctx debug_info =
           stmt_uses (self#local_uses_expr uses test) body
       | For (init, test, incr, body) ->
           stmt_uses (opt_expr (opt_expr (stmt_uses uses init) test) incr) body
-      | ForEach (_, _, _, container, body) ->
+      | ForEach (_, _, _, _, container, body) ->
           stmt_uses (self#local_uses_expr uses container) body
       | Return e -> opt_expr uses e
       | RefAssign (lhs, rhs) | ObjSwap (lhs, rhs) ->
@@ -2731,7 +2731,7 @@ class jaf_compiler ctx debug_info =
               @ Option.value_map step ~default:[]
                   ~f:collect_optional_call_lambdas
               @ collect_optional_call_lambdas_in_stmt body
-          | ForEach (_, _, _, container, body) ->
+          | ForEach (_, _, _, _, container, body) ->
               collect_optional_call_lambdas container
               @ collect_optional_call_lambdas_in_stmt body
           | RefAssign (a, b) | ObjSwap (a, b) ->
@@ -11007,7 +11007,7 @@ class jaf_compiler ctx debug_info =
         | If (_, con, alt) ->
             stmt_has_early_return con || stmt_has_early_return alt
         | While (_, body) | DoWhile (_, body) -> stmt_has_early_return body
-        | For (_, _, _, body) | ForEach (_, _, _, _, body) ->
+        | For (_, _, _, body) | ForEach (_, _, _, _, _, body) ->
             stmt_has_early_return body
         | Switch (_, stmts) -> List.exists stmts ~f:stmt_has_early_return
         | _ -> false
@@ -11423,8 +11423,8 @@ class jaf_compiler ctx debug_info =
                     Option.map b ~f:clone_expr,
                     Option.map c ~f:clone_expr,
                     clone_stmt d )
-            | ForEach (rev, name, idx, e, b) ->
-                ForEach (rev, name, idx, clone_expr e, clone_stmt b)
+            | ForEach (rev, ts, name, idx, e, b) ->
+                ForEach (rev, ts, name, idx, clone_expr e, clone_stmt b)
             | Goto _ as n -> n
             | Continue -> Continue
             | Break -> Break

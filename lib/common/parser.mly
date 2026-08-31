@@ -514,13 +514,23 @@ iteration_statement
            $8)
     }
   | FOREACH LPAREN IDENTIFIER COLON expression RPAREN statement
-    { ForEach (false, $3, None, $5, $7) }
+    { ForEach (false, None, $3, None, $5, $7) }
   | FOREACH LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
-    { ForEach (false, $3, Some $5, $7, $9) }
+    { ForEach (false, None, $3, Some $5, $7, $9) }
   | FOREACH_R LPAREN IDENTIFIER COLON expression RPAREN statement
-    { ForEach (true, $3, None, $5, $7) }
+    { ForEach (true, None, $3, None, $5, $7) }
   | FOREACH_R LPAREN IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
-    { ForEach (true, $3, Some $5, $7, $9) }
+    { ForEach (true, None, $3, Some $5, $7, $9) }
+  (* v12: explicit element type - needed when the container is an HLL
+     call returning untyped [array] *)
+  | FOREACH LPAREN declaration_specifiers IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, Some $3, $4, None, $6, $8) }
+  | FOREACH LPAREN declaration_specifiers IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (false, Some $3, $4, Some $6, $8, $10) }
+  | FOREACH_R LPAREN declaration_specifiers IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, Some $3, $4, None, $6, $8) }
+  | FOREACH_R LPAREN declaration_specifiers IDENTIFIER COMMA IDENTIFIER COLON expression RPAREN statement
+    { ForEach (true, Some $3, $4, Some $6, $8, $10) }
   ;
 
 jump_statement

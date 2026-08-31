@@ -147,7 +147,7 @@ class visitor ctx =
             Option.iter test ~f:scan_expr;
             Option.iter inc ~f:scan_expr;
             scan_stmt body
-        | ForEach (_, _, _, arr, body) ->
+        | ForEach (_, _, _, _, arr, body) ->
             scan_expr arr;
             scan_stmt body
         | RefAssign (a, b) | ObjSwap (a, b) ->

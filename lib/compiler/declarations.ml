@@ -2612,7 +2612,7 @@ let scan_user_bodied_accessors ctx (decls : declaration list) =
         Option.iter test ~f:(scan_expr class_name);
         Option.iter inc ~f:(scan_expr class_name);
         scan_stmt class_name body
-    | ForEach (_, _, _, arr, body) ->
+    | ForEach (_, _, _, _, arr, body) ->
         scan_expr class_name arr;
         scan_stmt class_name body
     | Return e -> Option.iter e ~f:(scan_expr class_name)

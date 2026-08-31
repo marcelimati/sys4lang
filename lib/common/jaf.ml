@@ -259,7 +259,9 @@ and ast_statement =
      with optional explicit index variable name as the third field.
      Lowered into a while loop by [desugar_foreach] before type
      analysis runs, so codegen never sees this variant directly. *)
-  | ForEach of bool * string * string option * expression * statement
+  | ForEach of
+      bool * type_specifier option * string * string option * expression
+      * statement
   | Goto of string
   | Continue
   | Break
@@ -841,7 +843,7 @@ class ivisitor ctx =
           Option.iter inc ~f:self#visit_expression;
           self#visit_statement body;
           self#env#pop
-      | ForEach (_, _, _, arr_expr, body) ->
+      | ForEach (_, _, _, _, arr_expr, body) ->
           self#env#push;
           self#visit_expression arr_expr;
           self#visit_statement body;
@@ -1094,7 +1096,7 @@ let rec stmt_to_string (stmt : statement) =
       let s_body = stmt_to_string body in
       let s_inc = expr_opt_to_string inc in
       sprintf "for (%s %s %s) %s" s_init s_test s_inc s_body
-  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+  | ForEach (rev, _, var_name, ivar_name, arr_expr, body) ->
       let kw = if rev then "foreach_r" else "foreach" in
       let i = match ivar_name with Some n -> ", " ^ n | None -> "" in
       sprintf "%s (%s%s : %s) %s" kw var_name i
@@ -1551,8 +1553,8 @@ let ain_to_jaf_variable ain kind (v : Ain.Variable.t) =
    matching original compiler bytecode. *)
 let foreach_counter = ref 0
 
-let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
-    (body : statement) =
+let desugar_foreach_stmt loc rev (elem_ts : type_specifier option) var_name
+    ivar_name (arr_expr : expression) (body : statement) =
   let id =
     foreach_counter := !foreach_counter + 1;
     !foreach_counter
@@ -1614,17 +1616,29 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
     | Call _ | ArrayLiteral _ -> { arr_expr with node = RvalueRef arr_expr }
     | _ -> arr_expr
   in
+  (* an explicit element type ([foreach (string x : hll_call())])
+     overrides the placeholder the type checker would otherwise have
+     to infer from the container - HLL functions return untyped
+     [array], so the inference has nothing to go on there *)
+  let elem_ty =
+    match elem_ts with Some ts -> Some ts.ty | None -> None
+  in
+  let container_ty =
+    match elem_ty with
+    | Some t -> Ref (Array t)
+    | None -> Ref (Array HLLParam)
+  in
   let container_init =
     mk_stmt
       (Declarations
          {
            decl_loc = dl;
            is_const_decls = false;
-           typespec = mk_ts (Ref (Array HLLParam));
+           typespec = mk_ts container_ty;
            vars =
              [
                {
-                 (mk_var container_name (Ref (Array HLLParam))) with
+                 (mk_var container_name container_ty) with
                  is_private = true;
                  initval = Some container_expr;
                };
@@ -1658,14 +1672,17 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
     else
       mk_expr (Binary (LT, mk_expr (Unary (ForeachInc, counter_id)), numof_call))
   in
+  let var_ty =
+    match elem_ty with Some t -> Wrap t | None -> Wrap HLLParam
+  in
   let var_decl =
     mk_stmt
       (Declarations
          {
            decl_loc = dl;
            is_const_decls = false;
-           typespec = mk_ts (Wrap HLLParam);
-           vars = [ mk_var var_name (Wrap HLLParam) ];
+           typespec = mk_ts var_ty;
+           vars = [ mk_var var_name var_ty ];
          })
   in
   let var_ref_assign =
@@ -1684,9 +1701,10 @@ let desugar_foreach_stmt loc rev var_name ivar_name (arr_expr : expression)
 
 let rec desugar_foreach_in_stmt (stmt : statement) =
   match stmt.node with
-  | ForEach (rev, var_name, ivar_name, arr_expr, body) ->
+  | ForEach (rev, elem_ts, var_name, ivar_name, arr_expr, body) ->
       desugar_foreach_in_stmt
-        (desugar_foreach_stmt stmt.loc rev var_name ivar_name arr_expr body)
+        (desugar_foreach_stmt stmt.loc rev elem_ts var_name ivar_name arr_expr
+           body)
   | Compound stmts ->
       { stmt with node = Compound (List.map stmts ~f:desugar_foreach_in_stmt) }
   | If (test, then_, else_) ->
