@@ -1014,7 +1014,8 @@ class type_analyze_visitor ctx =
          [return [];] — orig frees/returns the dummy as element type
          21, ours emitted 0). Covers returns and call arguments. *)
       (match (rhs.node, t, rhs.ty) with
-      | ArrayLiteral [], Array elem, Array Void -> rhs.ty <- Array elem
+      | ArrayLiteral [], (Array elem | Ref (Array elem)), Array Void ->
+          rhs.ty <- Array elem
       (* Non-empty literals too: element inference takes the FIRST
          element's type, so [[this]] into an [array@ref CASTask]
          parameter came out [array<CASTask>] — PushBack with the
@@ -1026,9 +1027,14 @@ class type_analyze_visitor ctx =
          the declared element type whenever the inferred one is
          implicitly convertible to it ([type_equal] covers ref<->value
          struct and int<->enum). *)
-      | ArrayLiteral (_ :: _), Array te, Array ta
+      | ArrayLiteral (_ :: _), (Array te | Ref (Array te)), Array ta
         when (not (Poly.equal te ta)) && type_equal te ta ->
-          rhs.ty <- t
+          (* [Ref (Array _)] declared types (ref-returning getters like
+             [ref array@CardState StateList { get { return [0,..]; } }])
+             type the literal by element too - the type-table operand of
+             the literal's Free/PushBack was array<int> (10) where orig
+             has the enum array (92). *)
+          rhs.ty <- Array te
       | _ -> ());
       match (t, rhs.ty) with
       | FuncType _, String -> type_error t (Some rhs) parent
@@ -2596,6 +2602,19 @@ class type_analyze_visitor ctx =
                   match f.return.ty with
                   | Ref ty ->
                       self#check_referenceable e (ASTExpression e);
+                      (* Same ArrayLiteral element refinement as the
+                         by-value arm below: [ref array@CardState
+                         StateList { get { return [0,..]; } }] must
+                         type the literal's dummy by the declared enum
+                         element (orig type-table 92), not the
+                         elements' int (10). *)
+                      (match (e.node, ty, e.ty) with
+                      | ArrayLiteral (_ :: _), Array te, Array ta
+                        when (not (Poly.equal te ta)) && type_equal te ta ->
+                          e.ty <- Array te
+                      | ArrayLiteral [], Array te, Array Void ->
+                          e.ty <- Array te
+                      | _ -> ());
                       ref_type_check (ASTStatement stmt) ty e
                   | _ ->
                       self#check_funarg_or_return (ASTStatement stmt)
