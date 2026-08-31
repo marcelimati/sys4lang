@@ -164,6 +164,10 @@ class jaf_compiler ctx debug_info =
        same as [v12_not_peel]. *)
     val mutable v12_lambda_not_peel : bool option = None
 
+    (* Per-file marker: negated non-calls (reads, comparisons) in
+       LONG-form ifs peeled vs kept (FileStyle.long_peel). *)
+    val mutable v12_long_peel : bool = false
+
     (* Per-file marker: negated conditions outside long-form ifs
        (while conditions, plain operands in short-form ifs) peeled
        ([operand; IFNZ skip]) vs kept ([operand; NOT; IFZ skip]). *)
@@ -9397,6 +9401,18 @@ class jaf_compiler ctx debug_info =
                         | EmptyStatement -> true
                         | _ -> false) ->
                   (inner, true)
+              (* Long-form if on a negated NON-call (plain read or
+                 comparison): per-file long-peel build style. Calls in
+                 long-form ifs stay governed by not-peel below. *)
+              | Unary (LogNot, ({ node = inner_node; _ } as inner)), _
+                when v12_long_peel
+                     && (match inner_node with Call _ -> false | _ -> true)
+                     && not
+                          (unbraced_body
+                          && match alt.node with
+                             | EmptyStatement -> true
+                             | _ -> false) ->
+                  (inner, true)
               (* File compiled by the NOT-keeping compiler build. *)
               | _, Some false -> (test, false)
               (* NOT-peeling build: every negated call is peeled. *)
@@ -11527,6 +11543,9 @@ class jaf_compiler ctx debug_info =
         Hashtbl.find LexerState.file_lambda_not_peel jaf_name;
       v12_cond_peel <-
         Option.value (Hashtbl.find LexerState.file_cond_peel jaf_name)
+          ~default:false;
+      v12_long_peel <-
+        Option.value (Hashtbl.find LexerState.file_long_peel jaf_name)
           ~default:false;
       let compile_decl = function
         | Jaf.Function f

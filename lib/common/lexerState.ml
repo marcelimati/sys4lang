@@ -26,6 +26,17 @@ let file_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_if_ret_short : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_cond_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_lambda_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+let file_long_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
+let detect_long_peel (source : string) =
+  let head = String.prefix source 200 in
+  match String.substr_index head ~pattern:"long-peel=" with
+  | None -> None
+  | Some i ->
+      let rest = String.drop_prefix head (i + String.length "long-peel=") in
+      if String.is_prefix rest ~prefix:"1" then Some true
+      else if String.is_prefix rest ~prefix:"0" then Some false
+      else None
 
 let detect_lambda_not_peel (source : string) =
   let head = String.prefix source 200 in
@@ -86,7 +97,8 @@ let clear () =
   Hashtbl.clear file_not_peel;
   Hashtbl.clear file_if_ret_short;
   Hashtbl.clear file_cond_peel;
-  Hashtbl.clear file_lambda_not_peel
+  Hashtbl.clear file_lambda_not_peel;
+  Hashtbl.clear file_long_peel
 
 (* Pre-scan a source string to register any identifier immediately followed
    by `<` (no whitespace between) as templated. The decompiler emits

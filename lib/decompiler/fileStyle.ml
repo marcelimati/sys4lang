@@ -33,6 +33,17 @@ let lambda_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
    [not_peel]; this bit covers the rest. *)
 let cond_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 
+(* Fourth per-file bit: a negated NON-CALL (plain read or comparison)
+   in a LONG-form if ([if (!m_flag) { .. }], [if (!(a == b)) { .. }])
+   kept ([operand; NOT; IFNZ then; JUMP]) vs peeled
+   ([operand; IFZ then; JUMP] - the comparison keeps its own opcode
+   and the entry branch inverts). Pure per file in 84 of 91 evidence
+   files (55 keep / 29 peel / 7 mixed); NOT correlated with
+   [not_peel] (peeled evidence sits in keep- and unmarked-style
+   files too). Negated CALLS in long-form ifs stay governed by
+   [not_peel]. *)
+let long_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
 let is_cmp (i : Instructions.instruction) =
   match i with
   | EQUALE | NOTE | LT | GT | LTE | GTE | F_LT | F_GT | F_LTE | F_GTE
@@ -47,10 +58,12 @@ let compute (files : (string * CodeSection.function_t list) list) =
   Hashtbl.clear not_peel;
   Hashtbl.clear lambda_not_peel;
   Hashtbl.clear cond_peel;
+  Hashtbl.clear long_peel;
   List.iter files ~f:(fun (fname, funcs) ->
       let kept = ref 0 and peeled = ref 0 in
       let lam_kept = ref 0 and lam_peeled = ref 0 in
       let cond_kept = ref 0 and cond_peeled = ref 0 in
+      let long_kept = ref 0 and long_peeled = ref 0 in
       List.iter funcs ~f:(fun f ->
           let in_lambda = phys_equal f.CodeSection.func.kind Ain.Function.Lambda in
           let kept = if in_lambda then lam_kept else kept
@@ -110,6 +123,14 @@ let compute (files : (string * CodeSection.function_t list) list) =
                       let prev2 =
                         if i >= 2 then Some code.(i - 2).txt else None
                       in
+                      (if long_form then
+                         match (prev, prev2, l.txt) with
+                         | NOT, Some src, IFNZ _
+                           when is_read src || is_cmp src ->
+                             Int.incr long_kept
+                         | src, _, IFZ _ when is_read src || is_cmp src ->
+                             Int.incr long_peeled
+                         | _ -> ());
                       (match back_jump with
                       | `Loop -> (
                           match (prev, prev2, l.txt) with
@@ -132,6 +153,8 @@ let compute (files : (string * CodeSection.function_t list) list) =
               | _ -> ()));
       if !cond_kept + !cond_peeled > 0 then
         Hashtbl.set cond_peel ~key:fname ~data:(!cond_peeled > !cond_kept);
+      if !long_kept + !long_peeled > 0 then
+        Hashtbl.set long_peel ~key:fname ~data:(!long_peeled > !long_kept);
       (* the plain-function bit falls back to lambda evidence and vice
          versa; the lambda bit is emitted only when it differs *)
       let func_bit =
@@ -159,6 +182,8 @@ let marker fname =
             "lambda-not-peel=" ^ if peel then "peel" else "keep");
         Option.map (Hashtbl.find cond_peel fname) ~f:(fun peel ->
             "cond-peel=" ^ if peel then "1" else "0");
+        Option.map (Hashtbl.find long_peel fname) ~f:(fun peel ->
+            "long-peel=" ^ if peel then "1" else "0");
       ]
   in
   if List.is_empty bits then None
