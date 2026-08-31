@@ -1724,7 +1724,19 @@ class jaf_compiler ctx debug_info =
              self#write_instruction0 X_GETENV)
           done;
           self#write_instruction1 PUSH i;
-          compile_lvalue_after (jaf_to_ain_type e.ty)
+          (match e.ty with
+          | Ref (Struct (name, _)) | Struct (name, _)
+            when Ain.version_gte ctx.ain (12, 0)
+                 && Hashtbl.mem ctx.interface_names name ->
+              (* A captured [ref IFace] param is a two-slot fat-ref in
+                 the outer frame; the VALUE read is [REFREF] like the
+                 Subscript iface arm - [compile_lvalue_after] sees only
+                 [Ref (Struct _)] and emitted a one-slot [REF], so the
+                 scene-factory lambda in Scenes::RunTrophyDetail passed
+                 one garbage cell into [new SceneTrophyDetail(ss,
+                 trophy)]. *)
+              self#write_instruction0 REFREF
+          | _ -> compile_lvalue_after (jaf_to_ain_type e.ty))
       | Ident (_, GlobalVariable i) -> (
           match Ain.get_global_by_index ctx.ain i with
           | {
