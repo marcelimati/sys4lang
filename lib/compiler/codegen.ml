@@ -110,6 +110,24 @@ class jaf_compiler ctx debug_info =
 
     val mutable v12_last_use_deleted_vars : int list = []
 
+    (* v12 last-use release of NAMED iface locals: [Scenes::RunIScene]
+       releases [s] (and the factory-call dummy that initialized it)
+       right after [postEvent(s)] - BEFORE [ss.Release()] - so the
+       scene dies while the stack still exists; the VM's RETURN
+       auto-free does not cover iface fat-ref slots, so without this
+       every scene leaked and its parts survived the screen (the
+       collection-tab stacking bug). Sound only when the whole
+       function is visible to the use-walker: top-level statements of
+       a body with no labels/gotos (backward jumps could revive a
+       use) and no lambdas (captured uses are invisible,
+       [local_uses_expr] treats [Lambda] as a leaf). *)
+    val mutable v12_named_lastuse_ok : bool = false
+
+    (* named iface locals that OWN their value (call-result
+       initialized, +1); only these release at last use. *)
+    val mutable v12_iface_owned_locals : (int, unit) Hashtbl.t =
+      Hashtbl.create (module Int)
+
     val mutable suppress_inline_deleted_scope_cleanup = false
 
     val mutable block_depth : int = 0
@@ -1308,7 +1326,11 @@ class jaf_compiler ctx debug_info =
          Dummy slots are safe because their lifetime is always the
          single expression that filled them — the source AST never
          references a dummy slot across statement boundaries. *)
-      String.is_prefix local.name ~prefix:"<dummy"
+      (String.is_prefix local.name ~prefix:"<dummy"
+      || (v12_named_lastuse_ok
+         && Int.equal block_depth 1
+         && Hashtbl.mem v12_iface_owned_locals i
+         && not (String.is_prefix local.name ~prefix:"<")))
       &&
       match local.value_type with
       | IFace _ -> true
@@ -1335,6 +1357,70 @@ class jaf_compiler ctx debug_info =
         |> List.iter ~f:(fun i ->
                self#compile_delete_var (self#get_local i);
                v12_last_use_deleted_vars <- i :: v12_last_use_deleted_vars)
+
+    (* No labels/gotos (a backward jump could re-enter a use we walked
+       past) and no lambdas (captures invisible to the use walker). *)
+    method private v12_body_allows_named_lastuse stmts =
+      let ok = ref true in
+      let opt f = Option.iter ~f in
+      let rec chk_e (e : expression) =
+        match e.node with
+        | Lambda _ -> ok := false
+        | Unary (_, x)
+        | Cast (_, x)
+        | RvalueRef x
+        | OptionalMember (x, _, _)
+        | Member (x, _, _)
+        | DummyRef (_, x) ->
+            chk_e x
+        | Binary (_, a, b)
+        | Assign (_, a, b)
+        | Seq (a, b)
+        | NullCoalesce (a, b)
+        | Subscript (a, b) ->
+            chk_e a;
+            chk_e b
+        | Ternary (a, b, c) ->
+            chk_e a;
+            chk_e b;
+            chk_e c
+        | Call (c, args, _) ->
+            chk_e c;
+            List.iter args ~f:(opt chk_e)
+        | NewCall (_, args) -> List.iter args ~f:(opt chk_e)
+        | ArrayLiteral es -> List.iter es ~f:chk_e
+        | _ -> ()
+      in
+      let rec chk_s (st : statement) =
+        match st.node with
+        | Label _ | Goto _ -> ok := false
+        | Compound ss | Switch (_, ss) -> List.iter ss ~f:chk_s
+        | If (e, a, b) ->
+            chk_e e;
+            chk_s a;
+            chk_s b
+        | While (e, b) | DoWhile (e, b) ->
+            chk_e e;
+            chk_s b
+        | For (i, t, u, b) ->
+            chk_s i;
+            Option.iter t ~f:chk_e;
+            Option.iter u ~f:chk_e;
+            chk_s b
+        | ForEach (_, _, _, _, c, b) ->
+            chk_e c;
+            chk_s b
+        | Expression e | Case e | Jumps e -> chk_e e
+        | Return (Some e) -> chk_e e
+        | RefAssign (a, b) | ObjSwap (a, b) ->
+            chk_e a;
+            chk_e b
+        | Declarations d ->
+            List.iter d.vars ~f:(fun v -> Option.iter v.initval ~f:chk_e)
+        | _ -> ()
+      in
+      List.iter stmts ~f:chk_s;
+      !ok
 
     (** Walk lambda parent chain from [name]. The lambda-name pattern is
         [...<lambda : PARENT(line, col)>], possibly nested when a lambda
@@ -10092,6 +10178,29 @@ class jaf_compiler ctx debug_info =
         initval, the initval expression is computed and assigned to the
         variable. Otherwise a default value is assigned. *)
     method compile_variable_declaration (decl : variable) =
+      (match (decl.initval, decl.index) with
+      | Some iv, Some idx
+        when Ain.version_gte ctx.ain (12, 0)
+             && (match (self#get_local idx).value_type with
+                | Ain.Type.IFace _ -> true
+                | _ -> false) ->
+          (* Only a CALL-initialized iface local OWNS its value (the
+             call result is +1); wrap/member-initialized locals borrow
+             and orig does not release them at last use. Delegate
+             calls carry no DummyRef in the AST - unwrap Cast /
+             RvalueRef / DummyRef to find the Call. *)
+          let rec is_owned_call (e : expression) =
+            match e.node with
+            (* delegate / functype results transfer ownership (+1);
+               plain function/method results (AFL_*_Wrap family) are
+               engine borrows that orig never releases at last use *)
+            | Call (_, _, (DelegateCall _ | FuncTypeCall _)) -> true
+            | Cast (_, x) | RvalueRef x | DummyRef (_, x) -> is_owned_call x
+            | _ -> false
+          in
+          if is_owned_call iv then
+            Hashtbl.set v12_iface_owned_locals ~key:idx ~data:()
+      | _ -> ());
       if decl.is_const then ()
       else if
         Ain.version_gte ctx.ain (12, 0)
@@ -10914,6 +11023,14 @@ class jaf_compiler ctx debug_info =
       let prev_last_condition_deleted_dummies = last_condition_deleted_dummies in
       let prev_end_switch_deleted_dummies = end_switch_deleted_dummies in
       let prev_last_use_deleted_vars = v12_last_use_deleted_vars in
+      let prev_named_lastuse_ok = v12_named_lastuse_ok in
+      let prev_iface_owned = v12_iface_owned_locals in
+      v12_iface_owned_locals <- Hashtbl.create (module Int);
+      v12_named_lastuse_ok <-
+        Ain.version_gte ctx.ain (12, 0)
+        && (match decl.body with
+           | Some stmts -> self#v12_body_allows_named_lastuse stmts
+           | None -> false);
       let prev_block_depth = block_depth in
       let prev_v12_dummy_slots_initialized =
         Hashtbl.copy v12_dummy_slots_initialized
@@ -11094,6 +11211,8 @@ class jaf_compiler ctx debug_info =
       last_condition_deleted_dummies <- prev_last_condition_deleted_dummies;
       end_switch_deleted_dummies <- prev_end_switch_deleted_dummies;
       v12_last_use_deleted_vars <- prev_last_use_deleted_vars;
+      v12_named_lastuse_ok <- prev_named_lastuse_ok;
+      v12_iface_owned_locals <- prev_iface_owned;
       Hashtbl.clear v12_dummy_slots_initialized;
       Hashtbl.iteri prev_v12_dummy_slots_initialized ~f:(fun ~key ~data ->
           Hashtbl.set v12_dummy_slots_initialized ~key ~data);
