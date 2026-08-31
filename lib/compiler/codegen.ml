@@ -485,7 +485,15 @@ class jaf_compiler ctx debug_info =
         emit plain [PUSHSTRUCTPAGE] / [REF] into [PushBack 21]; the
         deref/This wrappers' auto-A_REF leaked one ref per element and
         diverged from orig. Scalars and S_PUSH literals stay plain. *)
-    method emit_array_literal_element (elem : expression) =
+    method emit_array_literal_element ?(elem_ty = -1) (elem : expression) =
+      (* elem_ty is the PushBack element-kind code. REF-element arrays
+         ([PushBack 21]): the runtime's store increfs the page-ref
+         itself, so even OWNED [new T(..)] elements push BARE - orig
+         AssistantMessageView@GetColorInfo emits [NEW; ASSIGN;
+         PushBack 21] with no A_REF (our bump leaked one ref per
+         element: the CASColors never died). VALUE-element arrays
+         ([PushBack 13]) keep the bump (CGroupInstance@AddBoxLine /
+         CLineInstance@GetOBB). *)
       let bare_struct_read =
         Ain.version_gte ctx.ain (12, 0)
         &&
@@ -504,8 +512,8 @@ class jaf_compiler ctx debug_info =
             self#write_instruction0 REF)
       else (
         self#compile_expression elem;
-        if self#needs_a_ref_for_consume elem then
-          self#write_instruction0 A_REF)
+        if self#needs_a_ref_for_consume elem && not (Int.equal elem_ty 21)
+        then self#write_instruction0 A_REF)
 
     (** Destructure [base.G1()....Gk()?.H1()....] — a getter chain with
         exactly one optional hop: plain zero-arg getters up to the
@@ -1880,7 +1888,7 @@ class jaf_compiler ctx debug_info =
                 (ASTExpression ref_expr);
               List.iter elems ~f:(fun elem ->
                   self#write_instruction0 DUP;
-                  self#emit_array_literal_element elem;
+                  self#emit_array_literal_element ~elem_ty elem;
                   self#compile_CALLHLL "Array" "PushBack" elem_ty
                     (ASTExpression ref_expr));
               (* v12 [return [new T(..), ..]]: the element dummies were
@@ -9039,7 +9047,7 @@ class jaf_compiler ctx debug_info =
           self#compile_CALLHLL "Array" "Free" elem_ty (ASTExpression expr);
           List.iter elems ~f:(fun elem ->
               self#write_instruction0 DUP;
-              self#emit_array_literal_element elem;
+              self#emit_array_literal_element ~elem_ty elem;
               self#compile_CALLHLL "Array" "PushBack" elem_ty
                 (ASTExpression expr));
           before_pop ();
@@ -10682,7 +10690,7 @@ class jaf_compiler ctx debug_info =
                     (ASTVariable decl);
                   List.iter elems ~f:(fun elem ->
                       self#write_instruction0 DUP;
-                      self#emit_array_literal_element elem;
+                      self#emit_array_literal_element ~elem_ty elem;
                       self#compile_CALLHLL "Array" "PushBack" elem_ty
                         (ASTVariable decl));
                   self#write_instruction0 POP
