@@ -10931,6 +10931,53 @@ class jaf_compiler ctx debug_info =
       let emits_v12_accessor_endfunc decl =
         v12 && Declarations.is_property_stub decl
       in
+      (* v12 "observer" setters - [T tmp = this.<X>; this.<X> = value;
+         this.OnChanged(tmp);] - carry ENDFUNC like the synthesized
+         property stubs (orig: exactly the 66 straight-line setters
+         with a local, >=2 assignments and a trailing single-arg
+         this-method call have ENDFUNC; the other 122 explicit setters
+         with locals do not; presumably compiler-generated from a
+         change-notification property sugar). *)
+      let v12_observer_setter_endfunc (decl : fundecl) =
+        v12
+        && String.is_suffix decl.name ~suffix:"::set"
+        && (not (Declarations.is_property_stub decl))
+        && (match decl.body with
+           | Some stmts ->
+               let has_decl =
+                 List.exists stmts ~f:(fun s ->
+                     match s.node with Declarations _ -> true | _ -> false)
+               in
+               let straight_line =
+                 List.for_all stmts ~f:(fun s ->
+                     match s.node with
+                     | Declarations _ | Expression _ -> true
+                     | _ -> false)
+               in
+               let observer_tail =
+                 match List.last stmts with
+                 | Some
+                     {
+                       node =
+                         Expression
+                           {
+                             node =
+                               Call
+                                 ( { node = Member ({ node = This; _ }, _, _); _ },
+                                   [ Some
+                                       { node = Ident (_, LocalVariable _); _ }
+                                   ],
+                                   _ );
+                             _;
+                           };
+                       _;
+                     } ->
+                     true
+                 | _ -> false
+               in
+               has_decl && straight_line && observer_tail
+           | None -> false)
+      in
       let rec stmt_has_early_return (s : statement) =
         match s.node with
         | Return _ -> true
@@ -11003,6 +11050,8 @@ class jaf_compiler ctx debug_info =
       | { is_lambda = true; _ } when v12 -> self#write_instruction1 ENDFUNC index
       | { name = "2"; _ } when v12 -> self#write_instruction1 ENDFUNC index
       | _ when emits_v12_accessor_endfunc decl ->
+          self#write_instruction1 ENDFUNC index
+      | _ when v12_observer_setter_endfunc decl ->
           self#write_instruction1 ENDFUNC index
       | { class_name = None; _ } when v12 -> self#write_instruction1 ENDFUNC index
       | { class_name = None; _ }
