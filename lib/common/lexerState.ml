@@ -25,6 +25,19 @@ let readonly_keyword = ref true
 let file_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_if_ret_short : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_cond_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+let file_lambda_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
+let detect_lambda_not_peel (source : string) =
+  let head = String.prefix source 200 in
+  match String.substr_index head ~pattern:"lambda-not-peel=" with
+  | None -> None
+  | Some i ->
+      let rest =
+        String.drop_prefix head (i + String.length "lambda-not-peel=")
+      in
+      if String.is_prefix rest ~prefix:"peel" then Some true
+      else if String.is_prefix rest ~prefix:"keep" then Some false
+      else None
 
 let detect_cond_peel (source : string) =
   let head = String.prefix source 200 in
@@ -72,7 +85,8 @@ let clear () =
   Hashtbl.clear templated;
   Hashtbl.clear file_not_peel;
   Hashtbl.clear file_if_ret_short;
-  Hashtbl.clear file_cond_peel
+  Hashtbl.clear file_cond_peel;
+  Hashtbl.clear file_lambda_not_peel
 
 (* Pre-scan a source string to register any identifier immediately followed
    by `<` (no whitespace between) as templated. The decompiler emits

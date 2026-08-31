@@ -516,7 +516,32 @@ let decompile ~move_to_original_file ~continue_on_error =
   let enums =
     Array.map Ain.ain.enum ~f:(fun name -> CodeGen.{ name; values = [] })
   in
-  if Ain.ain.vers >= 12 then FileStyle.compute files else FileStyle.compute [];
+  (if Ain.ain.vers >= 12 then
+     (* Style bits are computed per source file, but CodeSection.parse
+        pulls lambdas out of the per-file lists - and lambda bodies
+        carry style evidence too (file 36's long-if peel evidence is
+        entirely inside AddUserComponent's lambdas, and sys4c compiles
+        a lambda under its parent file's marker). Re-attribute each
+        lambda to the file whose address span contains it. *)
+     let lambda_list = Hashtbl.data lambdas in
+     let files_with_lambdas =
+       List.map files ~f:(fun (fname, funcs) ->
+           let lo, hi =
+             List.fold funcs ~init:(Int.max_value, Int.min_value)
+               ~f:(fun (lo, hi) (f : CodeSection.function_t) ->
+                 List.fold f.code ~init:(lo, hi)
+                   ~f:(fun (lo, hi) (l : _ Loc.loc) ->
+                     (Int.min lo l.addr, Int.max hi l.addr)))
+           in
+           let in_span (l : CodeSection.function_t) =
+             match l.code with
+             | { addr; _ } :: _ -> lo <= addr && addr <= hi
+             | [] -> false
+           in
+           (fname, funcs @ List.filter lambda_list ~f:in_span))
+     in
+     FileStyle.compute files_with_lambdas
+   else FileStyle.compute []);
   let globals = ref (to_variable_list Ain.ain.glob) in
   let srcs =
     List.map files ~f:(fun (fname, funcs) ->

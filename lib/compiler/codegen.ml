@@ -159,6 +159,11 @@ class jaf_compiler ctx debug_info =
        marker: fall back to the operand-kind heuristic). *)
     val mutable v12_not_peel : bool option = None
 
+    (* Lambda bodies may carry the other long-if peel style than the
+       file's plain functions (FileStyle.lambda_not_peel); None =
+       same as [v12_not_peel]. *)
+    val mutable v12_lambda_not_peel : bool option = None
+
     (* Per-file marker: negated conditions outside long-form ifs
        (while conditions, plain operands in short-form ifs) peeled
        ([operand; IFNZ skip]) vs kept ([operand; NOT; IFZ skip]). *)
@@ -9322,9 +9327,14 @@ class jaf_compiler ctx debug_info =
             | Compound _ | EmptyStatement -> false
             | _ -> true
           in
+          let effective_not_peel =
+            match (v12_lambda_not_peel, current_function) with
+            | Some b, Some f when f.is_lambda -> Some b
+            | _ -> v12_not_peel
+          in
           let test, peeled_lognot =
             if Ain.version_gte ctx.ain (12, 0) then
-              match (test.node, v12_not_peel) with
+              match (test.node, effective_not_peel) with
               (* Short-form (unbraced, else-less) if: BOTH compiler
                  builds peel a negated call (orig: 45 peeled short-if
                  sites, 0 kept; NOT survives only on negated
@@ -11468,6 +11478,8 @@ class jaf_compiler ctx debug_info =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
       v12_not_peel <- Hashtbl.find LexerState.file_not_peel jaf_name;
+      v12_lambda_not_peel <-
+        Hashtbl.find LexerState.file_lambda_not_peel jaf_name;
       v12_cond_peel <-
         Option.value (Hashtbl.find LexerState.file_cond_peel jaf_name)
           ~default:false;

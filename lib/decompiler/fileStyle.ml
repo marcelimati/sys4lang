@@ -13,6 +13,13 @@ open Base
 
 let not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 
+(* Lambda bodies in a file can carry the OTHER long-if peel style than
+   the file's plain functions (file 36: AddUserComponent's lambdas peel
+   [if (!name.EndsWith(..))] while activity::detail::Release keeps its
+   NOT). Evidence is pure per (file, context); emitted only when it
+   differs from [not_peel]. *)
+let lambda_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
 (* Second per-file bit: a negated condition OUTSIDE a long-form if -
    a while condition ([while (!x.Fn())] / [while (!flag)]: while-shaped
    loop [cond; IF? exit; body; JUMP head; exit:]) or a negated PLAIN
@@ -38,11 +45,16 @@ let is_call (i : Instructions.instruction) =
 
 let compute (files : (string * CodeSection.function_t list) list) =
   Hashtbl.clear not_peel;
+  Hashtbl.clear lambda_not_peel;
   Hashtbl.clear cond_peel;
   List.iter files ~f:(fun (fname, funcs) ->
       let kept = ref 0 and peeled = ref 0 in
+      let lam_kept = ref 0 and lam_peeled = ref 0 in
       let cond_kept = ref 0 and cond_peeled = ref 0 in
       List.iter funcs ~f:(fun f ->
+          let in_lambda = phys_equal f.CodeSection.func.kind Ain.Function.Lambda in
+          let kept = if in_lambda then lam_kept else kept
+          and peeled = if in_lambda then lam_peeled else peeled in
           let code = Array.of_list (List.map f.code ~f:(fun l -> l.Loc.txt)) in
           Array.iteri code ~f:(fun i ins ->
               match ins with
@@ -120,8 +132,22 @@ let compute (files : (string * CodeSection.function_t list) list) =
               | _ -> ()));
       if !cond_kept + !cond_peeled > 0 then
         Hashtbl.set cond_peel ~key:fname ~data:(!cond_peeled > !cond_kept);
-      if !kept + !peeled > 0 then
-        Hashtbl.set not_peel ~key:fname ~data:(!peeled > !kept))
+      (* the plain-function bit falls back to lambda evidence and vice
+         versa; the lambda bit is emitted only when it differs *)
+      let func_bit =
+        if !kept + !peeled > 0 then Some (!peeled > !kept)
+        else if !lam_kept + !lam_peeled > 0 then Some (!lam_peeled > !lam_kept)
+        else None
+      in
+      let lam_bit =
+        if !lam_kept + !lam_peeled > 0 then Some (!lam_peeled > !lam_kept)
+        else None
+      in
+      Option.iter func_bit ~f:(fun b -> Hashtbl.set not_peel ~key:fname ~data:b);
+      match (func_bit, lam_bit) with
+      | Some fb, Some lb when Bool.(fb <> lb) ->
+          Hashtbl.set lambda_not_peel ~key:fname ~data:lb
+      | _ -> ())
 
 let marker fname =
   let bits =
@@ -129,6 +155,8 @@ let marker fname =
       [
         Option.map (Hashtbl.find not_peel fname) ~f:(fun peel ->
             "not-peel=" ^ if peel then "peel" else "keep");
+        Option.map (Hashtbl.find lambda_not_peel fname) ~f:(fun peel ->
+            "lambda-not-peel=" ^ if peel then "peel" else "keep");
         Option.map (Hashtbl.find cond_peel fname) ~f:(fun peel ->
             "cond-peel=" ^ if peel then "1" else "0");
       ]
