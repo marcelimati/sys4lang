@@ -317,6 +317,16 @@ module Function = struct
     return_type : Type.t;
     is_label : bool;
     is_lambda : bool;
+    (* The bool between nr_vars and crc in v11+ function records is
+       NOT "is a lambda": the original compiler sets it only on
+       lambdas that CAPTURE the enclosing frame (Rance10: 648 of
+       3,203 lambdas, 638 of which use X_GETENV; the decompiler's
+       reader already calls it [capture]). Writing it for every
+       lambda made the VM pin the creating function's locals behind
+       every delegate - [p.OnChangeBgEvent += () => ...] then formed
+       a cycle (page -> delegate -> creator frame -> page) and no
+       collection page ever died: the tab-stacking bug. *)
+    captures_env : bool;
     crc : int32;
     struct_type : int option;
     enum_type : int option;
@@ -332,6 +342,7 @@ module Function = struct
       return_type = Void;
       is_label = false;
       is_lambda = false;
+      captures_env = false;
       crc = 0l;
       struct_type = None;
       enum_type = None;
@@ -619,6 +630,7 @@ let read_functions buf count =
       let nr_args = read_int buf in
       let nr_vars = read_int buf in
       let is_lambda = if_version_gte buf.ain (11, 0) read_bool false buf in
+      let captures_env = is_lambda in
       let crc = if_version_gte buf.ain (2, 0) read_int32 Int32.zero buf in
       let vars = read_variables buf nr_vars in
       let (f : Function.t) =
@@ -631,6 +643,7 @@ let read_functions buf count =
           return_type;
           is_label;
           is_lambda;
+          captures_env;
           crc;
           struct_type = None;
           enum_type = None;
@@ -1102,7 +1115,13 @@ let write_function buf ain (f : Function.t) =
   write_return_type buf ain f.return_type;
   BB.add_int buf f.nr_args;
   BB.add_int buf (List.length f.vars);
-  if_version_gte ain (11, 0) (BB.add_bool buf) () f.is_lambda;
+  (* v12: the capture-only semantic (Rance10 orig: 648 of 3,203
+     lambdas). v11 keeps the historical every-lambda write - Ixseal's
+     orig flags 317 functions on a broader-than-X_GETENV rule (v11
+     captures [this] through the env), and the all-lambda write is
+     the long-play-tested behavior there. *)
+  if_version_gte ain (11, 0) (BB.add_bool buf) ()
+    (if version_gte ain (12, 0) then f.captures_env else f.is_lambda);
   if_version_gte ain (2, 0) (BB.add_int32 buf) () f.crc;
   List.iter f.vars ~f:(write_variable buf ain)
 
@@ -1647,6 +1666,7 @@ let function_of_hll_function_index ain lib_no fun_no : Function.t =
     return_type = lib_fun.return_type;
     is_label = false;
     is_lambda = false;
+    captures_env = false;
     crc = 0l;
     struct_type = None;
     enum_type = None;
@@ -1689,6 +1709,7 @@ let function_of_functype (ft : FunctionType.t) no : Function.t =
     return_type = ft.return_type;
     is_label = false;
     is_lambda = false;
+    captures_env = false;
     crc = 0l;
     struct_type = None;
     enum_type = None;

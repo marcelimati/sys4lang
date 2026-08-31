@@ -69,6 +69,7 @@ module Function : sig
     return_type : Type.t;
     is_label : bool;
     is_lambda : bool;
+    captures_env : bool;
     crc : int32;
     struct_type : int option;
     enum_type : int option;

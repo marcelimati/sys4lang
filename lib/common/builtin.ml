@@ -46,7 +46,8 @@ let fundecl_of_syscall sys =
       params = make_params params [];
       body = None;
       is_label = false;
-      is_lambda = false; is_readonly = false;
+      is_lambda = false;
+      is_readonly = false;
       is_private = false;
       index = Some (int_of_syscall sys);
       class_name = None;
@@ -138,7 +139,8 @@ let fundecl_of_builtin ctx builtin receiver_ty node_opt =
       params = make_params params defaults;
       body = None;
       is_label = false;
-      is_lambda = false; is_readonly = false;
+      is_lambda = false;
+      is_readonly = false;
       is_private = false;
       index = None;
       class_name = None;
@@ -270,6 +272,7 @@ let default_function : Ain.Function.t =
     return_type = Void;
     is_label = false;
     is_lambda = false;
+    captures_env = false;
     crc = 0l;
     struct_type = None;
     enum_type = None;

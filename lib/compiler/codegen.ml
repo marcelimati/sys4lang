@@ -123,6 +123,17 @@ class jaf_compiler ctx debug_info =
        [local_uses_expr] treats [Lambda] as a leaf). *)
     val mutable v12_named_lastuse_ok : bool = false
 
+    (* Whether the function body emitted X_GETENV (captured a
+       variable from an enclosing frame). Written to the function
+       record as [captures_env] - the v11+ per-function bool that the
+       original compiler sets ONLY on capturing lambdas (the
+       decompiler's reader calls it [capture]). Setting it on every
+       lambda made the VM pin the creating frame behind every
+       delegate: [p.OnChangeBgEvent += () => ..] formed a
+       page->delegate->frame->page cycle and collection pages never
+       died (the tab-stacking bug). *)
+    val mutable v12_emitted_getenv : bool = false
+
     (* named iface locals that OWN their value (call-result
        initialized, +1); only these release at last use. *)
     val mutable v12_iface_owned_locals : (int, unit) Hashtbl.t =
@@ -1607,7 +1618,8 @@ class jaf_compiler ctx debug_info =
              variable index. *)
           self#write_instruction0 PUSHLOCALPAGE;
           for _ = 1 to level do
-            self#write_instruction0 X_GETENV
+            (v12_emitted_getenv <- true;
+             self#write_instruction0 X_GETENV)
           done;
           self#write_instruction1 PUSH i
       | GlobalVariable i ->
@@ -1700,7 +1712,8 @@ class jaf_compiler ctx debug_info =
              frame's local page. *)
           self#write_instruction0 PUSHLOCALPAGE;
           for _ = 1 to level do
-            self#write_instruction0 X_GETENV
+            (v12_emitted_getenv <- true;
+             self#write_instruction0 X_GETENV)
           done;
           self#write_instruction1 PUSH i;
           compile_lvalue_after (jaf_to_ain_type e.ty)
@@ -3827,7 +3840,8 @@ class jaf_compiler ctx debug_info =
              instead of the underlying string. *)
           self#write_instruction0 PUSHLOCALPAGE;
           for _ = 1 to level do
-            self#write_instruction0 X_GETENV
+            (v12_emitted_getenv <- true;
+             self#write_instruction0 X_GETENV)
           done;
           self#write_instruction1 PUSH i;
           let ty =
@@ -11024,6 +11038,8 @@ class jaf_compiler ctx debug_info =
       let prev_end_switch_deleted_dummies = end_switch_deleted_dummies in
       let prev_last_use_deleted_vars = v12_last_use_deleted_vars in
       let prev_named_lastuse_ok = v12_named_lastuse_ok in
+      let prev_emitted_getenv = v12_emitted_getenv in
+      v12_emitted_getenv <- false;
       let prev_iface_owned = v12_iface_owned_locals in
       v12_iface_owned_locals <- Hashtbl.create (module Int);
       v12_named_lastuse_ok <-
@@ -11171,7 +11187,7 @@ class jaf_compiler ctx debug_info =
         self#write_instruction0 RETURN);
       let crc = Crc32.finalize crc_state in
       crc_state <- prev_crc_state;
-      let func = { func with crc } in
+      let func = { func with crc; captures_env = v12_emitted_getenv } in
       (* ENDFUNC is not generated for the [NULL] function and methods
          except auto-generated array initializers — the global-init
          function ("0") and the per-class auto-array-initializer ("2")
@@ -11212,6 +11228,7 @@ class jaf_compiler ctx debug_info =
       end_switch_deleted_dummies <- prev_end_switch_deleted_dummies;
       v12_last_use_deleted_vars <- prev_last_use_deleted_vars;
       v12_named_lastuse_ok <- prev_named_lastuse_ok;
+      v12_emitted_getenv <- prev_emitted_getenv;
       v12_iface_owned_locals <- prev_iface_owned;
       Hashtbl.clear v12_dummy_slots_initialized;
       Hashtbl.iteri prev_v12_dummy_slots_initialized ~f:(fun ~key ~data ->
