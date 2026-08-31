@@ -1824,6 +1824,23 @@ class type_analyze_visitor ctx =
           in
           (match (con.ty, alt.ty) with
           | Ref _, Ref _ -> ()
+          (* v12 [c ? ref_expr : NULL]: NULL is already a valid null
+             reference (bare -1) - materializing it through a
+             [右辺値参照化用] local pushed a (page, slot) PAIR where the
+             merge point expects a single page-ref, so the getter
+             returned a live ref to the local page instead of NULL and
+             every [== NULL] guard on the result passed wrongly (orig
+             CParts@FuncSet::get else arm is a bare [PUSH -1]; the
+             FuncSet guards gate the whole parts system). Keep the ref
+             branch's ref-ness and type the NULL arm as the same ref. *)
+          | Ref t, _
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (match alt.node with Null -> true | _ -> false) ->
+              alt.ty <- Ref t
+          | _, Ref t
+            when Ain.version_gte ctx.ain (12, 0)
+                 && (match con.node with Null -> true | _ -> false) ->
+              con.ty <- Ref t
           | Ref t, _ ->
               if Ain.version_gte ctx.ain (11, 0) && needs_rval_wrap t then (
                 let inner = clone_expr alt in
