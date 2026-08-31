@@ -9366,9 +9366,23 @@ class jaf_compiler ctx debug_info =
               match (test.node, effective_not_peel) with
               (* Short-form (unbraced, else-less) if: BOTH compiler
                  builds peel a negated call (orig: 45 peeled short-if
-                 sites, 0 kept; NOT survives only on negated
-                 non-calls). *)
-              | Unary (LogNot, ({ node = Call _; _ } as inner)), _
+                 sites, 0 kept) and a negated comparison
+                 ([if (!(pre == item.GetTextBoxText()))]: 18 peeled,
+                 0 kept - the inverted skip keeps the comparison's own
+                 opcode). NOT survives only on negated plain reads
+                 (per-file cond-peel below). *)
+              | ( Unary
+                    ( LogNot,
+                      ({ node =
+                           ( Call _
+                           | Binary
+                               ( ( Equal | NEqual | RefEqual | RefNEqual
+                                 | LT | GT | LTE | GTE ),
+                                 _,
+                                 _ ) );
+                         _;
+                       } as inner) ),
+                  _ )
                 when unbraced_body
                      && (match alt.node with
                         | EmptyStatement -> true
