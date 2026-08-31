@@ -551,3 +551,13 @@ let cond_decl_marks : (string, unit) Base.Hashtbl.t =
   Base.Hashtbl.create (module Base.String)
 
 let cond_decl_key fno vidx = Printf.sprintf "%d:%d" fno vidx
+
+(* v12 short-form ifs ([cond; IFZ end; stmt; end:], no JUMP over the
+   body): the original v12 compiler emits this shape for an if whose
+   then-body is a single UNBRACED statement, and the long
+   [IFNZ then; JUMP end; then: ...] shape for a braced body (which
+   also gets the block-end temp replay). Keyed by the IfElse
+   statement's (bytecode) address; set in ControlFlow.reduce_if_then,
+   consumed by CodeGen to print the body without braces. *)
+let unbraced_if_marks : (int, unit) Base.Hashtbl.t =
+  Base.Hashtbl.create (module Base.Int)

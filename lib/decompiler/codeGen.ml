@@ -771,6 +771,26 @@ class code_printer ?(print_addr = false) ?(dbginfo = create_debug_info ())
             self#println "%a = %a;" self#pr_vardecl var
               (self#pr_expr ~parent_op:op op.rprec)
               e
+        | IfElse (expr, stmt1, stmt2)
+          when Ain.ain.vers >= 12
+               && (match stmt2.txt with Block [] -> true | _ -> false)
+               && Base.Hashtbl.mem Ast.unbraced_if_marks stmt.addr
+               && (match stmt1.txt with
+                  | Block [ { txt = (Expression _ | Return _ | Continue
+                                    | Break | Goto _); _ } ]
+                  | Expression _ | Return _ | Continue | Break | Goto _ ->
+                      true
+                  | _ -> false) ->
+            (* v12 short-form if: single-statement body printed without
+               braces so sys4c reproduces [IFZ end; stmt; end:] with a
+               single temp release (no block-end replay). *)
+            if not in_else_if then self#addr_and_indent stmt.addr;
+            self#println "if (%a)" (self#pr_expr 0) expr;
+            self#with_indent (fun () ->
+                print_stmt
+                  (match stmt1.txt with
+                  | Block [ single ] -> single
+                  | _ -> stmt1))
         | IfElse (expr, stmt1, stmt2) -> (
             if not in_else_if then self#addr_and_indent stmt.addr;
             self#println "if (%a) {" (self#pr_expr 0) expr;

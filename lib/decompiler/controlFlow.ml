@@ -445,6 +445,8 @@ let reduce_switch cfg node0 =
     bb1..bbk-1: then clause
     bbk:
     => if (expr) { bb1..bbk-1 } *)
+let v12_long_if_addrs : (int, unit) Hashtbl.t = Hashtbl.create (module Int)
+
 let reduce_if_then cfg node0 branch_target =
   let bb0 = CFG.value_exn node0 in
   match bb0 with
@@ -452,6 +454,11 @@ let reduce_if_then cfg node0 branch_target =
    code = { txt = Branch (join_addr, expr); addr = expr_addr; _ }, stmts0;
    _;
   } ->
+      (* v12 short-form if: a Branch that was NOT rewritten from the
+         [IFNZ then; JUMP end] pair means the original emitted the
+         unbraced [IFZ end; stmt; end:] shape. *)
+      if Ain.ain.vers >= 12 && not (Hashtbl.mem v12_long_if_addrs expr_addr)
+      then Hashtbl.set Ast.unbraced_if_marks ~key:expr_addr ~data:();
       let then_stmt =
         CFG.splice cfg (CFG.next node0) branch_target |> collapse
       in
@@ -667,6 +674,7 @@ let rec reduce_forward_branch cfg node0 branch_target =
               IFNZ label1
       *)
       CFG.remove cfg jump_node;
+      Hashtbl.set v12_long_if_addrs ~key:term.addr ~data:();
       CFG.set node0
         {
           bb0 with

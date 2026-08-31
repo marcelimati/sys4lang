@@ -159,10 +159,6 @@ class jaf_compiler ctx debug_info =
        marker: fall back to the operand-kind heuristic). *)
     val mutable v12_not_peel : bool option = None
 
-    (* Per-file marker: [if (c) return;] compiled as the short skip
-       form (IFZ end; RETURN; end:). *)
-    val mutable v12_if_ret_short : bool = false
-
     (* v12: the LAST top-level statement of a lambda body does not
        release its expression temps — the frame teardown at the
        implicit RETURN does (orig: 212 of 227 straight-line lambdas). *)
@@ -9259,10 +9255,12 @@ class jaf_compiler ctx debug_info =
           let empty_statement stmt =
             match stmt.node with EmptyStatement -> true | _ -> false
           in
+          (* Unbraced only: a braced [if (x == null) { return; }] is
+             compiled in the general long form (sys4dc encodes the
+             original shape as braced-ness of the then body). *)
           let branch_exit_statement stmt =
             match stmt.node with
             | Return _ | Continue | Break -> true
-            | Compound [ { node = (Return _ | Continue | Break); _ } ] -> true
             | _ -> false
           in
           let inverted_null_test =
@@ -9334,17 +9332,24 @@ class jaf_compiler ctx debug_info =
              both the taken and not-taken branch see them cleaned up. *)
           self#cleanup_condition_dummyrefs vars_before;
           self#maybe_emit_condition_itob test;
-          let bare_return_body =
+          let unbraced_body =
             match con.node with
-            | Return None | Compound [ { node = Return None; _ } ] -> true
-            | _ -> false
+            | Compound _ | EmptyStatement -> false
+            | _ -> true
           in
           if
             Ain.version_gte ctx.ain (12, 0)
-            && v12_if_ret_short && bare_return_body && empty_statement alt
+            && unbraced_body && empty_statement alt
           then (
-            (* Short form ([cond; IFZ end; RETURN; end:]) - a per-file
-               compiler-build style, see FileStyle. *)
+            (* v12 short form ([cond; IFZ end; stmt; end:]): an UNBRACED
+               single-statement then body (sys4dc prints the original's
+               short shape without braces). No JUMP, no arm replays: the
+               body's temps release once inline and stay registered in
+               the ENCLOSING scope (at function scope that means no
+               replay at all - orig ComboView@Hide releases its two
+               call temps exactly once). Condition temps released
+               before the branch are not replayed on either arm
+               (orig CInstanceParamSetter@SetValue<> null guards). *)
             let skip_op = if peeled_lognot then IFNZ else IFZ in
             let skip_addr = current_address + 2 in
             self#write_instruction1 skip_op 0;
@@ -11428,9 +11433,6 @@ class jaf_compiler ctx debug_info =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
       v12_not_peel <- Hashtbl.find LexerState.file_not_peel jaf_name;
-      v12_if_ret_short <-
-        Option.value (Hashtbl.find LexerState.file_if_ret_short jaf_name)
-          ~default:false;
       let compile_decl = function
         | Jaf.Function f
           when Ain.version_gte ctx.ain (12, 0)
