@@ -24,6 +24,17 @@ let readonly_keyword = ref true
    project file. *)
 let file_not_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
 let file_if_ret_short : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+let file_cond_peel : (string, bool) Hashtbl.t = Hashtbl.create (module String)
+
+let detect_cond_peel (source : string) =
+  let head = String.prefix source 200 in
+  match String.substr_index head ~pattern:"cond-peel=" with
+  | None -> None
+  | Some i ->
+      let rest = String.drop_prefix head (i + String.length "cond-peel=") in
+      if String.is_prefix rest ~prefix:"1" then Some true
+      else if String.is_prefix rest ~prefix:"0" then Some false
+      else None
 
 let detect_if_ret_short (source : string) =
   let head = String.prefix source 200 in
@@ -60,7 +71,8 @@ let is_cond_scoped fname pos name = Hashtbl.mem cond_scoped (cond_key fname pos 
 let clear () =
   Hashtbl.clear templated;
   Hashtbl.clear file_not_peel;
-  Hashtbl.clear file_if_ret_short
+  Hashtbl.clear file_if_ret_short;
+  Hashtbl.clear file_cond_peel
 
 (* Pre-scan a source string to register any identifier immediately followed
    by `<` (no whitespace between) as templated. The decompiler emits

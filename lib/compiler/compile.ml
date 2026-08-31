@@ -62,6 +62,8 @@ let parse_pass ctx sources read_file =
               Hashtbl.set LexerState.file_not_peel ~key:f ~data:peel);
           Option.iter (LexerState.detect_if_ret_short source) ~f:(fun short ->
               Hashtbl.set LexerState.file_if_ret_short ~key:f ~data:short);
+          Option.iter (LexerState.detect_cond_peel source) ~f:(fun peel ->
+              Hashtbl.set LexerState.file_cond_peel ~key:f ~data:peel);
           (src, source)
       | _ -> failwith "unreachable")
   in

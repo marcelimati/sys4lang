@@ -159,6 +159,11 @@ class jaf_compiler ctx debug_info =
        marker: fall back to the operand-kind heuristic). *)
     val mutable v12_not_peel : bool option = None
 
+    (* Per-file marker: negated conditions outside long-form ifs
+       (while conditions, plain operands in short-form ifs) peeled
+       ([operand; IFNZ skip]) vs kept ([operand; NOT; IFZ skip]). *)
+    val mutable v12_cond_peel : bool = false
+
     (* v12: the LAST top-level statement of a lambda body does not
        release its expression temps — the frame teardown at the
        implicit RETURN does (orig: 212 of 227 straight-line lambdas). *)
@@ -9312,9 +9317,33 @@ class jaf_compiler ctx debug_info =
              [!g_bRestrainScreensaverWhileAutoMode] (bool global) and
              [!system.IsDebugMode()] (bool CALLHLL, DebugLogTextToClipboard);
              peeled for [!this.IsEnd()] (bool CALLMETHOD, CASTask@IsEndTask). *)
+          let unbraced_body =
+            match con.node with
+            | Compound _ | EmptyStatement -> false
+            | _ -> true
+          in
           let test, peeled_lognot =
             if Ain.version_gte ctx.ain (12, 0) then
               match (test.node, v12_not_peel) with
+              (* Short-form (unbraced, else-less) if: BOTH compiler
+                 builds peel a negated call (orig: 45 peeled short-if
+                 sites, 0 kept; NOT survives only on negated
+                 non-calls). *)
+              | Unary (LogNot, ({ node = Call _; _ } as inner)), _
+                when unbraced_body
+                     && (match alt.node with
+                        | EmptyStatement -> true
+                        | _ -> false) ->
+                  (inner, true)
+              (* Short-form if on a negated NON-call: per-file
+                 cond-peel build style (orig: peeled in 15 files,
+                 kept in 3, none mixed). *)
+              | Unary (LogNot, inner), _
+                when v12_cond_peel && unbraced_body
+                     && (match alt.node with
+                        | EmptyStatement -> true
+                        | _ -> false) ->
+                  (inner, true)
               (* File compiled by the NOT-keeping compiler build. *)
               | _, Some false -> (test, false)
               (* NOT-peeling build: every negated call is peeled. *)
@@ -9332,11 +9361,6 @@ class jaf_compiler ctx debug_info =
              both the taken and not-taken branch see them cleaned up. *)
           self#cleanup_condition_dummyrefs vars_before;
           self#maybe_emit_condition_itob test;
-          let unbraced_body =
-            match con.node with
-            | Compound _ | EmptyStatement -> false
-            | _ -> true
-          in
           if
             Ain.version_gte ctx.ain (12, 0)
             && unbraced_body && empty_statement alt
@@ -9481,6 +9505,17 @@ class jaf_compiler ctx debug_info =
             | Some scope -> List.length scope.vars
             | None -> 0
           in
+          (* v12 [while (!cond)]: the cond-peel per-file build style
+             (see FileStyle.cond_peel) peels the NOT and inverts the
+             exit branch - any operand kind (orig peels plain members
+             too: SceneBattleInformation@Run [while (!m_isFinish)]). *)
+          let test, loop_peeled =
+            if Ain.version_gte ctx.ain (12, 0) && v12_cond_peel then
+              match test.node with
+              | Unary (LogNot, inner) -> (inner, true)
+              | _ -> (test, false)
+            else (test, false)
+          in
           self#compile_expression test;
           (* v11: release condition-local dummies before the IFZ so
              both the continue and the exit branch see them cleaned
@@ -9488,7 +9523,7 @@ class jaf_compiler ctx debug_info =
           self#cleanup_condition_dummyrefs vars_before;
           self#maybe_emit_condition_itob test;
           let break_addr = current_address + 2 in
-          self#write_instruction1 IFZ 0;
+          self#write_instruction1 (if loop_peeled then IFNZ else IFZ) 0;
           (* loop body *)
           self#compile_statement body;
           self#write_instruction1 JUMP loop_addr;
@@ -11433,6 +11468,9 @@ class jaf_compiler ctx debug_info =
       start_address <- Ain.code_size ctx.ain;
       current_address <- start_address;
       v12_not_peel <- Hashtbl.find LexerState.file_not_peel jaf_name;
+      v12_cond_peel <-
+        Option.value (Hashtbl.find LexerState.file_cond_peel jaf_name)
+          ~default:false;
       let compile_decl = function
         | Jaf.Function f
           when Ain.version_gte ctx.ain (12, 0)
