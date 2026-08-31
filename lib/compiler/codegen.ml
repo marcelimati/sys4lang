@@ -10434,6 +10434,28 @@ class jaf_compiler ctx debug_info =
             let prev_suppress = v12_suppress_localassign in
             if Option.is_some pending_foreach then
               v12_suppress_localassign <- true;
+            (match (v.value_type, rhs.node) with
+            | Ain.Type.String, Member (_, member_name, ClassVariable _)
+              when Ain.version_gte ctx.ain (12, 0)
+                   && (match rhs.ty with String -> true | _ -> false)
+                   && String.is_prefix member_name ~prefix:"<"
+                   && String.is_suffix member_name ~suffix:">" ->
+                (* v12 [string tmp = this.<X>;] where <X> is a property
+                   BACKING member: its string ref is pushed BARE (no
+                   A_REF rvalue bump - S_ASSIGN reads through the ref)
+                   and the S_ASSIGN result is POPped, not DELETEd
+                   (orig observer setters like CInstanceItem@Name::set:
+                   [.LOCALREF tmp; .STRUCTREF <Name>; S_ASSIGN; POP]).
+                   Ordinary members keep the A_REF (BattleLog@Width::get
+                   [.STRUCTREF ...; A_REF]). *)
+                self#compile_variable_ref lhs;
+                self#write_instruction0 REF;
+                self#compile_variable_ref rhs;
+                self#write_instruction0 REF;
+                self#write_instruction0 S_ASSIGN;
+                self#cleanup_condition_dummyrefs release_from;
+                self#write_instruction0 POP
+            | _ ->
             Exn.protect
               ~f:(fun () ->
                 self#compile_expr_and_pop
@@ -10445,7 +10467,7 @@ class jaf_compiler ctx debug_info =
                     ty = rhs.ty;
                     loc = decl.location;
                   })
-              ~finally:(fun () -> v12_suppress_localassign <- prev_suppress)
+              ~finally:(fun () -> v12_suppress_localassign <- prev_suppress))
         | Struct sno -> (
             (* FIXME: use verbose versions *)
             let v12 = Ain.version_gte ctx.ain (12, 0) in
