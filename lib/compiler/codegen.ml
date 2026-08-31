@@ -8074,6 +8074,33 @@ class jaf_compiler ctx debug_info =
       | Some (_, _, _, hops) as r when List.length hops >= 2 -> r
       | _ -> None
 
+    (** v12 short-form / null-fast-path ifs: the condition's released
+        temps and any condition-scoped declaration must not be replayed
+        by the enclosing scope's end (for a cond-scoped decl that scope
+        is the synthetic [wrap_cond_decls] block closing right after
+        the if - replaying there deletes a STILL-LIVE variable: orig
+        CInstanceParamSetter@SetValue<> uses [parts] after the guard).
+        Mirrors the braced with-cleanup layout's scope drop. *)
+    method v12_drop_condition_slots saved_last =
+      match Stack.top scopes with
+      | Some scope ->
+          scope.vars <-
+            List.filter scope.vars ~f:(fun v ->
+                (* cond-scoped decls never replay; IFace cond temps
+                   stay out of replays like in the braced layout (their
+                   release is deferred to last-use tracking) - but
+                   Ref/Struct cond temps DO get the enclosing scope's
+                   replay (orig CToolBar@SelectPolygon releases its
+                   guard's call temp again right after the end
+                   label). *)
+                (not (Hashtbl.mem v12_cond_scoped_slots v.index))
+                && not
+                     (List.mem saved_last v.index ~equal:Int.equal
+                     && (match v.value_type with
+                        | Ain.Type.IFace _ -> true
+                        | _ -> false)))
+      | None -> ()
+
     method v12_compile_branch ~fallthrough (b : statement) =
       v12_pending_fallthrough <- Ain.version_gte ctx.ain (12, 0) && fallthrough;
       Exn.protect
@@ -9302,11 +9329,13 @@ class jaf_compiler ctx debug_info =
             let test = Option.value_exn inverted_null_test in
             self#compile_expression test;
             self#cleanup_condition_dummyrefs vars_before;
+            let saved_last = last_condition_deleted_dummies in
             self#maybe_emit_condition_itob test;
             let after_return_addr = current_address + 2 in
             self#write_instruction1 IFNZ 0;
             self#compile_statement con;
-            self#write_address_at after_return_addr current_address)
+            self#write_address_at after_return_addr current_address;
+            self#v12_drop_condition_slots saved_last)
           else (
           let _ = empty_statement in
           let _ = branch_exit_statement in
@@ -9384,11 +9413,13 @@ class jaf_compiler ctx debug_info =
                call temps exactly once). Condition temps released
                before the branch are not replayed on either arm
                (orig CInstanceParamSetter@SetValue<> null guards). *)
+            let saved_last = last_condition_deleted_dummies in
             let skip_op = if peeled_lognot then IFNZ else IFZ in
             let skip_addr = current_address + 2 in
             self#write_instruction1 skip_op 0;
             self#compile_statement con;
-            self#write_address_at skip_addr current_address)
+            self#write_address_at skip_addr current_address;
+            self#v12_drop_condition_slots saved_last)
           else
           if Ain.version_gte ctx.ain (12, 0) then (
             (* Capture the per-if cleanup slot list now; nested ifs in con
