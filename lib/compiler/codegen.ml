@@ -3056,14 +3056,18 @@ class jaf_compiler ctx debug_info =
         (not (Hashtbl.mem pre_emitted_lambdas lambda_idx))
         && not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
       then (
+        (* Our own jump-over is written FIRST, then any cascaded
+           first-statement nested frames, then our FUNC (orig
+           IsExistCaptureSkill: [JUMP end; JUMP after-inner; inner;
+           after-inner:; outer; end:]). *)
+        let jump_addr = current_address + 2 in
+        self#write_instruction1 JUMP 0;
         (if cascade then
            match f.body with
            | Some (first :: _) ->
                List.iter (self#v12_stmt_direct_lambdas first)
                  ~f:self#v12_emit_lambda_frame
            | _ -> ());
-        let jump_addr = current_address + 2 in
-        self#write_instruction1 JUMP 0;
         self#compile_function f;
         self#write_address_at jump_addr current_address;
         Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
