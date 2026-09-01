@@ -132,7 +132,16 @@ class jaf_compiler ctx debug_info =
        delegate: [p.OnChangeBgEvent += () => ..] formed a
        page->delegate->frame->page cycle and collection pages never
        died (the tab-stacking bug). *)
-    val mutable v12_emitted_getenv : bool = false
+    (* v12 captures_env, by function index. A level-L X_GETENV walk
+       flags the reading lambda AND the L-1 LEXICAL ancestor lambdas
+       it walks THROUGH (orig LeaderCardCollection@
+       IsExistSkillEffectType: the intermediate lambda is flagged with
+       no X_GETENV of its own — its frame is a link in the inner's
+       2-level chain). The level-L HOLDER frame is not flagged, and
+       plain functions never are (orig has 0 flagged non-lambdas).
+       Keyed by index, not compile nesting — hoisted lambda frames
+       compile from the plain function's context. *)
+    val v12_env_linked : (int, unit) Hashtbl.t = Hashtbl.create (module Int)
 
     (* named iface locals that OWN their value (call-result
        initialized, +1); only these release at last use. *)
@@ -1662,6 +1671,19 @@ class jaf_compiler ctx debug_info =
       self#write_instruction0 PUSHGLOBALPAGE;
       self#write_instruction1 PUSH i
 
+    (** Mark captures_env for a level-[level] X_GETENV walk: the
+        current lambda and the lexical ancestor lambdas the walk
+        passes THROUGH (positions 0..level-2 of
+        [enclosing_functions]). The frame at position level-1 holds
+        the variable and is not marked. *)
+    method private v12_mark_getenv level =
+      (match current_function with
+      | Some f -> Hashtbl.set v12_env_linked ~key:f.index ~data:()
+      | None -> ());
+      List.iteri enclosing_functions ~f:(fun d (anc : Ain.Function.t) ->
+          if d < level - 1 && anc.is_lambda then
+            Hashtbl.set v12_env_linked ~key:anc.index ~data:())
+
     method compile_identifier_ref id_type =
       match id_type with
       | LocalVariable (i, _) -> self#compile_local_ref (self#get_local i).index
@@ -1670,9 +1692,9 @@ class jaf_compiler ctx debug_info =
              from the current local page, then push the outer frame's
              variable index. *)
           self#write_instruction0 PUSHLOCALPAGE;
+          self#v12_mark_getenv level;
           for _ = 1 to level do
-            (v12_emitted_getenv <- true;
-             self#write_instruction0 X_GETENV)
+            self#write_instruction0 X_GETENV
           done;
           self#write_instruction1 PUSH i
       | GlobalVariable i ->
@@ -1764,9 +1786,9 @@ class jaf_compiler ctx debug_info =
              value is read like any local but lives in an outer
              frame's local page. *)
           self#write_instruction0 PUSHLOCALPAGE;
+          self#v12_mark_getenv level;
           for _ = 1 to level do
-            (v12_emitted_getenv <- true;
-             self#write_instruction0 X_GETENV)
+            self#write_instruction0 X_GETENV
           done;
           self#write_instruction1 PUSH i;
           (match e.ty with
@@ -4132,9 +4154,9 @@ class jaf_compiler ctx debug_info =
              and would emit a plain [REF] that loads the ref-handle
              instead of the underlying string. *)
           self#write_instruction0 PUSHLOCALPAGE;
+          self#v12_mark_getenv level;
           for _ = 1 to level do
-            (v12_emitted_getenv <- true;
-             self#write_instruction0 X_GETENV)
+            self#write_instruction0 X_GETENV
           done;
           self#write_instruction1 PUSH i;
           let ty =
@@ -11530,8 +11552,6 @@ class jaf_compiler ctx debug_info =
       let prev_end_switch_deleted_dummies = end_switch_deleted_dummies in
       let prev_last_use_deleted_vars = v12_last_use_deleted_vars in
       let prev_named_lastuse_ok = v12_named_lastuse_ok in
-      let prev_emitted_getenv = v12_emitted_getenv in
-      v12_emitted_getenv <- false;
       let prev_iface_owned = v12_iface_owned_locals in
       v12_iface_owned_locals <- Hashtbl.create (module Int);
       v12_named_lastuse_ok <-
@@ -11679,7 +11699,12 @@ class jaf_compiler ctx debug_info =
         self#write_instruction0 RETURN);
       let crc = Crc32.finalize crc_state in
       crc_state <- prev_crc_state;
-      let func = { func with crc; captures_env = v12_emitted_getenv } in
+      let func =
+        { func with
+          crc;
+          captures_env = Hashtbl.mem v12_env_linked func.index;
+        }
+      in
       (* ENDFUNC is not generated for the [NULL] function and methods
          except auto-generated array initializers — the global-init
          function ("0") and the per-class auto-array-initializer ("2")
@@ -11720,7 +11745,6 @@ class jaf_compiler ctx debug_info =
       end_switch_deleted_dummies <- prev_end_switch_deleted_dummies;
       v12_last_use_deleted_vars <- prev_last_use_deleted_vars;
       v12_named_lastuse_ok <- prev_named_lastuse_ok;
-      v12_emitted_getenv <- prev_emitted_getenv;
       v12_iface_owned_locals <- prev_iface_owned;
       Hashtbl.clear v12_dummy_slots_initialized;
       Hashtbl.iteri prev_v12_dummy_slots_initialized ~f:(fun ~key ~data ->
