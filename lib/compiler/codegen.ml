@@ -2447,6 +2447,30 @@ class jaf_compiler ctx debug_info =
             ("compile_pop: unsupported value type " ^ jaf_type_to_string t)
             (Some parent)
 
+    (** v12: a local stored in the IFace ENCODING of a CLASS (an
+        iface-compatible class, not a true interface) passes its page
+        id to ref/iface params with a single REF — orig
+        CAS3DStage@AddElement: [.LOCALREF object] to AddObject, not
+        [.LOCALREFREF]. Returns the local's slot when the rule
+        applies. *)
+    method private v12_class_iface_local_arg (expr : expression) =
+      if not (Ain.version_gte ctx.ain (12, 0)) then None
+      else
+        let rec peel (e : expression) =
+          match e.node with Cast (_, x) | RvalueRef x -> peel x | _ -> e
+        in
+        match (peel expr).node with
+        | Ident (_, LocalVariable (i, _)) -> (
+            match (self#get_local i).value_type with
+            | Ain.Type.IFace sno when sno >= 0 ->
+                if
+                  Hashtbl.mem ctx.interface_names
+                    (Ain.get_struct_by_index ctx.ain sno).name
+                then None
+                else Some i
+            | _ -> None)
+        | _ -> None
+
     method compile_argument (expr : expression option) (t : Ain.Type.t) =
       match expr with
       | None -> compiler_bug "missing argument" None
@@ -2547,7 +2571,11 @@ class jaf_compiler ctx debug_info =
                  <void>). Interface-typed values already carry both
                  slots through [compile_lvalue]; concrete struct values
                  need the implemented interface vtable offset appended. *)
-              self#compile_lvalue expr;
+              (match self#v12_class_iface_local_arg expr with
+              | Some i ->
+                  self#compile_local_ref i;
+                  self#write_instruction0 REF
+              | None -> self#compile_lvalue expr);
               (* Foreach loop-vars over iface arrays are stored as
                  [Wrap (IFace _)]: compile_lvalue leaves the
                  wrap-handle location, and orig adds a second [REFREF]
@@ -2571,22 +2599,31 @@ class jaf_compiler ctx debug_info =
                       (self#interface_vtable_offset actual_sno iface_sno)
                       ~f:(fun offset -> self#write_instruction1 PUSH offset)
               | _ -> ())
-          | Ref _ ->
-              self#compile_lvalue expr;
-              (* v11 [Wrap T] lvalue (foreach loop var, etc.): the
-                 [compile_lvalue_after] tail for non-string Wrap leaves
-                 page+slot of the wrap on the stack. A [ref T] callee
-                 wants the underlying page-ref instead — unpack the
-                 wrap with [REFREF; REF]. Without this, passing a
-                 [foreach] loop var (typed [Wrap HLLParam]) to a
-                 [ref Struct] parameter pushes one extra slot and the
-                 callee pops one fewer arg than declared. *)
-              (match expr.ty with
-              | Wrap (String | Int | Float | Bool | LongInt) -> ()
-              | Wrap _ when Ain.version ctx.ain > 8 ->
-                  self#write_instruction0 REFREF;
+          | Ref _ -> (
+              match self#v12_class_iface_local_arg expr with
+              | Some i ->
+                  (* Class-repr IFace local to a [ref T] param: pass
+                     the page id with a single REF (orig CAS3DStage@
+                     AddElement: [.LOCALREF object] to
+                     AddObject(ref CObject)). *)
+                  self#compile_local_ref i;
                   self#write_instruction0 REF
-              | _ -> ())
+              | None -> (
+                  self#compile_lvalue expr;
+                  (* v11 [Wrap T] lvalue (foreach loop var, etc.): the
+                     [compile_lvalue_after] tail for non-string Wrap leaves
+                     page+slot of the wrap on the stack. A [ref T] callee
+                     wants the underlying page-ref instead — unpack the
+                     wrap with [REFREF; REF]. Without this, passing a
+                     [foreach] loop var (typed [Wrap HLLParam]) to a
+                     [ref Struct] parameter pushes one extra slot and the
+                     callee pops one fewer arg than declared. *)
+                  match expr.ty with
+                  | Wrap (String | Int | Float | Bool | LongInt) -> ()
+                  | Wrap _ when Ain.version ctx.ain > 8 ->
+                      self#write_instruction0 REFREF;
+                      self#write_instruction0 REF
+                  | _ -> ()))
           | Wrap _ when Ain.version_gte ctx.ain (12, 0) ->
               (* v12 property event ref parameters are encoded as
                  Wrap<T> + <void>. The callee wants the raw source
@@ -8277,6 +8314,46 @@ class jaf_compiler ctx debug_info =
             Stack.push scopes self_scope)
       | None -> ()
 
+    (** v12: named locals ASSIGNED inside an if condition
+        ([(object = CObject(element)) != NULL]) whose ain type is the
+        2-slot IFace encoding of a CLASS (an iface-compatible class,
+        not a true interface) join the if's both-branch replay set:
+        orig releases them on the false path before the JUMP to alt
+        and again right after the then-body (CAS3DStage@AddElement's
+        object/group/brush cast-guard chain). *)
+    method private v12_cond_assigned_class_iface (test : expression) =
+      let out = ref [] in
+      let is_class_iface i =
+        match (self#get_local i).value_type with
+        | Ain.Type.IFace sno when sno >= 0 ->
+            not
+              (Hashtbl.mem ctx.interface_names
+                 (Ain.get_struct_by_index ctx.ain sno).name)
+        | _ -> false
+      in
+      let rec walk (e : expression) =
+        match e.node with
+        | Assign (EqAssign, { node = Ident (_, LocalVariable (i, _)); _ }, rhs)
+          ->
+            if is_class_iface i then out := i :: !out;
+            walk rhs
+        | Assign (_, a, b) | Binary (_, a, b) | Seq (a, b) | Subscript (a, b)
+          ->
+            walk a;
+            walk b
+        | Unary (_, x) | Cast (_, x) | RvalueRef x | DummyRef (_, x) -> walk x
+        | Ternary (a, b, c) ->
+            walk a;
+            walk b;
+            walk c
+        | Call (c, args, _) ->
+            walk c;
+            List.iter args ~f:(Option.iter ~f:walk)
+        | _ -> ()
+      in
+      walk test;
+      List.rev !out
+
     method v12_compile_loop_body (b : statement) =
       if Ain.version_gte ctx.ain (12, 0) then (
         v12_pending_loop_body_dump <- true;
@@ -9635,7 +9712,10 @@ class jaf_compiler ctx debug_info =
             (* Capture the per-if cleanup slot list now; nested ifs in con
                will clobber [last_condition_deleted_dummies]. *)
             let saved_last = last_condition_deleted_dummies in
-            if List.is_empty saved_last then (
+            (* Class-repr iface locals assigned in the condition join
+               the replay set (see [v12_cond_assigned_class_iface]). *)
+            let cond_assigned = self#v12_cond_assigned_class_iface test in
+            if List.is_empty saved_last && List.is_empty cond_assigned then (
               (* No condition-local dummies released. Original v12
                  if-without-cleanup layout:
                    cond
@@ -9691,6 +9771,8 @@ class jaf_compiler ctx debug_info =
               self#write_instruction1 branch_op 0;
               List.iter saved_last ~f:(fun idx ->
                   self#write_instruction1 SH_LOCALDELETE idx);
+              List.iter cond_assigned ~f:(fun idx ->
+                  self#write_instruction1 SH_LOCALDELETE idx);
               let alt_jump_addr = current_address + 2 in
               self#write_instruction1 JUMP 0;
               self#write_address_at if_addr current_address;
@@ -9717,6 +9799,11 @@ class jaf_compiler ctx debug_info =
                          && not con_returns ->
                       ()
                   | _ -> self#write_instruction1 SH_LOCALDELETE idx);
+              (* Condition-assigned class-repr locals replay
+                 unconditionally — orig releases [object] right after
+                 [this.AddObject(object)] on the live path. *)
+              List.iter cond_assigned ~f:(fun idx ->
+                  self#write_instruction1 SH_LOCALDELETE idx);
               (match alt.node with
               | EmptyStatement ->
                   self#write_address_at alt_jump_addr current_address
@@ -9735,11 +9822,14 @@ class jaf_compiler ctx debug_info =
               | Some scope ->
                   scope.vars <-
                     List.filter scope.vars ~f:(fun v ->
-                        not
-                          (List.mem saved_last v.index ~equal:Int.equal
-                          && (match v.value_type with
-                             | Ain.Type.IFace _ -> false
-                             | _ -> true)))
+                        (not
+                           (List.mem saved_last v.index ~equal:Int.equal
+                           && (match v.value_type with
+                              | Ain.Type.IFace _ -> false
+                              | _ -> true)))
+                        && not
+                             (List.mem cond_assigned v.index
+                                ~equal:Int.equal))
               | None -> ())))
           else (
             let ifz_addr = current_address + 2 in
