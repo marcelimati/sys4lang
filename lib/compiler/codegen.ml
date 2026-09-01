@@ -8354,6 +8354,21 @@ class jaf_compiler ctx debug_info =
       walk test;
       List.rev !out
 
+    (** v12 continue/break path cleanup: the replayed dummies and the
+        statement's out-of-scope locals emit as ONE block in
+        descending slot order (orig puts the named local's release
+        AFTER the replayed dummies — TrophyCollection@GetAll's
+        [dummy; t], CTestMenuItem@GetRightItem's [D; D; D; rfItem2]).
+        Locals already released inline are deduped like the old
+        pre-statement delete_vars emission. *)
+    method private v12_emit_exit_cleanup replay delete_vars =
+      let dv =
+        List.filter delete_vars ~f:(fun i ->
+            not (List.mem inline_deleted_dummies i ~equal:Int.equal))
+      in
+      List.dedup_and_sort ~compare:Int.descending (replay @ dv)
+      |> List.iter ~f:(fun i -> self#compile_delete_var (self#get_local i))
+
     method v12_compile_loop_body (b : statement) =
       if Ain.version_gte ctx.ain (12, 0) then (
         v12_pending_loop_body_dump <- true;
@@ -9339,10 +9354,19 @@ class jaf_compiler ctx debug_info =
         state of the stack is unchanged after executing a statement. *)
     method compile_statement (stmt : statement) =
       DebugInfo.add_loc debug_info current_address stmt.loc;
-      (* delete locals that will be out-of-scope after this statement *)
-      List.iter (List.rev stmt.delete_vars) ~f:(fun i ->
-          if List.mem inline_deleted_dummies i ~equal:Int.equal then ()
-          else self#compile_delete_var (self#get_local i));
+      (* delete locals that will be out-of-scope after this statement.
+         v12 continue/break defer this into the arm's merged cleanup
+         (one descending-slot block together with the dummy replay —
+         orig TrophyCollection@GetAll / CTestMenuItem@GetRightItem put
+         the named local's release AFTER the replayed dummies). *)
+      (let defer_dv =
+         Ain.version_gte ctx.ain (12, 0)
+         && (match stmt.node with Continue | Break -> true | _ -> false)
+       in
+       if not defer_dv then
+         List.iter (List.rev stmt.delete_vars) ~f:(fun i ->
+             if List.mem inline_deleted_dummies i ~equal:Int.equal then ()
+             else self#compile_delete_var (self#get_local i)));
       match stmt.node with
       | EmptyStatement -> ()
       | Declarations decls ->
@@ -9965,19 +9989,27 @@ class jaf_compiler ctx debug_info =
              right before the branch and orig's continue path is a bare
              [JUMP head] (CInstanceParamSetter@SetModeMark, 53 sites). *)
           if Ain.version_gte ctx.ain (12, 0) then (
-            match Stack.top cflow_stmts with
-            | Some s ->
-                List.iter s.inline_deleted_dummies ~f:(fun idx ->
-                    if
+            let replay =
+              match Stack.top cflow_stmts with
+              | Some s ->
+                  List.filter s.inline_deleted_dummies ~f:(fun idx ->
                       not
                         (List.mem last_condition_deleted_dummies idx
-                           ~equal:Int.equal)
-                    then self#write_instruction1 SH_LOCALDELETE idx)
-            | None -> ())
+                           ~equal:Int.equal))
+              | None -> []
+            in
+            self#v12_emit_exit_cleanup replay stmt.delete_vars)
           else self#emit_loop_exit_cleanup;
           self#add_continue (ASTStatement stmt)
       | Break ->
-          self#emit_loop_exit_cleanup;
+          (if Ain.version_gte ctx.ain (12, 0) then
+             let replay =
+               match Stack.top cflow_stmts with
+               | Some s -> s.inline_deleted_dummies
+               | None -> []
+             in
+             self#v12_emit_exit_cleanup replay stmt.delete_vars
+           else self#emit_loop_exit_cleanup);
           self#record_switch_break_deleted_vars stmt.delete_vars;
           self#push_break_addr (current_address + 2) (ASTStatement stmt);
           self#write_instruction1 JUMP 0
