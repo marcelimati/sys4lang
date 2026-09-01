@@ -2969,6 +2969,110 @@ class jaf_compiler ctx debug_info =
               | None -> ())
           | None -> ())
 
+    (** v12 lambda placement (mined from orig 2026-09-01): every
+        lambda's [JUMP over; FUNC..ENDFUNC; over:] frame is emitted at
+        the START of its containing STATEMENT, before any of the
+        statement's own code (orig AddUserComponent: the Find-arg
+        lambda's frame precedes the assignment's [.LOCALREF nameList]).
+        A lambda used in the FIRST statement of an enclosing lambda's
+        body cascades: its frame is emitted before the parent's own
+        FUNC header (orig AutoCaptureProcess@IsExistCaptureSkill:
+        [JUMP end; JUMP after-inner; inner FUNC..ENDFUNC; after-inner:;
+        outer FUNC..ENDFUNC; end:]); lambdas in LATER statements emit
+        inline inside the parent at their statement start
+        (CModelAction). *)
+    (* Each collected lambda carries a cascade flag: true for lambdas
+       consumed as call ARGUMENTS (orig hoists their first-statement
+       nested lambdas before their FUNC — AutoCaptureProcess,
+       CLightPanel@0's spin-box helper args), false for
+       delegate-ASSIGNMENT right-hand sides (orig keeps the nested
+       lambda inside the parent, right after its FUNC —
+       CModelAction@SetModelEvent's [+=] chains). *)
+    method private v12_collect_direct_lambdas (e : expression) =
+      let out = ref [] in
+      let rec rhs_lambda (e : expression) =
+        match e.node with
+        | Lambda f -> Some f
+        | Cast (_, x) | RvalueRef x -> rhs_lambda x
+        | _ -> None
+      in
+      let rec walk (e : expression) =
+        match e.node with
+        | Lambda f -> out := (f, true) :: !out
+        | Assign (_, a, b) -> (
+            walk a;
+            match rhs_lambda b with
+            | Some f -> out := (f, false) :: !out
+            | None -> walk b)
+        | Unary (_, x) | Cast (_, x) | DummyRef (_, x) | RvalueRef x
+        | OptionalMember (x, _, _) | Member (x, _, _) ->
+            walk x
+        | Binary (_, a, b) | Seq (a, b) | NullCoalesce (a, b)
+        | Subscript (a, b) ->
+            walk a;
+            walk b
+        | Ternary (a, b, c) ->
+            walk a;
+            walk b;
+            walk c
+        | Call (c, args, _) ->
+            walk c;
+            List.iter args ~f:(Option.iter ~f:walk)
+        | NewCall (_, args) -> List.iter args ~f:(Option.iter ~f:walk)
+        | ArrayLiteral elems -> List.iter elems ~f:walk
+        | _ -> ()
+      in
+      walk e;
+      List.rev !out
+
+    method private v12_stmt_direct_lambdas (stmt : statement) =
+      match stmt.node with
+      | Expression e | Return (Some e) | Jumps e | Switch (e, _) ->
+          self#v12_collect_direct_lambdas e
+      | Declarations ds ->
+          List.concat_map ds.vars ~f:(fun (v : variable) ->
+              (match v.initval with
+              | Some iv -> (
+                  match
+                    (match iv.node with
+                    | Lambda f -> Some f
+                    | Cast (_, { node = Lambda f; _ }) -> Some f
+                    | _ -> None)
+                  with
+                  | Some f -> [ (f, false) ]
+                  | None -> self#v12_collect_direct_lambdas iv)
+              | None -> [])
+              @ List.concat_map v.array_dim
+                  ~f:self#v12_collect_direct_lambdas)
+      | If (test, _, _) | While (test, _) | DoWhile (test, _) ->
+          self#v12_collect_direct_lambdas test
+      | RefAssign (a, b) | ObjSwap (a, b) ->
+          self#v12_collect_direct_lambdas a @ self#v12_collect_direct_lambdas b
+      | _ -> []
+
+    method private v12_emit_lambda_frame ((f : Jaf.fundecl), cascade) =
+      let lambda_idx = Option.value_exn f.index in
+      if
+        (not (Hashtbl.mem pre_emitted_lambdas lambda_idx))
+        && not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+      then (
+        (if cascade then
+           match f.body with
+           | Some (first :: _) ->
+               List.iter (self#v12_stmt_direct_lambdas first)
+                 ~f:self#v12_emit_lambda_frame
+           | _ -> ());
+        let jump_addr = current_address + 2 in
+        self#write_instruction1 JUMP 0;
+        self#compile_function f;
+        self#write_address_at jump_addr current_address;
+        Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
+
+    method private v12_pre_emit_stmt_lambdas (stmt : statement) =
+      if Ain.version_gte ctx.ain (12, 0) then
+        List.iter (self#v12_stmt_direct_lambdas stmt)
+          ~f:self#v12_emit_lambda_frame
+
     method pre_emit_v12_rhs_lambdas expr =
       if Ain.version_gte ctx.ain (12, 0) then
         let emit (f : Jaf.fundecl) =
@@ -4577,8 +4681,11 @@ class jaf_compiler ctx debug_info =
               in
               match (op, lhs.ty, find_lambda rhs) with
               | EqAssign, Delegate _, Some f
-                when not (Hashtbl.mem v12_assignment_lambdas
-                            (Option.value_exn f.index)) ->
+                when (not (Hashtbl.mem v12_assignment_lambdas
+                             (Option.value_exn f.index)))
+                     && not
+                          (Hashtbl.mem pre_emitted_lambdas
+                             (Option.value_exn f.index)) ->
                   let lambda_idx = Option.value_exn f.index in
                   let jump_addr = current_address + 2 in
                   self#write_instruction1 JUMP 0;
@@ -9380,6 +9487,7 @@ class jaf_compiler ctx debug_info =
          List.iter (List.rev stmt.delete_vars) ~f:(fun i ->
              if List.mem inline_deleted_dummies i ~equal:Int.equal then ()
              else self#compile_delete_var (self#get_local i)));
+      self#v12_pre_emit_stmt_lambdas stmt;
       match stmt.node with
       | EmptyStatement -> ()
       | Declarations decls ->
@@ -11047,7 +11155,9 @@ class jaf_compiler ctx debug_info =
                 (match find_lambda e with
                 | Some f ->
                     let lambda_idx = Option.value_exn f.index in
-                    if not (Hashtbl.mem v12_assignment_lambdas lambda_idx)
+                    if
+                      (not (Hashtbl.mem v12_assignment_lambdas lambda_idx))
+                      && not (Hashtbl.mem pre_emitted_lambdas lambda_idx)
                     then (
                       let jump_addr = current_address + 2 in
                       self#write_instruction1 JUMP 0;
