@@ -9666,10 +9666,19 @@ class jaf_compiler ctx debug_info =
                  AFL_Parts_Wrap) is kept alive ONLY by the dummy — the
                  raw replay freed the live wrapper and the next dispatch
                  read its vtable from a dead page:【 CALLMETHOD 】
-                 存在しない関数番号 -1 at the intro scene transition. *)
+                 存在しない関数番号 -1 at the intro scene transition.
+                 EXCEPT when [con] guarantees its own RETURN: the replay
+                 position is then unreachable, the hazard is moot, and
+                 orig emits the IFace deletes there as dead code
+                 (CMotionItemController@GetToolTipText else-if chain,
+                 CEnqueteNumber@SetFontNumber). *)
+              let con_returns = self#statement_guaranteed_returns con in
               List.iter saved_last ~f:(fun idx ->
                   match (self#get_local idx).value_type with
-                  | Ain.Type.IFace _ when not (Hashtbl.mem v12_cond_scoped_slots idx) -> ()
+                  | Ain.Type.IFace _
+                    when (not (Hashtbl.mem v12_cond_scoped_slots idx))
+                         && not con_returns ->
+                      ()
                   | _ -> self#write_instruction1 SH_LOCALDELETE idx);
               (match alt.node with
               | EmptyStatement ->
