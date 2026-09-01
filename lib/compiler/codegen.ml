@@ -351,16 +351,29 @@ class jaf_compiler ctx debug_info =
         idempotent release-and-null sequence), and most dump sites are
         dead code after a RETURN / break-JUMP anyway. *)
     method private v12_dump_switch_scope =
-      self#v12_dump_scope_vars ~f:(fun _ -> true)
+      self#v12_dump_scope_vars ~record:false ~f:(fun _ -> true)
 
-    method private v12_dump_scope_vars ~f:keep =
+    (** [record]: mark the dumped slots as last-use-released so the
+        statement-level cleanup AFTER the construct doesn't re-release
+        them (ours emitted a second post-label block in
+        CSpriteParts@Get#1). Switch dumps record; the loop-body dump
+        does not (each iteration's inline releases already happened,
+        and the slots stay legitimately releasable after the loop). *)
+    method private v12_dump_scope_vars ~record ~f:keep =
       let scope = Stack.pop_exn scopes in
       let dumped, reparented = List.partition_tf scope.vars ~f:keep in
       (* Vars excluded from the dump keep their pre-existing lifetime:
          hand them to the enclosing scope. *)
       List.iter (List.rev reparented) ~f:self#scope_add_var;
       List.sort dumped ~compare:(fun a b -> Int.descending a.index b.index)
-      |> List.iter ~f:self#compile_delete_var
+      |> List.iter ~f:(fun (v : Ain.Variable.t) ->
+             self#compile_delete_var v;
+             if
+               record
+               && not
+                    (List.mem v12_last_use_deleted_vars v.index
+                       ~equal:Int.equal)
+             then v12_last_use_deleted_vars <- v.index :: v12_last_use_deleted_vars)
 
     (** Add a variable to the current scope. *)
     method scope_add_var v =
@@ -10070,14 +10083,15 @@ class jaf_compiler ctx debug_info =
                  if has_decl body && case_returns body then (
                    self#start_scope;
                    List.iter body ~f:self#compile_statement;
-                   self#v12_dump_switch_scope)
+                   self#v12_dump_scope_vars ~record:true ~f:(fun _ -> true))
                  else List.iter body ~f:self#compile_statement);
              (* The switch-level dump covers compiler temps only; a
                 NAMED local declared in an unbraced case survives the
                 switch and is released by the enclosing block's cleanup
                 (orig CInstanceParamSetter@SetValue<...>: [.LOCALDELETE
                 p] comes AFTER the end label, at loop-body end). *)
-             self#v12_dump_scope_vars ~f:(fun (v : Ain.Variable.t) ->
+             self#v12_dump_scope_vars ~record:true
+               ~f:(fun (v : Ain.Variable.t) ->
                  String.is_prefix v.name ~prefix:"<"))
            else List.iter stmts ~f:self#compile_statement);
           self#end_switch
@@ -11235,7 +11249,11 @@ class jaf_compiler ctx debug_info =
          | None -> ());
       (* v12 loop body: full iteration-cleanup dump (no released-var
          skips) in place of the skip-aware end_scope — see
-         [v12_pending_loop_body_dump]. *)
+         [v12_pending_loop_body_dump]. (An attempt to exclude the
+         LAST statement's own fresh releases regressed 32 fns — orig
+         usually DOES replay them at the body end; the single-release
+         counter-exemplar SimpleBattleParty@CalcTotalAtk has a subtler
+         discriminator, parked.) *)
       if is_loop_body then self#v12_dump_switch_scope else self#end_scope;
       block_depth <- block_depth - 1
 
