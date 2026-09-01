@@ -217,6 +217,15 @@ class jaf_compiler ctx debug_info =
     val mutable v12_struct_assign_released : int list = []
     val mutable v12_pending_fallthrough : bool = false
 
+    (* v12: set by the loop arms right before compiling the body; the
+       body's [compile_block] consumes it and ends with a FULL scope
+       dump (all vars descending, released-or-not, no skips) instead
+       of the skip-aware [end_scope] — orig's loop-body iteration
+       cleanup re-emits IFace locals and their already-released
+       dummies (CInstanceParamSetter@SetFont<ITextParts> foreach tail:
+       [.LOCALDELETE dg-dummy; f; s; get-dummy; p; wrap-dummy]). *)
+    val mutable v12_pending_loop_body_dump : bool = false
+
     (* v12 foreach header: the original lowers [container = call(), i = -1]
        as one comma expression, so the container call's temps are
        released just before the counter assignment's POP. The container
@@ -8231,8 +8240,8 @@ class jaf_compiler ctx debug_info =
     method v12_drop_condition_slots saved_last =
       match Stack.top scopes with
       | Some scope ->
-          scope.vars <-
-            List.filter scope.vars ~f:(fun v ->
+          let stays, dropped =
+            List.partition_tf scope.vars ~f:(fun v ->
                 (* cond-scoped decls never replay; IFace cond temps
                    stay out of replays like in the braced layout (their
                    release is deferred to last-use tracking) - but
@@ -8246,7 +8255,35 @@ class jaf_compiler ctx debug_info =
                      && (match v.value_type with
                         | Ain.Type.IFace _ -> true
                         | _ -> false)))
+          in
+          scope.vars <- stays;
+          (* When the guard sits in the synthetic [wrap_cond_decls]
+             block (recognizable by a cond-scoped decl among the
+             dropped vars), the slots are not forgotten — they move to
+             the PARENT scope so a loop body's iteration dump replays
+             them (orig SetFont<ITextParts> foreach tail releases the
+             guard's [p]/[s] and their wrap temps). At function level
+             the parent emits nothing, so live guards like
+             SetValue<>'s [parts] stay untouched. *)
+          let in_synthetic_block =
+            List.exists dropped ~f:(fun v ->
+                Hashtbl.mem v12_cond_scoped_slots v.index)
+          in
+          if in_synthetic_block && not (List.is_empty dropped) then (
+            let self_scope = Stack.pop_exn scopes in
+            (match Stack.top scopes with
+            | Some parent -> parent.vars <- dropped @ parent.vars
+            | None -> ());
+            Stack.push scopes self_scope)
       | None -> ()
+
+    method v12_compile_loop_body (b : statement) =
+      if Ain.version_gte ctx.ain (12, 0) then (
+        v12_pending_loop_body_dump <- true;
+        Exn.protect
+          ~f:(fun () -> self#compile_statement b)
+          ~finally:(fun () -> v12_pending_loop_body_dump <- false))
+      else self#compile_statement b
 
     method v12_compile_branch ~fallthrough (b : statement) =
       v12_pending_fallthrough <- Ain.version_gte ctx.ain (12, 0) && fallthrough;
@@ -9748,7 +9785,7 @@ class jaf_compiler ctx debug_info =
           let break_addr = current_address + 2 in
           self#write_instruction1 (if loop_peeled then IFNZ else IFZ) 0;
           (* loop body *)
-          self#compile_statement body;
+          self#v12_compile_loop_body body;
           self#write_instruction1 JUMP loop_addr;
           (* loop end *)
           self#write_address_at break_addr current_address;
@@ -9757,7 +9794,7 @@ class jaf_compiler ctx debug_info =
           (* start the loop with an unknown continue address *)
           let loop_addr = current_address in
           self#start_loop (-1);
-          self#compile_statement body;
+          self#v12_compile_loop_body body;
           (* loop test ('continue' jumps here) *)
           List.iter (Stack.top_exn cflow_stmts).continue_addrs ~f:(fun addr ->
               self#write_address_at addr current_address);
@@ -9780,7 +9817,7 @@ class jaf_compiler ctx debug_info =
           (* loop body *)
           let loop_addr = current_address in
           self#start_loop loop_addr;
-          self#compile_statement body;
+          self#v12_compile_loop_body body;
           self#write_instruction1 JUMP loop_addr;
           self#end_loop
       | For (decl, test, inc, body) ->
@@ -9807,7 +9844,7 @@ class jaf_compiler ctx debug_info =
           if Ain.version ctx.ain > 8 then self#write_instruction1 JUMP test_addr;
           (* loop body *)
           self#write_address_at body_addr current_address;
-          self#compile_statement body;
+          self#v12_compile_loop_body body;
           self#write_instruction1 JUMP loop_addr;
           (* loop end *)
           Option.iter break_addr ~f:(fun break_addr ->
@@ -10998,6 +11035,8 @@ class jaf_compiler ctx debug_info =
       let top_level = Int.equal block_depth 0 in
       let is_fallthrough = v12_pending_fallthrough in
       v12_pending_fallthrough <- false;
+      let is_loop_body = v12_pending_loop_body_dump in
+      v12_pending_loop_body_dump <- false;
       let last_struct_released = ref [] in
       block_depth <- block_depth + 1;
       self#start_scope;
@@ -11072,7 +11111,10 @@ class jaf_compiler ctx debug_info =
                List.filter scope.vars ~f:(fun v ->
                    not (List.mem !last_struct_released v.index ~equal:Int.equal))
          | None -> ());
-      self#end_scope;
+      (* v12 loop body: full iteration-cleanup dump (no released-var
+         skips) in place of the skip-aware end_scope — see
+         [v12_pending_loop_body_dump]. *)
+      if is_loop_body then self#v12_dump_switch_scope else self#end_scope;
       block_depth <- block_depth - 1
 
     method private statement_guaranteed_returns (stmt : statement) =
