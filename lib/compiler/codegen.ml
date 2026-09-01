@@ -3004,6 +3004,25 @@ class jaf_compiler ctx debug_info =
             match rhs_lambda b with
             | Some f -> out := (f, false) :: !out
             | None -> walk b)
+        (* [obj.E += λ] on a user-bodied event is rewritten by
+           typeAnalysis into [E::add(λ)] — still an assignment-style
+           consumer (orig SetMotionDiffuseEvent keeps the env-reading
+           inners of these parents inside them, exactly like the plain
+           delegate-field += statements around them). *)
+        | Call
+            ( ({ node =
+                   ( Member (_, mname, ClassMethod _)
+                   | OptionalMember (_, mname, ClassMethod _) );
+                 _;
+               } as callee),
+              [ Some arg ],
+              _ )
+          when String.is_suffix mname ~suffix:"::add"
+               || String.is_suffix mname ~suffix:"::remove" -> (
+            walk callee;
+            match rhs_lambda arg with
+            | Some f -> out := (f, false) :: !out
+            | None -> walk arg)
         | Unary (_, x) | Cast (_, x) | DummyRef (_, x) | RvalueRef x
         | OptionalMember (x, _, _) | Member (x, _, _) ->
             walk x
@@ -3050,6 +3069,65 @@ class jaf_compiler ctx debug_info =
           self#v12_collect_direct_lambdas a @ self#v12_collect_direct_lambdas b
       | _ -> []
 
+    (** Does the lambda's own code read captured (X_GETENV) variables?
+        Deeper nested lambdas' captures live in THEIR code, so the
+        walk does not descend into nested Lambda bodies. *)
+    method private v12_lambda_reads_env (f : Jaf.fundecl) =
+      let found = ref false in
+      let rec chk_e (e : expression) =
+        match e.node with
+        | Ident (_, CapturedVariable _) -> found := true
+        | Lambda _ -> ()
+        | Unary (_, x) | Cast (_, x) | RvalueRef x | DummyRef (_, x)
+        | OptionalMember (x, _, _) | Member (x, _, _) ->
+            chk_e x
+        | Binary (_, a, b) | Assign (_, a, b) | Seq (a, b)
+        | NullCoalesce (a, b) | Subscript (a, b) ->
+            chk_e a;
+            chk_e b
+        | Ternary (a, b, c) ->
+            chk_e a;
+            chk_e b;
+            chk_e c
+        | Call (c, args, _) ->
+            chk_e c;
+            List.iter args ~f:(Option.iter ~f:chk_e)
+        | NewCall (_, args) -> List.iter args ~f:(Option.iter ~f:chk_e)
+        | ArrayLiteral es -> List.iter es ~f:chk_e
+        | _ -> ()
+      in
+      let rec chk_s (s : statement) =
+        match s.node with
+        | Expression e | Case e | Jumps e -> chk_e e
+        | Return (Some e) -> chk_e e
+        | Declarations ds ->
+            List.iter ds.vars ~f:(fun v ->
+                Option.iter v.initval ~f:chk_e;
+                List.iter v.array_dim ~f:chk_e)
+        | Compound ss | Switch (_, ss) -> List.iter ss ~f:chk_s
+        | If (e, a, b) ->
+            chk_e e;
+            chk_s a;
+            chk_s b
+        | While (e, b) | DoWhile (e, b) ->
+            chk_e e;
+            chk_s b
+        | For (i, t, u, b) ->
+            chk_s i;
+            Option.iter t ~f:chk_e;
+            Option.iter u ~f:chk_e;
+            chk_s b
+        | ForEach (_, _, _, _, c, b) ->
+            chk_e c;
+            chk_s b
+        | RefAssign (a, b) | ObjSwap (a, b) ->
+            chk_e a;
+            chk_e b
+        | _ -> ()
+      in
+      Option.iter f.body ~f:(List.iter ~f:chk_s);
+      !found
+
     method private v12_emit_lambda_frame ((f : Jaf.fundecl), cascade) =
       let lambda_idx = Option.value_exn f.index in
       if
@@ -3059,15 +3137,20 @@ class jaf_compiler ctx debug_info =
         (* Our own jump-over is written FIRST, then any cascaded
            first-statement nested frames, then our FUNC (orig
            IsExistCaptureSkill: [JUMP end; JUMP after-inner; inner;
-           after-inner:; outer; end:]). *)
+           after-inner:; outer; end:]). An argument lambda cascades
+           ALL of its first-statement inners; an assignment-RHS lambda
+           cascades only the NON-capturing ones (orig SceneHelpScreen@0
+           hoists the env-free OnExit thunk out of its [+=] parent,
+           while SetModelEvent's X_GETENV-reading inner stays inside). *)
         let jump_addr = current_address + 2 in
         self#write_instruction1 JUMP 0;
-        (if cascade then
-           match f.body with
-           | Some (first :: _) ->
-               List.iter (self#v12_stmt_direct_lambdas first)
-                 ~f:self#v12_emit_lambda_frame
-           | _ -> ());
+        (match f.body with
+        | Some (first :: _) ->
+            List.iter (self#v12_stmt_direct_lambdas first)
+              ~f:(fun ((g, _) as plan) ->
+                if cascade || not (self#v12_lambda_reads_env g) then
+                  self#v12_emit_lambda_frame plan)
+        | _ -> ());
         self#compile_function f;
         self#write_address_at jump_addr current_address;
         Hashtbl.set pre_emitted_lambdas ~key:lambda_idx ~data:())
