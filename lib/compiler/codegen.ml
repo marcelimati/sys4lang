@@ -335,6 +335,24 @@ class jaf_compiler ctx debug_info =
           else if already_inline_deleted || already_last_use_deleted then ()
           else self#compile_delete_var v)
 
+    (** v12 switch / implicit case-block scope dump: pop the scope and
+        emit [compile_delete_var] for every var in it, descending slot
+        order, with NO released-var skips — orig re-emits the delete
+        for slots already released inline (they expand to the
+        idempotent release-and-null sequence), and most dump sites are
+        dead code after a RETURN / break-JUMP anyway. *)
+    method private v12_dump_switch_scope =
+      self#v12_dump_scope_vars ~f:(fun _ -> true)
+
+    method private v12_dump_scope_vars ~f:keep =
+      let scope = Stack.pop_exn scopes in
+      let dumped, reparented = List.partition_tf scope.vars ~f:keep in
+      (* Vars excluded from the dump keep their pre-existing lifetime:
+         hand them to the enclosing scope. *)
+      List.iter (List.rev reparented) ~f:self#scope_add_var;
+      List.sort dumped ~compare:(fun a b -> Int.descending a.index b.index)
+      |> List.iter ~f:self#compile_delete_var
+
     (** Add a variable to the current scope. *)
     method scope_add_var v =
       match Stack.top scopes with
@@ -740,7 +758,12 @@ class jaf_compiler ctx debug_info =
       (match Stack.top cflow_stmts with
       | Some { kind = CFlowSwitch switch; _ } -> Ain.write_switch ctx.ain switch
       | _ -> compiler_bug "Mismatched start/end of control flow construct" None);
-      (if Ain.version ctx.ain > 8 then
+      (* v12 replaces this replay with the switch-scope dump emitted by
+         the [Switch] statement arm: orig's switch-end block is the
+         scope's full var list (released or not, descending), and
+         dummies released inside a NESTED switch are not replayed at
+         the outer one (orig CPartsStandInDataManager@Sort). *)
+      (if Ain.version ctx.ain > 8 && Ain.version_lt ctx.ain (12, 0) then
          match Stack.top cflow_stmts with
          | None -> ()
          | Some s ->
@@ -9827,7 +9850,68 @@ class jaf_compiler ctx debug_info =
           self#start_switch expr.ty (ASTExpression expr);
           self#push_break_addr (current_address + 2) (ASTStatement stmt);
           self#write_instruction1 JUMP 0;
-          List.iter stmts ~f:self#compile_statement;
+          (if Ain.version_gte ctx.ain (12, 0) then (
+             (* Original v12 treats the switch body as a scope: right
+                before the end label it emits [.LOCALDELETE] for EVERY
+                var allocated at switch level, in descending slot
+                order, whether or not it was already released — and it
+                does not reachability-skip the block even when the
+                last case ends in RETURN (dead code, orig
+                ActivityUserObject::CreateObjectFromName's 41 deletes).
+                A case body of two or more statements that exits the
+                switch was a braced block in the true sources: its
+                vars belong to an implicit per-case scope whose full
+                list is dumped right after the exit statement instead
+                (orig SceneCollection@Create). *)
+             self#start_scope;
+             let is_marker (s : statement) =
+               match s.node with Case _ | Default -> true | _ -> false
+             in
+             let not_marker s = not (is_marker s) in
+             let rec split = function
+               | [] -> []
+               | s :: _ as l when is_marker s ->
+                   let markers, rest = List.split_while l ~f:is_marker in
+                   let body, rest = List.split_while rest ~f:not_marker in
+                   (markers, body) :: split rest
+               | l ->
+                   let body, rest = List.split_while l ~f:not_marker in
+                   ([], body) :: split rest
+             in
+             let case_returns body =
+               match List.last body with
+               | None -> false
+               | Some (last : statement) ->
+                   self#statement_guaranteed_returns last
+             in
+             let has_decl body =
+               List.exists body ~f:(fun (s : statement) ->
+                   match s.node with Declarations _ -> true | _ -> false)
+             in
+             List.iter (split stmts) ~f:(fun (markers, body) ->
+                 List.iter markers ~f:self#compile_statement;
+                 (* Only a declaration-carrying, return-ending case body
+                    is provably a braced block in the true sources
+                    (SceneCollection@Create cases 2/3: [ref CgModePage p
+                    = ...] then [.LOCALDELETE dummy; .LOCALDELETE p]
+                    after the RETURN). Multi-statement bodies without
+                    declarations defer their temps to the switch scope
+                    (CEnqueteTextCount@CreateSymbol), and break-ending
+                    bodies are never dumped per-case
+                    (CAEPropertyForm@SelectedEvent). *)
+                 if has_decl body && case_returns body then (
+                   self#start_scope;
+                   List.iter body ~f:self#compile_statement;
+                   self#v12_dump_switch_scope)
+                 else List.iter body ~f:self#compile_statement);
+             (* The switch-level dump covers compiler temps only; a
+                NAMED local declared in an unbraced case survives the
+                switch and is released by the enclosing block's cleanup
+                (orig CInstanceParamSetter@SetValue<...>: [.LOCALDELETE
+                p] comes AFTER the end label, at loop-body end). *)
+             self#v12_dump_scope_vars ~f:(fun (v : Ain.Variable.t) ->
+                 String.is_prefix v.name ~prefix:"<"))
+           else List.iter stmts ~f:self#compile_statement);
           self#end_switch
       | Case { node; _ } -> self#add_switch_case node (ASTStatement stmt)
       | Default -> self#set_switch_default (ASTStatement stmt)
